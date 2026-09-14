@@ -1,0 +1,23 @@
+moq_server:
+  listenip: 0.0.0.0
+  port: 4433
+  subpath:
+    - desc: media format is flv
+      path: flv
+    - desc: media format is moq
+      path: moq
+  certfile: ""
+  keyfile: ""
+
+httpflv:
+  listenip: 0.0.0.0
+  port: 4433
+
+log:
+  level: info
+  filename: /tmp/moqlivecast.log
+  console: false
+
+meta_log:
+  log: /tmp/moq_meta.log
+  interval: 3

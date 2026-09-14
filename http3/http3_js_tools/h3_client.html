@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>HTTP/3 Client Test</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family: -apple-system, sans-serif; background:#0d1117; color:#c9d1d9; padding:2rem; }
+h1 { color:#58a6ff; margin-bottom:.5rem; }
+.warn { color:#d2991d; font-size:.85rem; margin-bottom:1.5rem; }
+.card { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:1.2rem; margin-bottom:1rem; }
+.card h3 { color:#f0f6fc; margin-bottom:.5rem; }
+.card button { background:#238636; color:#fff; border:none; padding:.4rem 1rem; border-radius:4px; cursor:pointer; margin-right:.5rem; }
+.card button:hover { background:#2ea043; }
+.card pre { background:#0d1117; padding:.8rem; margin-top:.6rem; border-radius:4px; overflow-x:auto; font-size:.85rem; max-height:400px; overflow-y:auto; }
+.status-ok  { color:#3fb950; }
+.status-err { color:#f85149; }
+.summary { margin-top:1.5rem; padding:1rem; background:#161b22; border-radius:8px; }
+</style>
+</head>
+<body>
+
+<h1>&#x26A1; HTTP/3 Client Test</h1>
+<p class="warn">&#x26A0; Browser must be launched with QUIC flags. See README.</p>
+
+<div id="result" class="summary">
+  <span id="passed">0</span> passed,
+  <span id="failed">0</span> failed,
+  <span id="total">0</span> total
+</div>
+
+<div class="card">
+  <h3>Test 1: GET query params</h3>
+  <code>GET /get/hello?name=alex&age=23</code>
+  <br><br>
+  <button onclick="testGet('/get/hello?name=alex&age=23')">&#x25B6; Run</button>
+  <pre id="out1"></pre>
+</div>
+
+<div class="card">
+  <h3>Test 2: POST JSON</h3>
+  <code>POST /post/hello &nbsp; Content-Type: application/json</code>
+  <br><br>
+  <button onclick="testPost('/post/hello', 'application/json', '{\"name\":\"alex\",\"age\":23}')">&#x25B6; Run</button>
+  <pre id="out2"></pre>
+</div>
+
+<div class="card">
+  <h3>Test 3: POST plain text</h3>
+  <code>POST /post/hello &nbsp; Content-Type: text/plain</code>
+  <br><br>
+  <button onclick="testPost('/post/hello', 'text/plain', 'hello from browser JS')">&#x25B6; Run</button>
+  <pre id="out3"></pre>
+</div>
+
+<div class="card">
+  <h3>Test 4: GET /nope → 404</h3>
+  <button onclick="testGet('/nope')">&#x25B6; Run</button>
+  <pre id="out4"></pre>
+</div>
+
+<script>
+const BASE = "https://127.0.0.1:4433";
+let counts = { passed: 0, failed: 0, total: 0 };
+
+function updateSummary() {
+  document.getElementById('passed').textContent = counts.passed;
+  document.getElementById('failed').textContent = counts.failed;
+  document.getElementById('total').textContent  = counts.total;
+}
+
+async function testGet(path) {
+  const out = document.getElementById('out' + (++counts.total > 4 ? 4 : counts.total));
+  counts.total--;
+  out.textContent = 'Fetching...';
+  try {
+    const resp = await fetch(BASE + path);
+    const body = await resp.text();
+    out.innerHTML = `<span class="status-ok">Status: ${resp.status} ${resp.statusText}</span>\n\n${body}`;
+    if (resp.status >= 200 && resp.status < 300) counts.passed++;
+    else counts.failed++;
+  } catch(e) {
+    out.innerHTML = `<span class="status-err">ERROR: ${e.message}</span>`;
+    counts.failed++;
+  }
+  updateSummary();
+}
+
+async function testPost(path, contentType, data) {
+  const id = (counts.total % 4) + 1;
+  const out = document.getElementById('out' + id);
+  out.textContent = 'Fetching...';
+  try {
+    const resp = await fetch(BASE + path, {
+      method: 'POST',
+      headers: { 'Content-Type': contentType },
+      body: data,
+    });
+    const body = await resp.text();
+    out.innerHTML = `<span class="status-ok">Status: ${resp.status} ${resp.statusText}</span>\n\n${body}`;
+    if (resp.status >= 200 && resp.status < 300) counts.passed++;
+    else counts.failed++;
+  } catch(e) {
+    out.innerHTML = `<span class="status-err">ERROR: ${e.message}</span>`;
+    counts.failed++;
+  }
+  updateSummary();
+}
+
+/* Auto-run all tests on load */
+window.onload = async () => {
+  await testGet('/get/hello?name=alex&age=23');
+  await new Promise(r => setTimeout(r, 300));
+  await testPost('/post/hello', 'application/json', '{"name":"alex","age":23}');
+  await new Promise(r => setTimeout(r, 300));
+  await testPost('/post/hello', 'text/plain', 'hello from browser JS');
+  await new Promise(r => setTimeout(r, 300));
+  await testGet('/nope');
+};
+</script>
+</body>
+</html>

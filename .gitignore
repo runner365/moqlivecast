@@ -1,0 +1,81 @@
+# === Build artifacts ===
+build/
+
+# === JavaScript / Vite ===
+node_modules/
+dist/
+.vite
+
+# === C object / library files ===
+*.o
+*.a
+*.so
+*.dylib
+*.lo
+*.la
+
+# === Go ===
+*.exe
+wt_go_client
+wt_go_server
+
+# quic-go echo tools — keep sources, ignore binaries (no suffix on Darwin/Linux)
+quic/quicgo_tools/*
+!quic/quicgo_tools/*.go
+!quic/quicgo_tools/go.mod
+!quic/quicgo_tools/go.sum
+
+# quic-go WebTransport tools
+http3/quicgo_webtransport_tools/*
+!http3/quicgo_webtransport_tools/*.go
+!http3/quicgo_webtransport_tools/go.mod
+!http3/quicgo_webtransport_tools/go.sum
+
+# === Logs ===
+*.log
+nohup.out
+*.pm
+
+
+# === macOS ===
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+Icon
+
+# === IDE / Editor ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.clangd/
+compile_commands.json
+.ccls-cache/
+
+# === Project-specific ===
+.claude/
+.cache/
+wechat_doc/
+
+# === Tags ===
+tags
+TAGS
+GPATH
+GRTAGS
+GTAGS
+
+# === CMake ===
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+
+# === cert artifacts ===
+cert/*.srl
+cert/*.csr
+cert/tls_echo_client
+cert/tls_echo_server
+cert/udp_echo_client
+cert/udp_echo_server
