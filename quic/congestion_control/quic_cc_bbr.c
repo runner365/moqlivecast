@@ -18,6 +18,7 @@
 #define BBR_DRAIN      1
 #define BBR_PROBE_BW   2
 #define BBR_PROBE_RTT  3
+#define BBR_MIN_RTT_WINDOW_MS  10000   /* WinMinRTT 窗口 */
 
 #define BBR_BW_WINDOW      8     /* max bandwidth samples */
 #define BBR_RTT_WINDOW_MS  10000 /* min rtt window */
@@ -38,7 +39,9 @@ typedef struct {
 
     /* RTT */
     uint64_t min_rtt_us;
+    uint64_t min_rtt_stamp_ms;
     uint64_t rtt_probe_us;      /* last min_rtt update timestamp (us) */
+    uint64_t last_probe_rtt_ms; /* 上次 PROBE_RTT 的时刻 (ms) */
 
     /* state machine */
     int      state;
@@ -133,8 +136,9 @@ static void bbr_enter_probe_bw(quic_cc_bbr_t *bbr) {
 static void bbr_enter_probe_rtt(quic_cc_bbr_t *bbr) {
     bbr->state = BBR_PROBE_RTT;
     bbr->state_start_ms = (uint64_t)(bbr_now_us() / 1000);
+    bbr->last_probe_rtt_ms = bbr->state_start_ms;
     /* cwnd = 4 * MSS to drain queue and measure true min_rtt */
-    bbr->cwnd_ = 16 * bbr->mss;
+    bbr->cwnd_ = 4 * bbr->mss;
     LOG_DEBUG("[cc-bbr] → PROBE_RTT  cwnd=%llu", (unsigned long long)bbr->cwnd_);
 }
 
@@ -180,9 +184,10 @@ static void bbr_handle_round_end(quic_cc_bbr_t *bbr, uint64_t now_us) {
         bbr->probe_bw_phase = (bbr->probe_bw_phase + 1) & 7;
         bbr_set_cwnd(bbr);
 
-        /* Check PROBE_RTT: if min_rtt hasn't been updated in 10s */
-        if (now_us - bbr->rtt_probe_us > BBR_RTT_WINDOW_MS * 1000)
+        /* Check PROBE_RTT: 每 10s 重探一次真实地板（对齐 WinMinRTT 窗口）*/
+        if ((now_us / 1000) - bbr->last_probe_rtt_ms >= BBR_RTT_WINDOW_MS) {
             bbr_enter_probe_rtt(bbr);
+        }
         break;
 
     case BBR_PROBE_RTT:
@@ -208,17 +213,17 @@ static void bbr_on_packet_sent(struct quic_cc *cc, uint64_t pn,
 static void bbr_on_packet_acked(struct quic_cc *cc, uint64_t pn,
                                 uint64_t bytes, uint64_t rtt_us,
                                 uint64_t now_ms) {
-    (void)pn; (void)now_ms;
-
     quic_cc_bbr_t *bbr = (quic_cc_bbr_t*)cc->priv;
     uint64_t now_us = bbr_now_us();
 
     /* update min_rtt — BBR only lowers, tracking the path floor */
     if (rtt_us > 0 && rtt_us < 10000000) {
         uint64_t r = rtt_us < BBR_MIN_RTT_US ? BBR_MIN_RTT_US : rtt_us;
-        if (r < bbr->min_rtt_us || bbr->min_rtt_us == 0) {
+        if (now_ms - bbr->min_rtt_stamp_ms > BBR_MIN_RTT_WINDOW_MS || bbr->min_rtt_us == 0) {
+            bbr->min_rtt_us = r;      // ← 直接用本次采样
+            bbr->min_rtt_stamp_ms = now_ms; 
+        } else if (r < bbr->min_rtt_us) {
             bbr->min_rtt_us = r;
-            bbr->rtt_probe_us = now_us;
         }
     }
 
@@ -231,10 +236,10 @@ static void bbr_on_packet_acked(struct quic_cc *cc, uint64_t pn,
     if (bbr->state == BBR_STARTUP) {
         bbr->cwnd_ += bytes;
         if ((int)bbr->round_count < 1) {
-            LOG_DEBUG("[cc-bbr] STARTUP: cwnd=%llu (+%llu) rtt=%llu bw=%llu",
+            LOG_DEBUG("[cc-bbr] STARTUP: cwnd=%llu (+%llu) rtt=%llu bw=%llu, pn=%llu",
                      (unsigned long long)bbr->cwnd_, (unsigned long long)bytes,
                      (unsigned long long)rtt_us,
-                     (unsigned long long)bbr->max_bw);
+                     (unsigned long long)bbr->max_bw, pn);
         }
     }
 
@@ -272,7 +277,19 @@ static void bbr_on_persistent_congestion(struct quic_cc *cc, uint64_t now_ms) {
 }
 
 static uint64_t bbr_get_cwnd(const struct quic_cc *cc) {
-    const quic_cc_bbr_t *bbr = (const quic_cc_bbr_t*)cc->priv;
+    const quic_cc_bbr_t *bbr_const = (const quic_cc_bbr_t*)cc->priv;
+    quic_cc_bbr_t *bbr = (quic_cc_bbr_t*)bbr_const;   /* 需要改下 const */
+
+    if (!bbr) return 0;
+
+    /* 这里被 quic_cc_can_send 每次调用 —— 不依赖 ACK，
+     * PROBE_RTT 超时能在这里强制退出，避免死锁。 */
+    if (bbr->state == BBR_PROBE_RTT) {
+        uint64_t now_ms = bbr_now_us() / 1000;
+        if (now_ms - bbr->state_start_ms >= BBR_PROBE_RTT_DUR) {
+            bbr_enter_probe_bw(bbr);
+        }
+    }
     return bbr->cwnd_;
 }
 
@@ -314,13 +331,15 @@ struct quic_cc *quic_cc_bbr_create(void) {
     bbr->mss          = QUIC_MIN_PKT_SIZE;
     bbr->cwnd_        = 32 * bbr->mss;  /* ~38KB initial window */
     bbr->min_rtt_us   = 0;
+    bbr->min_rtt_stamp_ms = 0;
     bbr->rtt_probe_us = bbr_now_us();
+    bbr->last_probe_rtt_ms = bbr_now_us() / 1000;
     bbr->max_bw       = bbr->mss * 100; /* 120KB/s minimal */
 
     cc->ops  = &bbr_ops;
     cc->priv = bbr;
 
-    LOG_DEBUG("[cc-bbr] created: cwnd=%llu mss=%llu",
+    LOG_INFO("[cc-bbr] created: cwnd=%llu mss=%llu",
              (unsigned long long)bbr->cwnd_, (unsigned long long)bbr->mss);
     return cc;
 }

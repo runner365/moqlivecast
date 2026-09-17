@@ -128,5 +128,8 @@ struct quic_cc *quic_cc_newreno_create(void) {
 
     cc->ops  = &nr_ops;
     cc->priv = nr;
+
+    LOG_INFO("[cc-newreno] created: cwnd=%llu",
+             (unsigned long long)nr->cwnd_);
     return cc;
 }

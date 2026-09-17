@@ -571,8 +571,8 @@ void quic_recovery_init(QuicRecoveryCtx *ctx, void *conn, uv_loop_t *loop,
     ctx->flush_fn = flush_fn;
     ctx->send_imm_fn = send_imm_fn;
     /* CC 选择：改这一行即可在 BBR / CUBIC / NewReno 间切换（对照实验用） */
-    // ctx->cc_ = cc ? cc : quic_cc_bbr_create();
-    ctx->cc_ = cc ? cc : quic_cc_cubic_create();
+    ctx->cc_ = cc ? cc : quic_cc_bbr_create();
+    // ctx->cc_ = cc ? cc : quic_cc_cubic_create();
     // ctx->cc_ = cc ? cc : quic_cc_newreno_create();
     ctx->pto_base_ = QUIC_INITIAL_PTO_MS;
     ctx->current_retrans_chunk_id_ = UINT64_MAX;  /* 未复用哨兵 */

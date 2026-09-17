@@ -204,7 +204,7 @@ struct quic_cc *quic_cc_cubic_create(void) {
     cc->ops  = &cubic_ops;
     cc->priv = c;
 
-    LOG_DEBUG("[cc-cubic] created: cwnd=%llu (init %d*MSS)",
+    LOG_INFO("[cc-cubic] created: cwnd=%llu (init %d*MSS)",
              (unsigned long long)c->cwnd_, CUBIC_INIT_W / QUIC_MIN_PKT_SIZE);
     return cc;
 }
