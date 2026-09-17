@@ -39,7 +39,7 @@ elseif(UNIX)
     endif()
 endif()
 
-set(OPENSSL_SRC_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/openssl-3.5.4")
+set(OPENSSL_SRC_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/openssl-3.5.8")
 set(OPENSSL_INSTALL_DIR "${CMAKE_BINARY_DIR}/openssl_install")
 
 # 提前创建目录，避免 IMPORTED target 因路径不存在而报错
