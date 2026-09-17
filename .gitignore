@@ -34,8 +34,6 @@ http3/quicgo_webtransport_tools/*
 # === Logs ===
 *.log
 nohup.out
-*.pm
-
 
 # === macOS ===
 .DS_Store
