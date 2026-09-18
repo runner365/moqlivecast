@@ -78,11 +78,12 @@ private:
     void EnqueueSend(Downlink &dl, std::shared_ptr<DataBuffer> buf);
     void TrimSendQueue(Downlink &dl);
     void ClearSendQueue(Downlink &dl);
-    void OnLocObject(uint64_t alias, int64_t ts_ms, bool key,
+    /* cts_ms = pts - dts，来自 LOC 私有扩展属性 0x0e；无该属性时为 0 */
+    void OnLocObject(uint64_t alias, int64_t ts_ms, int64_t cts_ms, bool key,
                      const uint8_t *cfg, size_t cfg_len,
                      const uint8_t *payload, size_t payload_len);
     void EmitFlvVideo(int64_t dts, bool seq, bool key,
-                      const uint8_t *data, size_t len);
+                      const uint8_t *data, size_t len, int64_t cts_ms);
     void EmitFlvAudio(int64_t dts, bool seq, const uint8_t *data, size_t len);
 
     std::string app_;

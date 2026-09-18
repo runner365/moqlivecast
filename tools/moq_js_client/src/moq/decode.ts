@@ -1,5 +1,6 @@
 import {
   LOC_AUDIO_CONFIG,
+  LOC_COMPOSITION_TIME,
   LOC_FRAME_MARK,
   LOC_TIMESTAMP,
   LOC_VIDEO_CONFIG,
@@ -13,7 +14,10 @@ export type ControlMsg = {
 }
 
 export type LocObject = {
+  /** 解码时间戳 DTS（LOC TIMESTAMP 属性） */
   timestampMs: number
+  /** pts - dts，缺省 0。有 B 帧时非零，播放端要靠它还原显示顺序 */
+  ctsMs: number
   key: boolean
   videoConfig?: Uint8Array
   audioConfig?: Uint8Array
@@ -84,6 +88,7 @@ export function tryReadObject(r: ByteReader, hasProps: boolean): LocObject | nul
     return null
   }
   let timestampMs = 0
+  let ctsMs = 0
   let key = false
   let videoConfig: Uint8Array | undefined
   let audioConfig: Uint8Array | undefined
@@ -110,6 +115,7 @@ export function tryReadObject(r: ByteReader, hasProps: boolean): LocObject | nul
         const val = pr.readVarint()
         if (val === null) break
         if (type === LOC_TIMESTAMP) timestampMs = val
+        if (type === LOC_COMPOSITION_TIME) ctsMs = val
       } else {
         const vlen = pr.readVarint()
         if (vlen === null) break
@@ -134,12 +140,12 @@ export function tryReadObject(r: ByteReader, hasProps: boolean): LocObject | nul
     }
     /* 注意：payload 为 0 不代表没有 config —— 服务端的 config 对象可能只带属性不带 payload，
      * 丢掉 videoConfig/audioConfig 会让解码器永远配不起来。 */
-    return { timestampMs, key, videoConfig, audioConfig, payload: new Uint8Array(0) }
+    return { timestampMs, ctsMs, key, videoConfig, audioConfig, payload: new Uint8Array(0) }
   }
   const payload = r.readBytes(payloadLen)
   if (!payload) {
     r.restore(snap)
     return null
   }
-  return { timestampMs, key, videoConfig, audioConfig, payload: payload.slice() }
+  return { timestampMs, ctsMs, key, videoConfig, audioConfig, payload: payload.slice() }
 }

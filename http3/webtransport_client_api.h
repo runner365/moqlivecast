@@ -56,6 +56,12 @@ wt_client_t *wt_client_new(uv_loop_t *loop, wt_callbacks_t *cb);
  * 结果 → cb.on_connect(status) */
 void wt_client_connect(wt_client_t *cli, const char *host, int port);
 
+/* 同上，但可指定 HTTP/3 的 :path（含 query，如
+ * "/moq?app=live&stream=123456"）。:authority 由 host:port 自动生成。
+ * wt_client_connect() 等价于 path="/"。 */
+void wt_client_connect_path(wt_client_t *cli, const char *host, int port,
+                            const char *path);
+
 /* 关闭客户端 */
 void wt_client_close(wt_client_t *cli);
 

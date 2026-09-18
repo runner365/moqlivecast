@@ -87,7 +87,6 @@ typedef struct {
     uint64_t   last_keepalive_ms_;
     uint64_t   last_loss_log_s_;
     uint64_t   last_ack_log_s_;
-    int        fix_pto_timeout_;
     void *conn_;
     int  (*queue_fn)(void *conn, const uint8_t *frames, size_t flen);
     void (*flush_fn)(void *conn);

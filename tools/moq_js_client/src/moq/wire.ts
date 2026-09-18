@@ -10,6 +10,10 @@ export const MOQT_SUBSCRIBE_OK = 0x04
 export const LOC_TIMESCALE = 0x08
 export const LOC_FRAME_MARK = 0x09
 export const LOC_VIDEO_CONFIG = 0x0d
+/** 私有扩展：CompositionTime = pts - dts，单位同 Timescale（毫秒）。
+ *  有 B 帧时非零；缺省即 0，等价于 pts == dts。与服务端 moq_push.cpp 的
+ *  kLocCompositionTime 对应。 */
+export const LOC_COMPOSITION_TIME = 0x0e
 export const LOC_AUDIO_CONFIG = 0x0f
 export const LOC_TIMESTAMP = 0x10
 

@@ -40,7 +40,6 @@ typedef struct {
     /* RTT */
     uint64_t min_rtt_us;
     uint64_t min_rtt_stamp_ms;
-    uint64_t rtt_probe_us;      /* last min_rtt update timestamp (us) */
     uint64_t last_probe_rtt_ms; /* 上次 PROBE_RTT 的时刻 (ms) */
 
     /* state machine */
@@ -51,6 +50,8 @@ typedef struct {
     /* round tracking */
     uint64_t round_start_us;
     uint64_t round_bytes;
+    uint64_t round_start_pn;    /* 本轮首包号：ACK 到它 = 本轮走完一圈 */
+    uint64_t max_pn_sent;       /* 已发送的最大包号 */
     int      round_count;       /* startup rounds */
     uint64_t prev_max_bw;       /* bandwidth last round (startup exit) */
 
@@ -89,7 +90,7 @@ static double bbr_cwnd_gain(const quic_cc_bbr_t *bbr) {
     switch (bbr->state) {
     case BBR_STARTUP:  return BBR_STARTUP_GAIN_CWND;
     case BBR_DRAIN:    return BBR_DRAIN_GAIN_CWND;
-    case BBR_PROBE_BW: return 2.0;/*bbr_pbw_gain[bbr->probe_bw_phase];*/
+    case BBR_PROBE_BW: return bbr_pbw_gain[bbr->probe_bw_phase];
     case BBR_PROBE_RTT:return 1.0;
     default:           return 1.0;
     }
@@ -144,17 +145,28 @@ static void bbr_enter_probe_rtt(quic_cc_bbr_t *bbr) {
 
 static void bbr_handle_round_end(quic_cc_bbr_t *bbr, uint64_t now_us) {
     /* compute bandwidth for completed round */
-    uint64_t elapsed_us = now_us - bbr->round_start_us;
-    if (elapsed_us < 5000) elapsed_us = 5000;  /* floor: 5ms/round avoids false ~GB/s */
+    const uint64_t raw_elapsed_us = now_us - bbr->round_start_us;
+    /* 只防 0 除与测量噪声，不假设 RTT 有下限。
+     *
+     * 原值 5000us（5ms）是在公网上防「本地回环算出 GB/s 级假值」加的，
+     * 但它把回环的真实高带宽也一起压掉了：本地 RTT 常 <1ms，
+     * elapsed 恒被截断成 5ms → bw = round_bytes/5ms → 恒定低报，
+     * 而 cwnd = 2×bw×min_rtt 又反过来限制 round_bytes，
+     * 形成不动点（实测锁死在 cwnd=4800 / max_bw≈565KB/s）。
+     * 回环的高带宽不是噪声，是真值，不该被地板吃掉。 */
+    uint64_t elapsed_us = raw_elapsed_us;
+    if (elapsed_us < 100) elapsed_us = 100;
     /* bytes/sec = round_bytes * 1e6 / elapsed_us */
     uint64_t bw = (uint64_t)((double)bbr->round_bytes * 1e6
                              / (double)elapsed_us);
     bbr_update_max_bw(bbr, bw);
 
-    LOG_DEBUG("[cc-bbr] round end: %lluB/%lluus = %llu B/s"
+    /* 带 raw 值：一眼看出地板是否仍在生效（raw==elapsed 即未触发） */
+    LOG_DEBUG("[cc-bbr] round end: %lluB/%lluus(raw=%lluus) = %llu B/s"
              "  max_bw=%llu state=%d cwnd=%llu",
              (unsigned long long)bbr->round_bytes,
              (unsigned long long)elapsed_us,
+             (unsigned long long)raw_elapsed_us,
              (unsigned long long)bw,
              (unsigned long long)bbr->max_bw,
              bbr->state, (unsigned long long)bbr->cwnd_);
@@ -186,6 +198,8 @@ static void bbr_handle_round_end(quic_cc_bbr_t *bbr, uint64_t now_us) {
 
         /* Check PROBE_RTT: 每 10s 重探一次真实地板（对齐 WinMinRTT 窗口）*/
         if ((now_us / 1000) - bbr->last_probe_rtt_ms >= BBR_RTT_WINDOW_MS) {
+            LOG_INFO("[cc-bbr] PROBE_RTT triggered: %llu ms since last probe",
+                     (unsigned long long)((now_us / 1000) - bbr->last_probe_rtt_ms));
             bbr_enter_probe_rtt(bbr);
         }
         break;
@@ -201,13 +215,16 @@ static void bbr_handle_round_end(quic_cc_bbr_t *bbr, uint64_t now_us) {
     /* start new round */
     bbr->round_start_us = now_us;
     bbr->round_bytes = 0;
+    bbr->round_start_pn = bbr->max_pn_sent + 1;   /* 下一轮的首包号 */
 }
 
 /* ── 回调 ────────────────────────────────── */
 
 static void bbr_on_packet_sent(struct quic_cc *cc, uint64_t pn,
                                uint64_t bytes, uint64_t now_ms) {
-    (void)cc; (void)pn; (void)bytes; (void)now_ms;
+    quic_cc_bbr_t *bbr = (quic_cc_bbr_t*)cc->priv;
+    (void)bytes; (void)now_ms;
+    if (pn > bbr->max_pn_sent) bbr->max_pn_sent = pn;
 }
 
 static void bbr_on_packet_acked(struct quic_cc *cc, uint64_t pn,
@@ -243,9 +260,8 @@ static void bbr_on_packet_acked(struct quic_cc *cc, uint64_t pn,
         }
     }
 
-    /* end round when we've sent ~1 cwnd worth of data since round start.
-     * In BBR, a round ends when we ACK a packet sent after the round start. */
-    if (bbr->round_bytes >= bbr->cwnd_ / 2) {
+    /* In BBR, a round ends when we ACK a packet sent after the round start. */
+    if (pn >= bbr->round_start_pn) {
         bbr_handle_round_end(bbr, now_us);
     }
 
@@ -287,6 +303,8 @@ static uint64_t bbr_get_cwnd(const struct quic_cc *cc) {
     if (bbr->state == BBR_PROBE_RTT) {
         uint64_t now_ms = bbr_now_us() / 1000;
         if (now_ms - bbr->state_start_ms >= BBR_PROBE_RTT_DUR) {
+            LOG_INFO("[cc-bbr] PROBE_RTT timeout (%llums), force → PROBE_BW",
+                     (unsigned long long)(now_ms - bbr->state_start_ms));
             bbr_enter_probe_bw(bbr);
         }
     }
@@ -332,9 +350,12 @@ struct quic_cc *quic_cc_bbr_create(void) {
     bbr->cwnd_        = 32 * bbr->mss;  /* ~38KB initial window */
     bbr->min_rtt_us   = 0;
     bbr->min_rtt_stamp_ms = 0;
-    bbr->rtt_probe_us = bbr_now_us();
     bbr->last_probe_rtt_ms = bbr_now_us() / 1000;
     bbr->max_bw       = bbr->mss * 100; /* 120KB/s minimal */
+
+    bbr->round_start_pn = 0;                  /* 显式写出，calloc 已置零 */
+    bbr->max_pn_sent    = 0;
+    bbr->round_start_us = bbr_now_us();       /* 避免第一轮 elapsed 从 0 起算 */
 
     cc->ops  = &bbr_ops;
     cc->priv = bbr;

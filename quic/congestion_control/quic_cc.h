@@ -35,7 +35,7 @@ struct quic_cc_info {
 
 /* ── CC 算法必须实现的回调 ────────────────── */
 struct quic_cc_ops {
-    /* 发包后通知 — CC 不需要做任何事 */
+    /* 发包后通知 —— BBR 用它记录发送水位（max_pn_sent）以判定轮边界 */
     void (*on_packet_sent)(struct quic_cc *cc, uint64_t pn,
                            uint64_t bytes, uint64_t now_ms);
 

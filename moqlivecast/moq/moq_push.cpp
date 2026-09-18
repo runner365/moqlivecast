@@ -25,6 +25,7 @@ constexpr uint64_t kMoqtSubscribeOk = 0x04;
 constexpr uint64_t kLocTimescale = 0x08;
 constexpr uint64_t kLocFrameMark = 0x09;
 constexpr uint64_t kLocVideoConfig = 0x0d;
+constexpr uint64_t kLocCompositionTime = 0x0e;  /* 私有扩展：pts - dts */
 constexpr uint64_t kLocAudioConfig = 0x0f;
 constexpr uint64_t kLocTimestamp = 0x10;
 constexpr uint64_t kAliasVideo = 1;
@@ -125,11 +126,16 @@ std::vector<uint8_t> EncodeSubgroup(uint64_t alias, uint64_t group) {
 std::vector<uint8_t> EncodeLocObject(uint64_t delta, int64_t ts_ms,
                                      const uint8_t *payload, size_t payload_len,
                                      bool key, const uint8_t *cfg, size_t cfg_len,
-                                     bool video_cfg) {
+                                     bool video_cfg, int64_t cts_ms) {
     std::vector<std::pair<uint64_t, uint64_t>> even = {
         {kLocTimescale, 1000},
         {kLocTimestamp, ts_ms < 0 ? 0 : static_cast<uint64_t>(ts_ms)},
     };
+    /* 只有非零才带：绝大多数帧 cts=0，带上会平白增加每帧开销。
+     * 订阅端读不到即按 0 处理，语义等价。 */
+    if (cts_ms != 0) {
+        even.push_back({kLocCompositionTime, static_cast<uint64_t>(cts_ms)});
+    }
     std::vector<std::pair<uint64_t, std::vector<uint8_t>>> odd;
     if (key) odd.push_back({kLocFrameMark, {0x01}});
     if (cfg && cfg_len) {
@@ -753,8 +759,20 @@ void MoqPushSession::EmitLoc(Downlink &dl, uint64_t alias, Media_Packet_Ptr pkt)
     bool video_cfg = alias == kAliasVideo;
     bool key = pkt->is_key_frame_;
 
+    /* 视频 tag body 前 5 字节是 [frame|codec][AVCPacketType][CTS×3]。
+     * CTS 必须单独取出来：它是 24 位有符号、可能为负，且要用 LOC 的
+     * CompositionTime 属性重新下发，否则订阅端拿到的 pts 恒等于 dts，
+     * 有 B 帧的流在 MSE 上会前后跳。 */
+    int64_t cts_ms = 0;
     if (alias == kAliasVideo) {
         if (body_len < 5) return;
+        {
+            int32_t c = (static_cast<int32_t>(body[2]) << 16) |
+                        (static_cast<int32_t>(body[3]) << 8) |
+                        static_cast<int32_t>(body[4]);
+            if (c & 0x800000) c -= 0x1000000;   /* 24 位补码 → 有符号 */
+            cts_ms = pkt->is_seq_hdr_ ? 0 : c;  /* config 帧无显示时间 */
+        }
         payload = body + 5;
         payload_len = body_len - 5;
         if (pkt->is_seq_hdr_) {
@@ -775,7 +793,8 @@ void MoqPushSession::EmitLoc(Downlink &dl, uint64_t alias, Media_Packet_Ptr pkt)
     const int64_t ts = PullTs(pkt);
 
     const auto obj = EncodeLocObject(dl.obj == 0 ? 0 : 0, ts, payload, payload_len,
-                                     key && !pkt->is_seq_hdr_, cfg, cfg_len, video_cfg);
+                                     key && !pkt->is_seq_hdr_, cfg, cfg_len, video_cfg,
+                                     cts_ms);
     auto buf = std::make_shared<DataBuffer>(obj.size() + 64);
     buf->AppendData(reinterpret_cast<const char *>(obj.data()), obj.size());
 
@@ -846,6 +865,9 @@ bool MoqPushSession::ParseObject(StreamState &ss) {
     if (!MoqReadVarint(ss.buf.data(), ss.buf.size(), off, delta)) return false;
 
     int64_t ts_ms = 0;
+    /* pts - dts。缺省 0（等价于 pts == dts，即无 B 帧的流）。
+     * 客户端只在非零时携带该属性，所以读不到是正常情况。 */
+    int64_t cts_ms = 0;
     bool key = false;
     const uint8_t *cfg = nullptr;
     size_t cfg_len = 0;
@@ -866,6 +888,7 @@ bool MoqPushSession::ParseObject(StreamState &ss) {
                 uint64_t val = 0;
                 if (!MoqReadVarint(ss.buf.data(), ss.buf.size(), off, val)) return false;
                 if (type == kLocTimestamp) ts_ms = static_cast<int64_t>(val);
+                if (type == kLocCompositionTime) cts_ms = static_cast<int64_t>(val);
                 (void)kLocTimescale;
             } else {
                 uint64_t vlen = 0;
@@ -909,23 +932,24 @@ bool MoqPushSession::ParseObject(StreamState &ss) {
     std::vector<uint8_t> pay(payload, payload + static_cast<size_t>(payload_len));
     ss.buf.erase(ss.buf.begin(), ss.buf.begin() + static_cast<long>(off));
 
-    OnLocObject(ss.alias, ts_ms, key,
+    OnLocObject(ss.alias, ts_ms, cts_ms, key,
                 cfg_copy.empty() ? nullptr : cfg_copy.data(), cfg_copy.size(),
                 pay.data(), pay.size());
     (void)cfg_type;
     return true;
 }
 
-void MoqPushSession::OnLocObject(uint64_t alias, int64_t ts_ms, bool key,
-                                 const uint8_t *cfg, size_t cfg_len,
+void MoqPushSession::OnLocObject(uint64_t alias, int64_t ts_ms, int64_t cts_ms,
+                                 bool key, const uint8_t *cfg, size_t cfg_len,
                                  const uint8_t *payload, size_t payload_len) {
     if (!HasMedia() || !payload || payload_len == 0) return;
     if (alias == kAliasVideo) {
         if (cfg && cfg_len && !avc_seq_sent_) {
-            EmitFlvVideo(ts_ms, true, true, cfg, cfg_len);
+            /* config 帧没有显示时间，CTS 恒 0 */
+            EmitFlvVideo(ts_ms, true, true, cfg, cfg_len, 0);
             avc_seq_sent_ = true;
         }
-        EmitFlvVideo(ts_ms, false, key, payload, payload_len);
+        EmitFlvVideo(ts_ms, false, key, payload, payload_len, cts_ms);
         return;
     }
     if (alias == kAliasAudio) {
@@ -938,30 +962,44 @@ void MoqPushSession::OnLocObject(uint64_t alias, int64_t ts_ms, bool key,
 }
 
 void MoqPushSession::EmitFlvVideo(int64_t dts, bool seq, bool key,
-                                  const uint8_t *data, size_t len) {
+                                  const uint8_t *data, size_t len,
+                                  int64_t cts_ms) {
     const size_t body_len = 5 + len;
     auto pkt = std::make_shared<Media_Packet>(body_len);
     pkt->av_type_ = MEDIA_VIDEO_TYPE;
     pkt->codec_type_ = MEDIA_CODEC_H264;
     pkt->fmt_type_ = MEDIA_FORMAT_FLV;
     pkt->dts_ = dts;
-    pkt->pts_ = dts;
     pkt->is_seq_hdr_ = seq;
     pkt->is_key_frame_ = !seq && key;
     pkt->app_ = app_;
     pkt->streamname_ = stream_;
     pkt->key_ = app_ + "/" + stream_;
+    /* CompositionTime 是 24 位有符号，写 DTS 与 PTS 的差。
+     * 写 0（旧行为）会让播放端认为 pts == dts：有 B 帧的流解码顺序
+     * 与显示顺序不一致，MSE/flv.js 严格按容器时间戳渲染 → 画面前后跳。
+     * 负数在 FLV 里是合法值（B 帧需要），按 24 位补码写入。 */
+    const int64_t cts = seq ? 0 : cts_ms;
+    const uint32_t cts_u = static_cast<uint32_t>(cts) & 0xffffffu;
     uint8_t hdr[5] = {
         static_cast<uint8_t>((seq || key) ? (FLV_VIDEO_KEY_FLAG | FLV_VIDEO_H264_CODEC)
                                           : (FLV_VIDEO_INTER_FLAG | FLV_VIDEO_H264_CODEC)),
         static_cast<uint8_t>(seq ? FLV_VIDEO_AVC_SEQHDR : FLV_VIDEO_AVC_NALU),
-        0, 0, 0,
+        static_cast<uint8_t>((cts_u >> 16) & 0xff),
+        static_cast<uint8_t>((cts_u >> 8) & 0xff),
+        static_cast<uint8_t>(cts_u & 0xff),
     };
     pkt->buffer_ptr_->AppendData(reinterpret_cast<const char *>(hdr), 5);
     pkt->buffer_ptr_->AppendData(reinterpret_cast<const char *>(data), len);
+    /* pts = dts + cts。NormalizeDts 之后会平移 dts 但保留两者之差，
+     * 所以这个偏移能一路活到写 FLV tag 的时候。 */
+    pkt->pts_ = dts + cts;
     MediaStreamManager::WriterMediaPacket(pkt);
-    LOG_DEBUG("[moq-rfc] flv video %s dts=%lld size=%zu key=%d",
-             seq ? "seq" : "nalu", (long long)dts, len, key ? 1 : 0);
+    if (cts != 0) {
+        LOG_DEBUG("[moq-rfc] flv video %s dts=%lld cts=%lld pts=%lld size=%zu key=%d",
+                 seq ? "seq" : "nalu", (long long)dts, (long long)cts,
+                 (long long)(dts + cts), len, key ? 1 : 0);
+    }
 }
 
 void MoqPushSession::EmitFlvAudio(int64_t dts, bool seq,

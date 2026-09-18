@@ -39,7 +39,29 @@ type MediaSample = {
 
 /** 单条轨道的归一化状态：lastRaw 用于跳变检测，lastOut 用于条内单调性。
  *  时间轴原点 base 是**音视频共享**的（见 wcOriginMs），不放这里。 */
-type TsNorm = { lastRaw: number; lastOut: number }
+/* 时间戳归一化状态 + 连续性观测计数（诊断用） */
+type TsNorm = {
+  lastRaw: number
+  lastOut: number
+  /* 以下为观测统计，不参与归一化计算 */
+  statCount: number      /* 累计帧数 */
+  statBack: number       /* rawMs 回退次数 */
+  statPinned: number     /* 因回退被强制 +1 拉平的次数 */
+  statMinGap: number     /* 最小正间隔 */
+  statMaxGap: number     /* 最大间隔 */
+}
+
+function newTsNorm(): TsNorm {
+  return {
+    lastRaw: -1,
+    lastOut: -1,
+    statCount: 0,
+    statBack: 0,
+    statPinned: 0,
+    statMinGap: Number.MAX_SAFE_INTEGER,
+    statMaxGap: 0,
+  }
+}
 
 function parseAppStream(url: string): { app: string; stream: string } {
   try {
@@ -83,8 +105,8 @@ export class MoqPuller {
    * 客户端减同一个原点才能保持音画相对偏移；各自归零会把它们强行对齐到 0 → 音画错位。
    * 每条流另有独立的 lastRaw（跳变检测）与 lastOut（条内单调性）。 */
   private wcOriginMs = -1
-  private wcNormV: TsNorm = { lastRaw: -1, lastOut: -1 }
-  private wcNormA: TsNorm = { lastRaw: -1, lastOut: -1 }
+  private wcNormV: TsNorm = newTsNorm()
+  private wcNormA: TsNorm = newTsNorm()
   private wcFirstEmitLogged = false
   private onPhase: ((p: SessionPhase) => void) | null = null
   private mediaSeen = false
@@ -150,8 +172,8 @@ export class MoqPuller {
     this.tsShift = 0
     this.lastFlvTs = -1
     this.wcOriginMs = -1
-    this.wcNormV = { lastRaw: -1, lastOut: -1 }
-    this.wcNormA = { lastRaw: -1, lastOut: -1 }
+    this.wcNormV = newTsNorm()
+    this.wcNormA = newTsNorm()
     this.wcFirstEmitLogged = false
     this.mediaSeen = false
     this.onPhase = hooks.onPhase ?? null
@@ -446,8 +468,43 @@ export class MoqPuller {
       /* 条内单调：只防回退，不回拉大跳 */
       if (out <= n.lastOut) out = n.lastOut + 1
     }
+
+    /* ── 时间戳连续性观测（诊断用，不改行为）──
+     * 输入的 rawMs 是服务端发来的共享时间轴，out 是喂给解码器的值。
+     * 关注三件事：
+     *   1) rawMs 回退 —— 服务端时间轴倒退，MSE/解码器会缓冲异常
+     *   2) out 被强制 +1 —— 说明发生了回退被强行拉平，帧被压在同一时刻
+     *   3) out 间隔异常 —— 正常 15fps 应约 66.7ms
+     * 每帧打一条 debug，另有每 60 帧一条的汇总。 */
+    if (n.lastRaw >= 0) {
+      const dRaw = rawMs - n.lastRaw
+      if (dRaw < 0) n.statBack++
+      if (dRaw > n.statMaxGap) n.statMaxGap = dRaw
+      if (dRaw < n.statMinGap) n.statMinGap = dRaw
+      if (out === n.lastOut + 1 && dRaw <= 0) n.statPinned++
+      log_debug(
+        'moq-pull',
+        `ts[${tag}] #${n.statCount} raw=${rawMs} out=${out} ` +
+          `dRaw=${dRaw} dOut=${n.lastOut >= 0 ? out - n.lastOut : 0} ` +
+          `origin=${this.wcOriginMs}${dRaw < 0 ? '  <<< 回退' : ''}`,
+      )
+    }
+
+    n.statCount++
     n.lastRaw = rawMs
     n.lastOut = out
+
+    if (n.statCount % 60 === 0) {
+      log_info(
+        'moq-pull',
+        `ts统计[${tag}] ${n.statCount}帧 out=${out}ms ` +
+          `回退=${n.statBack} 被钉平=${n.statPinned} ` +
+          `间隔 min=${n.statMinGap === Number.MAX_SAFE_INTEGER ? '-' : n.statMinGap}` +
+          `/max=${n.statMaxGap}ms ` +
+          `origin=${this.wcOriginMs}` +
+          (n.statBack > 0 ? '  ← 时间戳有回退' : ''),
+      )
+    }
     return out
   }
 
@@ -460,12 +517,23 @@ export class MoqPuller {
       /* 音视频各用一套归一化状态：两条流的 ts 轴不同、到达交错，
        * 共用会让 base/lastRaw 互相污染，导致帧时间戳远大于时钟、渲染队列堆死。 */
       const norm = isVideo ? this.wcNormV : this.wcNormA
-      const outMs = this.normalizeMediaTs(norm, sample.ts, isVideo ? 'v' : 'a')
+      /* 先按 DTS 归一化，再加 CTS。
+       *
+       * 顺序不能反：normalizeMediaTs 带单调性保证（out <= lastOut 时强制 +1），
+       * 而 PTS 在有 B 帧时本就不单调（显示顺序 ≠ 解码顺序）。
+       * 若直接把 pts 喂进去，正常的 B 帧回退会被拉平成一堆同刻帧。
+       * DTS 单调，归一化对它是纯平移，所以
+       *   normalize(dts) + cts === (dts + cts) - origin === pts - origin
+       * 语义等价且不触发单调保护。音频无 B 帧，cts 恒 0。 */
+      const dtsOutMs = this.normalizeMediaTs(norm, sample.ts, isVideo ? 'v' : 'a')
+      const ctsMs = isVideo ? obj.ctsMs : 0
+      const outMs = dtsOutMs + ctsMs
       if (!this.wcFirstEmitLogged) {
         this.wcFirstEmitLogged = true
         log_info(
           'moq-pull',
-          `first sample emitted alias=${sample.alias} rawTs=${sample.ts} outTs=${outMs} ` +
+          `first sample emitted alias=${sample.alias} rawTs=${sample.ts} cts=${ctsMs} ` +
+            `dtsOut=${dtsOutMs} ptsOut=${outMs} ` +
             `${obj.payload.byteLength}B key=${obj.key ? 1 : 0}`,
         )
       }
@@ -484,7 +552,9 @@ export class MoqPuller {
     if (!mux) return
     const ts = this.mapFlvTs(sample.ts)
     if (sample.alias === ALIAS_VIDEO) {
-      mux.writeAvcNalu(obj.payload, ts, 0, obj.key)
+      /* 第三参是 CTS（写进 FLV tag 的 CompositionTime）。
+       * 原先硬编码 0 → pts 恒等于 dts，有 B 帧的流在 MSE 上前后跳。 */
+      mux.writeAvcNalu(obj.payload, ts, obj.ctsMs ?? 0, obj.key)
       return
     }
     mux.writeAacRaw(obj.payload, ts)

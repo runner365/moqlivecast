@@ -308,6 +308,33 @@ add_dependencies(http3_wt_echo_client ssl crypto)
 endif()
 
 # ============================================
+# WebTransport 客户端静态库（供外部工具复用）
+# 只含客户端路径：不含 http3_server / webtransport_session（服务端）
+# ============================================
+add_library(webtransport_client STATIC
+    http3/webtransport_client_api.c
+    http3/http3_frame.c
+    http3/qpack.c
+    http3/huffman.c
+    ${UDP_COMMON_SOURCES} ${TLS_COMMON_SOURCES}
+    ${QUIC_COMMON_SOURCES} ${LOGGER_SOURCES}
+)
+
+set_target_properties(webtransport_client PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+)
+
+target_include_directories(webtransport_client PUBLIC
+    3rdparty/libuv/include
+    ${OPENSSL_INSTALL_DIR}/include
+    udp tls quic quic/congestion_control http3 logger
+)
+
+# PUBLIC → 链接方自动继承 uv_a/ssl/crypto 和上面的 include
+target_link_libraries(webtransport_client PUBLIC uv_a ssl crypto)
+add_dependencies(webtransport_client ssl crypto)
+
+# ============================================
 # WebTransport Client API echo 测试
 # ============================================
 add_executable(wt_client_echo
@@ -403,6 +430,12 @@ target_link_libraries(udp_jitter_proxy PRIVATE uv_a)
 target_include_directories(udp_jitter_proxy PRIVATE
     3rdparty/libuv/include
 )
+
+# ============================================
+# flv2moq_client（FLV 文件 → MOQT 推流工具）
+# 依赖上面的 webtransport_client 静态库
+# ============================================
+add_subdirectory(tools/flv2moq_client)
 
 # ============================================
 # Media over WebTransport（C++ 服务端）

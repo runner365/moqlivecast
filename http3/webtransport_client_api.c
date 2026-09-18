@@ -52,6 +52,7 @@ typedef struct wt_task {
     /* CONNECT */
     char   *host;
     int     port;
+    char   *path;
     /* STREAM_WRITE / STREAM_CLOSE */
     wt_stream_t *stream;
     /* STREAM_WRITE */
@@ -83,6 +84,10 @@ struct wt_client {
     QuicConnection  *qc;
     uint64_t         ctrl_sid;       /* H3 控制流 */
     int              connect_sent;   /* CONNECT 已发送 */
+    /* CONNECT 请求的 :path / :authority（默认 "/" 与 "127.0.0.1:4433"）。
+     * 长度上限与 send_wt_connect_internal 的 hdr[512] 配套，勿随意放大。 */
+    char             path[192];
+    char             authority[96];
     /* Stream 链表 */
     wt_stream_t     *streams;
     /* 任务队列 + 互斥锁 */
@@ -169,14 +174,20 @@ wt_client_t *wt_client_new(uv_loop_t *loop, wt_callbacks_t *cb) {
     return cli;
 }
 
-void wt_client_connect(wt_client_t *cli, const char *host, int port) {
-    if (!cli) return;
+void wt_client_connect_path(wt_client_t *cli, const char *host, int port,
+                            const char *path) {
+    if (!cli || !host) return;
     wt_task_t *t = (wt_task_t*)calloc(1, sizeof(*t));
     t->type = WT_TASK_CONNECT;
     t->host = strdup(host);
     t->port = port;
+    t->path = strdup(path && path[0] ? path : "/");
     task_push(cli, t);
     uv_async_send(&cli->async);
+}
+
+void wt_client_connect(wt_client_t *cli, const char *host, int port) {
+    wt_client_connect_path(cli, host, port, "/");
 }
 
 void wt_client_close(wt_client_t *cli) {
@@ -242,6 +253,11 @@ static void async_cb(uv_async_t *h) {
         case WT_TASK_CONNECT:
             if (cli->state == WT_STATE_IDLE) {
                 cli->state = WT_STATE_CONNECTING;
+                /* 在 loop 线程上落盘 :path / :authority，供 CONNECT 使用 */
+                snprintf(cli->path, sizeof(cli->path), "%s",
+                         t->path ? t->path : "/");
+                snprintf(cli->authority, sizeof(cli->authority), "%s:%d",
+                         t->host, t->port);
                 cli->qc = QuicConnectionCreate(cli->loop);
                 QuicConnectionSetIdleTimeout(cli->qc, 300000); /* 300s covers full test */
                 QuicConnectionSetAppData(cli->qc, cli);
@@ -279,6 +295,7 @@ static void async_cb(uv_async_t *h) {
 static void free_task(wt_task_t *t) {
     if (!t) return;
     free(t->host);
+    free(t->path);
     free(t->data);
     free(t);
 }
@@ -452,10 +469,15 @@ static void send_wt_connect_internal(wt_client_t *cli) {
     qpack_write_literal_i(hdr, &p, ":method",   "CONNECT");
     qpack_write_literal_i(hdr, &p, ":protocol", "webtransport");
     qpack_write_literal_i(hdr, &p, ":scheme",   "https");
-    qpack_write_literal_i(hdr, &p, ":path",     "/");
-    qpack_write_literal_i(hdr, &p, ":authority", "127.0.0.1:4433");
+    qpack_write_literal_i(hdr, &p, ":path",     cli->path[0] ? cli->path : "/");
+    qpack_write_literal_i(hdr, &p, ":authority",
+                          cli->authority[0] ? cli->authority : "127.0.0.1:4433");
     qpack_write_literal_i(hdr, &p, "sec-webtransport-http3-draft-02", "1");
 
+    if (p >= sizeof(hdr)) {
+        LOG_WARN("[wt-api] CONNECT header overflow (%zu bytes), path too long", p);
+        return;
+    }
     uint8_t frame[1024];
     int flen = h3_frame_write_headers(frame, sizeof(frame), hdr, p);
     if (flen < 0) { LOG_WARN("[wt-api] HEADERS frame failed"); return; }

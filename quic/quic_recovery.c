@@ -340,12 +340,6 @@ static void detect_losses(QuicRecoveryCtx *ctx, uint64_t now_ms) {
         if (p->acknowledged || p->lost) continue;
 
         int lv = pkt_type_to_level(p->pkt_type);
-        if (p->pn <= ctx->largest_acked_pn_[lv]) {
-            LOG_DEBUG("[quic-recovery] LOSS pn=%llu BUT largest_acked=%llu (already acked?!) chunk=%llu",
-                     (unsigned long long)p->pn,
-                     (unsigned long long)ctx->largest_acked_pn_[lv],
-                     (unsigned long long)p->chunk_id);
-        }
         int64_t pn_diff = (int64_t)ctx->largest_acked_pn_[lv] - (int64_t)p->pn;
         int pn_threshold_met = (pn_diff >= 3);
         int time_threshold_met = (now_ms - p->time_sent_ms > time_threshold);
@@ -383,6 +377,15 @@ static void detect_losses(QuicRecoveryCtx *ctx, uint64_t now_ms) {
         if (ctx->send_imm_fn) {
             ctx->current_retrans_chunk_id_ = p->chunk_id;
             ctx->send_imm_fn(ctx->conn_, p->pkt_type, p->frames, p->frames_len);
+            /* 必须记账：PTO 循环靠这两个字段判断「刚重传过」。
+             * 不更新的话 last_retrans_ms 停留在旧值，冷却判断恒真、
+             * PTO 会立刻把同一个 chunk 再重传一次（实测日志里
+             * 同一毫秒内出现两次重传，且 retrans=0 暴露了这点）。
+             * retrans_count 不涨还会让 :487 的 20 次断连保护失效。 */
+            if (c) {
+                c->retrans_count++;
+                c->last_retrans_ms = now_ms;
+            }
         }
         LOG_DEBUG("[quic-recovery] chunk=%llu pn=%llu LOST → retransmit"
                  " (pn_diff=%lld time=%llums)",
@@ -487,7 +490,7 @@ static void on_pto_timer(void *user) {
         QuicRecoveryChunk *c = &ctx->chunks_[i];
         if (c->state == QUIC_CHUNK_ACKED || !c->frames) continue;
 
-        /* PTO 冷却：20 次重传后放弃 + 同 chunk 50ms 间隔防叠加。
+        /* PTO 冷却：20 次重传后放弃 + 同 chunk 一个 pto_base_ 内不重复重传。
          * 放弃上限仅对应用层（1-RTT）生效；握手空间（Initial/Handshake）
          * 豁免，持续重传到握手完成清理，避免弱网握手死锁。 */
         if (c->retrans_count >= 20 && c->pkt_type == -1) {
@@ -502,7 +505,12 @@ static void on_pto_timer(void *user) {
                 return;
             }
         }
-        if (now - c->last_retrans_ms < 10) continue;
+        /* 冷却必须随 RTT 缩放：固定 10ms 在远程（RTT 15~30ms）下
+         * 短于一个 RTT，等于允许在对端 ACK 回来之前就重传同一个 chunk。
+         * 用 pto_base_（= srtt + 4×rttvar，且下限 QUIC_MIN_PTO_MS）而
+         * 不是裸的 smoothed_rtt_ —— 本地回环 RTT 亚毫秒，裸用会把
+         * 冷却彻底关掉。pto_base_ 的语义本就是「多久没回应才该重传」。 */
+        if (now - c->last_retrans_ms < ctx->pto_base_) continue;
 
         LOG_DEBUG("[quic-recovery] PTO retrans: chunk=%llu %zuB state=%d"
                  " retrans=%d",
@@ -552,7 +560,6 @@ static void arm_pto_timer(QuicRecoveryCtx *ctx) {
      * 上限由 idle timeout 兜底。 */
 
     quic_timer_stop(&ctx->pto_timer_);
-    if (ctx->fix_pto_timeout_ > 0) timeout = ctx->fix_pto_timeout_;
     quic_timer_start(&ctx->pto_timer_, on_pto_timer, ctx, timeout, 0);
 }
 
@@ -576,7 +583,6 @@ void quic_recovery_init(QuicRecoveryCtx *ctx, void *conn, uv_loop_t *loop,
     // ctx->cc_ = cc ? cc : quic_cc_newreno_create();
     ctx->pto_base_ = QUIC_INITIAL_PTO_MS;
     ctx->current_retrans_chunk_id_ = UINT64_MAX;  /* 未复用哨兵 */
-    ctx->fix_pto_timeout_ = 30; // for debug pto timeout fix
     ctx->last_ack_log_s_ = 0;
     quic_timer_init(&ctx->pto_timer_);
 }
@@ -690,7 +696,9 @@ void quic_recovery_on_packet_sent(QuicRecoveryCtx *ctx, uint64_t pn,
     }
     if (ack_eliciting)
         ctx->bytes_in_flight_ += bytes_sent;
-
+    /* 通知 CC：包已发出（真实发送侧水位，供 BBR 判定轮边界） */
+    if (ctx->cc_ && ctx->cc_->ops->on_packet_sent && pkt_type == -1)
+        ctx->cc_->ops->on_packet_sent(ctx->cc_, pn, bytes_sent, now_ms);
     ctx->sent_head_ = (idx + 1) % QUIC_RECOVERY_MAX_SENT_PACKETS;
 
     LOG_DEBUG("[quic-recovery] SENT pn=%llu chunk=%llu%s ack=%d pkt_type=%d bytes=%llu inflight=%llu",

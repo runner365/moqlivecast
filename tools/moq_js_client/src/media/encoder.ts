@@ -9,7 +9,25 @@ const VIDEO_BITRATE = 800_000
 const AUDIO_BITRATE = 128_000
 const KEYFRAME_INTERVAL_US = 4_000_000
 
-const VIDEO_CODECS = ['avc1.64001f', 'avc1.4d001f', 'avc1.42E01E']
+/* 实验：强制 H.264 High profile，不做降级。
+ * 64=High, 00=constraint flags, 1f=Level 3.1（640x360@15fps 够用）。
+ * 之前这里是 ['avc1.64001f','avc1.4d001f','avc1.42E01E']，会在
+ * isConfigSupported 返回 false 时静默退到 Main/Baseline，
+ * 导致「以为在测 High，实际跑的是别的档位」。 */
+const VIDEO_CODEC = 'avc1.64001f'
+
+/* latencyMode：直播推流取 'realtime'（低延迟优先）。
+ *
+ * 已实测（2026-09-18，Chrome + avc1.64001f @640x360）：改成 'quality'
+ * 后浏览器确实接受了该配置（isConfigSupported 回填 latencyMode=quality），
+ * 但 300 帧编码结果仍是「PTS 无回退」→ 不产生 B 帧。
+ * 结论：WebCodecs 的 EncodedVideoChunk 只有一个时间戳字段，
+ * 无法表达「解码顺序 ≠ 呈现顺序」，因此该路径天然不会有 B 帧，
+ * 下游按 cts=0 组装是正确的。详见同文件的重排序检测日志。
+ *
+ * 注意：avc.format 必须保持 'avc'（AVCC）—— 下游服务端按 AVCC 拼 FLV，
+ * 改成 'annexb' 会拿不到 avcC description，整条链路失效。 */
+const VIDEO_LATENCY_MODE: LatencyMode = 'realtime'
 const AUDIO_CODECS = ['mp4a.40.2', 'mp4a.40.02', 'aac']
 
 export type EncoderStatus = {
@@ -34,20 +52,34 @@ function asU8(src: AllowSharedBufferSource): Uint8Array {
 }
 
 async function pickVideoCodec(width: number, height: number): Promise<VideoEncoderConfig> {
-  for (const codec of VIDEO_CODECS) {
-    const config: VideoEncoderConfig = {
-      codec,
-      width,
-      height,
-      bitrate: VIDEO_BITRATE,
-      framerate: VIDEO_FPS,
-      latencyMode: 'realtime',
-      avc: { format: 'avc' },
-    }
-    const r = await VideoEncoder.isConfigSupported(config)
-    if (r.supported) return (r.config ?? config) as VideoEncoderConfig
+  const config: VideoEncoderConfig = {
+    codec: VIDEO_CODEC,
+    width,
+    height,
+    bitrate: VIDEO_BITRATE,
+    framerate: VIDEO_FPS,
+    latencyMode: VIDEO_LATENCY_MODE,
+    avc: { format: 'avc' },
   }
-  throw new Error('This browser does not support WebCodecs H.264 encoding')
+  const r = await VideoEncoder.isConfigSupported(config)
+  log_info(
+    'encoder',
+    `probe ${VIDEO_CODEC} ${width}x${height} latencyMode=${VIDEO_LATENCY_MODE}: ` +
+      `supported=${r.supported}` +
+      /* r.config 是浏览器回填的实际配置 —— 用它确认 latencyMode 是否被采纳 */
+      (r.config ? ` codec=${r.config.codec} latencyMode=${r.config.latencyMode}` : ''),
+  )
+  if (!r.supported) {
+    /* 不再静默降级 —— 实验需要确知跑的就是 High。
+     * 若这里抛出，说明浏览器/硬件不支持该档位，需要改 level 或换 profile。 */
+    throw new Error(
+      `WebCodecs 不支持 H.264 High profile (${VIDEO_CODEC}) @ ${width}x${height}；` +
+        `请查看控制台 probe 日志确认`,
+    )
+  }
+  const chosen = (r.config ?? config) as VideoEncoderConfig
+  log_info('encoder', `selected ${chosen.codec}`)
+  return chosen
 }
 
 async function pickAudioCodec(): Promise<AudioEncoderConfig | null> {
@@ -85,6 +117,17 @@ export class AvcAacEncoder {
   private videoOut = 0
   private dropP = 0
   private lastBeatMs = 0
+  /* ── 重排序（B 帧）观测 ── */
+  private tsSeen = 0          /* 出帧总数 */
+  private tsPrevMs = -1       /* 上一帧 PTS */
+  private tsFirstMs = -1
+  private tsLastMs = 0
+  private tsBack = 0          /* PTS 回退次数（>0 说明有 B 帧） */
+  private tsBackMax = 0       /* 最大单次回退（负数，越小回退越多） */
+  private tsBackLast = 0      /* 最近一次回退量（负数） */
+  private tsBackReported = 0  /* 已上报的回退次数 */
+  private tsDup = 0           /* PTS 重复次数 */
+  private tsMaxGap = 0        /* 最大正向间隔，用于判断帧率是否稳定 */
   status: EncoderStatus = {
     videoCodec: '',
     audioCodec: '',
@@ -131,6 +174,16 @@ export class AvcAacEncoder {
     this.videoOut = 0
     this.dropP = 0
     this.lastBeatMs = 0
+    this.tsSeen = 0
+    this.tsPrevMs = -1
+    this.tsFirstMs = -1
+    this.tsLastMs = 0
+    this.tsBack = 0
+    this.tsBackMax = 0
+    this.tsBackLast = 0
+    this.tsBackReported = 0
+    this.tsDup = 0
+    this.tsMaxGap = 0
     return this.status
   }
 
@@ -163,14 +216,76 @@ export class AvcAacEncoder {
 
   private onVideo(chunk: EncodedVideoChunk, meta?: EncodedVideoChunkMetadata) {
     const desc = meta?.decoderConfig?.description
-    const dts = Math.max(0, Math.round(chunk.timestamp / 1000))
+    /* chunk.timestamp 是送入 VideoFrame 的呈现时间（PTS），不是 DTS。
+     * 下面用「输出顺序 + 时间戳单调性」反推是否存在重排序（B 帧）。 */
+    const ptsMs = Math.max(0, Math.round(chunk.timestamp / 1000))
+    this.checkReorder(ptsMs, chunk.type)
+
     if (desc && !this.avcC) {
       this.avcC = asU8(desc)
-      log_info('encoder', `AVC seq header ${this.avcC.byteLength}B dts=${dts} hex=${hex_preview(this.avcC)}`)
-      this.muxer.writeAvcSeq(this.avcC, dts)
+      log_info(
+        'encoder',
+        `AVC seq header ${this.avcC.byteLength}B pts=${ptsMs} hex=${hex_preview(this.avcC)}`,
+      )
+      this.muxer.writeAvcSeq(this.avcC, ptsMs)
     }
     if (!this.avcC) return
-    this.muxer.writeAvcNalu(chunkBytes(chunk), dts, 0, chunk.type === 'key')
+    /* cts 传 0 —— 下游 FLV tag 里 pts 会被写成等于 dts。
+     * 若 checkReorder 报出重排序，这里传 0 就是错的，需要传真实 CTS。 */
+    this.muxer.writeAvcNalu(chunkBytes(chunk), ptsMs, 0, chunk.type === 'key')
+  }
+
+  /* ── 重排序（B 帧）检测 ──
+   * WebCodecs 不暴露 DTS，EncodedVideoChunk.timestamp 是 PTS，
+   * 输出顺序则是解码顺序。于是：
+   *   - 编码器按 PTS 递增顺序输出  → 无重排序（无 B 帧），dts == pts
+   *   - 出现 PTS 回退（后一帧 PTS 小于前一帧，超出容忍抖动）
+   *                              → 有重排序（B 帧），dts != pts
+   * 同时统计时间戳间隔，便于判断是否恒定帧率。
+   * 仅做观测，不改变行为。 */
+  private checkReorder(ptsMs: number, type: EncodedVideoChunkType) {
+    this.tsSeen++
+    this.tsFirstMs = this.tsFirstMs < 0 ? ptsMs : this.tsFirstMs
+    this.tsLastMs = ptsMs
+
+    if (this.tsPrevMs >= 0) {
+      const delta = ptsMs - this.tsPrevMs
+      if (delta === 0) this.tsDup++
+      if (delta < 0) {
+        /* 容忍 1ms 的取整抖动，避免误报 */
+        if (delta < -1) {
+          this.tsBack++
+          this.tsBackLast = delta
+          this.tsBackMax = Math.min(this.tsBackMax, delta)
+        }
+      } else if (this.tsMaxGap < delta) {
+        this.tsMaxGap = delta
+      }
+    }
+    this.tsPrevMs = ptsMs
+
+    /* 出现新的回退就立刻告警一次；否则每 150 帧打一次统计 */
+    if (this.tsBack > this.tsBackReported) {
+      this.tsBackReported = this.tsBack
+      log_warn(
+        'encoder',
+        `视频重排序检测: 第 ${this.tsSeen} 帧 PTS=${ptsMs} 相对上一帧回退 ` +
+          `${-this.tsBackLast}ms；累计回退 ${this.tsBack} 次` +
+          `（最大单次 ${-this.tsBackMax}ms）。说明存在 B 帧 → dts != pts，` +
+          `而当前 muxer 把 cts 写死 0`,
+      )
+    } else if (this.tsSeen % 150 === 0) {
+      const fps =
+        this.tsLastMs > this.tsFirstMs
+          ? ((this.tsSeen - 1) * 1000) / (this.tsLastMs - this.tsFirstMs)
+          : 0
+      log_info(
+        'encoder',
+        `视频时间戳统计: ${this.tsSeen} 帧 PTS ${this.tsFirstMs}..${this.tsLastMs}ms ` +
+          `≈${fps.toFixed(1)}fps 回退=${this.tsBack} 重复=${this.tsDup} 最大间隔=${this.tsMaxGap}ms ` +
+          `→ ${this.tsBack > 0 ? '存在重排序(dts!=pts)' : '无重排序(dts==pts)'}`,
+      )
+    }
   }
 
   private audioDts(chunk: EncodedAudioChunk): number {
