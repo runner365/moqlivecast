@@ -24,11 +24,25 @@
 #define BBR_RTT_WINDOW_MS  10000 /* min rtt window */
 #define BBR_MIN_RTT_US     3000  /* 3ms floor — hybrid loopback+proxy */
 #define BBR_PROBE_RTT_DUR  200   /* ms, probe_rtt lasts this long */
+/* ══ cwnd_gain 与 pacing_gain 是两个独立的增益（BBRv1）══
+ *
+ * 曾经的错误：PROBE_BW 下把 pacing 增益表当 cwnd 增益用，于是
+ * cwnd = 1.0 × BDP（多数相位），交付速率恒等于 cwnd/RTT ≡ max_bw，
+ * 测量只是在复述 cwnd，不携带链路信息（实测 max_bw ≈ cwnd/min_rtt）。
+ *
+ * 正确做法：cwnd_gain 在 PROBE_BW 恒为 2.0（留 2×BDP 余量，使
+ * cwnd 不成为瓶颈），发送速率由 pacing_gain × BtlBw 决定。 */
 #define BBR_STARTUP_GAIN_CWND    2.0
 #define BBR_DRAIN_GAIN_CWND      0.5
+#define BBR_PROBE_BW_GAIN_CWND   2.0   /* 常量，与相位无关 */
+#define BBR_PROBE_RTT_GAIN_CWND  1.0
 
 /* pacing gain per PROBE_BW phase (8-phase cycle) */
 static const double bbr_pbw_gain[8] = {1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+
+/* STARTUP 的 pacing gain = 2/ln2，一輪可翻倍带宽 */
+#define BBR_STARTUP_GAIN_PACING  2.89
+#define BBR_DRAIN_GAIN_PACING    1.0
 
 typedef struct {
     /* bandwidth */
@@ -86,10 +100,24 @@ static void bbr_update_max_bw(quic_cc_bbr_t *bbr, uint64_t bw) {
         if (bbr->bw_buf[i] > bbr->max_bw) bbr->max_bw = bbr->bw_buf[i];
 }
 
+/* cwnd 增益：只负责留出在途余量，不参与速率决策。
+ * PROBE_BW 恒为 2.0 —— 曾经的 bbr_pbw_gain[phase] 是错的（见上方注释）。 */
 static double bbr_cwnd_gain(const quic_cc_bbr_t *bbr) {
     switch (bbr->state) {
     case BBR_STARTUP:  return BBR_STARTUP_GAIN_CWND;
     case BBR_DRAIN:    return BBR_DRAIN_GAIN_CWND;
+    case BBR_PROBE_BW: return BBR_PROBE_BW_GAIN_CWND;
+    case BBR_PROBE_RTT:return BBR_PROBE_RTT_GAIN_CWND;
+    default:           return 1.0;
+    }
+}
+
+/* pacing 增益：决定发送速率 = gain × BtlBw。这才是相位增益的用武之地。
+ * PROBE_BW 用它做周期探测（1.25 试探更高带宽 / 0.75 排空队列）。 */
+static double bbr_pacing_gain(const quic_cc_bbr_t *bbr) {
+    switch (bbr->state) {
+    case BBR_STARTUP:  return BBR_STARTUP_GAIN_PACING;
+    case BBR_DRAIN:    return BBR_DRAIN_GAIN_PACING;
     case BBR_PROBE_BW: return bbr_pbw_gain[bbr->probe_bw_phase];
     case BBR_PROBE_RTT:return 1.0;
     default:           return 1.0;
@@ -320,6 +348,15 @@ static void bbr_get_info(const struct quic_cc *cc, struct quic_cc_info *out) {
     out->algo = QUIC_CC_ALGO_BBR;
     out->state = bbr->state;
     out->min_rtt_us = bbr->min_rtt_us;
+    /* 发送速率 = pacing_gain × BtlBw。max_bw 尚未建立时保持 0，
+     * 发送路径据此判定「pacing 未就绪」而放行。 */
+    if (bbr->max_bw > 0) {
+        double pg = bbr_pacing_gain(bbr);
+        double rate = pg * (double)bbr->max_bw;
+        if (rate < 0.0) rate = 0.0;
+        if (rate > 1e12) rate = 1e12;   /* 防溢出到 uint64 之外 */
+        out->pacing_rate_bps = (uint64_t)rate;
+    }
 }
 
 static void bbr_destroy(struct quic_cc *cc) {

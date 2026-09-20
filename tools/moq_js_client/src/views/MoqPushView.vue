@@ -12,7 +12,7 @@
         v-model="address"
         class="input"
         :disabled="busy"
-        placeholder="https://host:4433/moq?app=live&amp;stream=123456"
+        placeholder="https://host:4433/moq?app=live&amp;stream=<stream>"
       />
       <button class="btn" :class="{ stop: connected }" :disabled="busy" @click="onClick">
         {{ btnText }}

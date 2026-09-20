@@ -1,4 +1,5 @@
 import flvjs from 'flv.js'
+import { sessionStream } from '../config'
 import { hex_preview, log_debug, log_error, log_info, log_warn } from '../logger'
 import {
   isSubscribeOk,
@@ -64,14 +65,16 @@ function newTsNorm(): TsNorm {
 }
 
 function parseAppStream(url: string): { app: string; stream: string } {
+  /* URL 缺参数时的兜底用 sessionStream()，而不是写死 '123456'：
+   * 保持一致才能让「没填 stream 的推流」与「同标签页的拉流」对上。 */
   try {
     const u = new URL(url)
     return {
       app: u.searchParams.get('app') || 'live',
-      stream: u.searchParams.get('stream') || '123456',
+      stream: u.searchParams.get('stream') || sessionStream(),
     }
   } catch {
-    return { app: 'live', stream: '123456' }
+    return { app: 'live', stream: sessionStream() }
   }
 }
 

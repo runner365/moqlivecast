@@ -162,11 +162,26 @@ static QuicRecoveryChunk *chunk_find(QuicRecoveryCtx *ctx, uint64_t chunk_id) {
     return NULL;
 }
 
+/* 新建 chunk 的统一起点：memset 之后必须把两个时间戳锚定到"现在"。
+ *
+ * memset 会把 last_retrans_ms 置 0，而 PTO 冷却判据是
+ *     now - last_retrans_ms < pto_base_
+ * now 是 uv_now()（进程运行毫秒），只要进程跑过 pto_base_ 就恒成立
+ * (now - 0 = now)，于是每个新建 chunk 一被 PTO 扫到就被立即重传。
+ * 重传又产生新 chunk，形成滚雪球，最终耗尽 512 个槽位
+ * （实测：某一轮 retrans=5..9 各占满 512 个 = 全量集体重传）。 */
+static void chunk_init_timestamps(QuicRecoveryCtx *ctx, QuicRecoveryChunk *c) {
+    const uint64_t now = uv_now(ctx->loop_);
+    c->first_sent_ms = now;
+    c->last_retrans_ms = now;
+}
+
 static QuicRecoveryChunk *chunk_alloc(QuicRecoveryCtx *ctx) {
     if (ctx->chunk_count_ < QUIC_RECOVERY_MAX_CHUNKS) {
         QuicRecoveryChunk *c = &ctx->chunks_[ctx->chunk_count_++];
         memset(c, 0, sizeof(*c));
         c->chunk_id = ctx->next_chunk_id_++;
+        chunk_init_timestamps(ctx, c);
         return c;
     }
     /* 满了 → 清理已 ACK 的 chunk */
@@ -183,7 +198,32 @@ static QuicRecoveryChunk *chunk_alloc(QuicRecoveryCtx *ctx) {
         QuicRecoveryChunk *c = &ctx->chunks_[ctx->chunk_count_++];
         memset(c, 0, sizeof(*c));
         c->chunk_id = ctx->next_chunk_id_++;
+        chunk_init_timestamps(ctx, c);
         return c;
+    }
+
+    /* Still full: not a single ACKED chunk was reclaimable. That is
+     * abnormal -- a healthy flow always has completed chunks to recycle.
+     * Dump the state/retransmit distribution to distinguish "ACKs are not
+     * taking effect" from "there really is this much data in flight". */
+    {
+        int lost_n = 0, sending_n = 0, oldest_retrans = 0;
+        uint64_t oldest_id = UINT64_MAX;
+        for (int i = 0; i < ctx->chunk_count_ && i < 8; i++) {
+            const QuicRecoveryChunk *c = &ctx->chunks_[i];
+            if (c->state == QUIC_CHUNK_LOST) lost_n++;
+            else if (c->state == QUIC_CHUNK_SENDING) sending_n++;
+            if (c->chunk_id < oldest_id) {
+                oldest_id = c->chunk_id;
+                oldest_retrans = c->retrans_count;
+            }
+        }
+        LOG_ERROR("[quic-recovery] chunk pool exhausted: count=%d "
+                  "(first8: lost=%d sending=%d) oldest chunk_id=%llu retrans=%d "
+                  "next_id=%llu - no ACKED to reclaim, suspect ACKs not applied",
+                  ctx->chunk_count_, lost_n, sending_n,
+                  (unsigned long long)oldest_id, oldest_retrans,
+                  (unsigned long long)ctx->next_chunk_id_);
     }
     return NULL;
 }
@@ -191,7 +231,21 @@ static QuicRecoveryChunk *chunk_alloc(QuicRecoveryCtx *ctx) {
 /* ACK 到达 → 标记 chunk 及其所有 sent_packet 为已确认 */
 static void chunk_mark_acked(QuicRecoveryCtx *ctx, uint64_t chunk_id) {
     QuicRecoveryChunk *c = chunk_find(ctx, chunk_id);
-    if (!c || c->state == QUIC_CHUNK_ACKED) return;
+    if (!c) {
+        /* Silent return would make the ACK vanish: the chunk stays in
+         * SENDING/LOST forever, can never be reclaimed by chunk_alloc,
+         * eventually exhausting all 512 slots and leaving zombie chunks
+         * to be retransmitted indefinitely. This log is the only clue
+         * for that failure mode -- do not remove. */
+        LOG_WARN("[quic-recovery] chunk_mark_acked: chunk=%llu NOT FOUND "
+                 "(chunk_count=%d) - ACK has no effect, chunk unreclaimable",
+                 (unsigned long long)chunk_id, ctx->chunk_count_);
+        return;
+    }
+    if (c->state == QUIC_CHUNK_ACKED) {
+        /* Duplicate ACK: normal (retransmit copy already covered). */
+        return;
+    }
     c->state = QUIC_CHUNK_ACKED;
     free(c->frames); c->frames = NULL; c->frames_len = 0;
 
@@ -353,6 +407,16 @@ static void detect_losses(QuicRecoveryCtx *ctx, uint64_t now_ms) {
          * 算出秒级 RTT（1538/6921ms），污染 srtt/rttvar → 恶性循环
          * 让 pto_base/time_threshold 膨胀到秒级。 */
         QuicRecoveryChunk *c = chunk_find(ctx, p->chunk_id);
+        if (!c) {
+            /* Chunk already reclaimed or never allocated: this sent_packet
+             * has no owner. Skipping silently would leave inflight
+             * accounting and loss detection without a basis, so record it
+             * to trace chunk lifecycle problems. */
+            LOG_WARN("[quic-recovery] detect_losses: chunk=%llu NOT FOUND "
+                     "(pn=%llu, chunk_count=%d) - skipping packet",
+                     (unsigned long long)p->chunk_id,
+                     (unsigned long long)p->pn, ctx->chunk_count_);
+        }
         if (c && c->state == QUIC_CHUNK_LOST) {
             if (p->ack_eliciting && !p->lost)
                 inflight_sub(ctx, p->bytes_sent);
@@ -505,6 +569,15 @@ static void on_pto_timer(void *user) {
                 return;
             }
         }
+        /* 首次发送后至少等一个 pto_base_ 才允许 PTO 重传。
+         * 没有这道闸门时，新建 chunk 会在同一轮 PTO 里被立即重传
+         * （last_retrans_ms 的锚定见 chunk_init_timestamps 的说明）。
+         * 注意只对【从未重传过】的 chunk 生效：已重传过的由下面的
+         * last_retrans_ms 冷却负责，两把尺子各管一段。 */
+        if (c->retrans_count == 0 && now - c->first_sent_ms < ctx->pto_base_) {
+            continue;
+        }
+
         /* 冷却必须随 RTT 缩放：固定 10ms 在远程（RTT 15~30ms）下
          * 短于一个 RTT，等于允许在对端 ACK 回来之前就重传同一个 chunk。
          * 用 pto_base_（= srtt + 4×rttvar，且下限 QUIC_MIN_PTO_MS）而

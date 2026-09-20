@@ -22,6 +22,7 @@ set(MOQ_SERVER_STACK
     ${CMAKE_SOURCE_DIR}/quic/quic_stream.c
     ${CMAKE_SOURCE_DIR}/quic/quic_recovery.c
     ${CMAKE_SOURCE_DIR}/quic/quic_timer.c
+    ${CMAKE_SOURCE_DIR}/quic/pacing_send.c
     ${CMAKE_SOURCE_DIR}/quic/quic_client_api.c
     ${CMAKE_SOURCE_DIR}/quic/congestion_control/quic_cc_newreno.c
     ${CMAKE_SOURCE_DIR}/quic/congestion_control/quic_cc_bbr.c

@@ -4,6 +4,7 @@
 #include "quic_stream.h"
 #include "quic_recovery.h"
 #include "quic_timer.h"
+#include "pacing_send.h"
 #include "tls_common.h"
 #include "logger.h"
 #include <openssl/core_dispatch.h>
@@ -132,6 +133,10 @@ struct QuicConnection {
     QuicTimer  flush_timer_;
     int        flush_backoff_ms_;   /* cwnd 拥塞时的重试退避 */
     uint64_t   last_cwnd_block_log_ms_;
+    /* 令牌桶 pacing：发送速率由 CC 给的 pacing_rate 决定，
+     * 而不是「cwnd 允许就立刻发」。rate=0 时整体放行。 */
+    PacingSend pacer_;
+    uint64_t   last_pacing_block_log_ms_;
 #define QUIC_FLUSH_BACKOFF_MAX_MS 50
 
     /* 空闲超时（RFC 9000 §10.1） */
@@ -295,45 +300,117 @@ static void log_cwnd_block(QuicConnection *conn, const char *where) {
             info.cwnd, info.max_bw_bps, info.state, info.min_rtt_us);
 }
 
+/* 从 CC 刷新 pacing 速率。仅 BBR 会填 pacing_rate_bps，
+ * cubic/newreno 保持 0 → 下方 pacing_allow 恒放行（向后兼容）。 */
+static void refresh_pacing_rate(QuicConnection *conn) {
+    struct quic_cc_info info = {0};
+    if (conn->recovery_ctx_.cc_ && conn->recovery_ctx_.cc_->ops &&
+        conn->recovery_ctx_.cc_->ops->get_info) {
+        conn->recovery_ctx_.cc_->ops->get_info(conn->recovery_ctx_.cc_, &info);
+    }
+    if (pacing_send_rate(&conn->pacer_) != info.pacing_rate_bps) {
+        pacing_send_set_rate(&conn->pacer_, info.pacing_rate_bps);
+    }
+}
+
+/* pacing 准入：返回 1 = 现在可以发，0 = 令牌不足应退避。
+ * 每次调用都会先按 CC 最新速率刷新令牌桶。
+ * 注意不要再单独调用 refill —— acquire 内部已经做了（且幂等）。 */
+static int pacing_allow(QuicConnection *conn) {
+    refresh_pacing_rate(conn);
+    return pacing_send_acquire(&conn->pacer_, conn->pkt_payload_len_,
+                               uv_hrtime());
+}
+
+/* pacing 阻塞日志（1s 限流），便于观测是否被 pacing 限速 */
+static void log_pacing_block(QuicConnection *conn) {
+    uint64_t now = uv_now(conn->loop_);
+    if (conn->last_pacing_block_log_ms_ &&
+        now - conn->last_pacing_block_log_ms_ < 1000) {
+        return;
+    }
+    conn->last_pacing_block_log_ms_ = now;
+    LOG_INFO("[quic-conn] flush deferred by pacing payload=%zu rate=%llu B/s "
+             "tokens=%.0f burst=%llu",
+             conn->pkt_payload_len_,
+             (unsigned long long)pacing_send_rate(&conn->pacer_),
+             conn->pacer_.tokens,
+             (unsigned long long)conn->pacer_.max_burst);
+}
+
+/* pacing 阻塞时的退避：固定一个 tick，不走指数退避。
+ * 指数退避会把它推到远超目标发包间隔（1→2→4→…→50ms）。
+ * 5ms 是 quic_timer 的精度下限。 */
+static void arm_pacing_backoff(QuicConnection *conn) {
+    quic_timer_stop(&conn->flush_timer_);
+    quic_timer_start(&conn->flush_timer_, on_flush_timer, conn,
+                     QUIC_TIMER_TICK_MS, 0);
+}
+
+/* 一次 tick 内把「令牌允许的流量」全部发出去。
+ *
+ * 定时器是闹钟，不是节流阀 —— 每个 tick 只发一个包会把速率限死
+ * 50 倍（rate=12MB/s 时理论间隔仅 100us，而 tick 是 5ms）。
+ * 必须循环发包，让令牌桶成为唯一的限速器。
+ *
+ * 返回本次发出的包数；-1 表示被 cwnd/pacing 挡住（已安排好退避）。 */
+static int pacing_drain(QuicConnection *conn) {
+    int sent = 0;
+    /* 单次回调的发包上限：防止一帧数据在回调里长时间阻塞事件循环。
+     * 与 max_burst 呼应，正常不会触到。 */
+    const int max_pkts = 128;
+
+    for (;;) {
+        if (conn->pkt_payload_len_ == 0) {
+            quic_conn_retry_send(conn);
+            if (conn->pkt_payload_len_ == 0) break;   /* 无数据可发 */
+        }
+        if (!quic_recovery_can_send(&conn->recovery_ctx_)) {
+            log_cwnd_block(conn, "flush_timer");
+            /* bif 卡在 cwnd 之上时主动跑一遍丢包检测，回收 inflight */
+            quic_recovery_check_losses(&conn->recovery_ctx_);
+            arm_flush_backoff(conn);
+            return sent ? sent : -1;
+        }
+        /* pacing 准入：cwnd 允许 ≠ 现在就该发 */
+        if (!pacing_allow(conn)) {
+            log_pacing_block(conn);
+            arm_pacing_backoff(conn);
+            return sent ? sent : -1;
+        }
+
+        conn->flush_backoff_ms_ = 1;
+        send_quic_packet(conn, -1, conn->pkt_payload_, conn->pkt_payload_len_);
+        conn->pkt_payload_len_ = 0;
+        sent++;
+        if (sent >= max_pkts) {
+            /* 还没发完，下个 tick 继续 */
+            arm_pacing_backoff(conn);
+            break;
+        }
+    }
+    return sent;
+}
+
 static void on_flush_timer(void *user) {
     QuicConnection *conn = (QuicConnection*)user;
     if (!conn || conn->freeing_ || conn->state_ >= QUIC_STATE_CLOSED) return;
 
-    if (conn->pkt_payload_len_ == 0) {
-        /* 流控解开后 send_buf 还在，空 payload 也要再喂一次 */
-        quic_conn_retry_send(conn);
-        if (conn->pkt_payload_len_ == 0) {
-            conn->flush_backoff_ms_ = 1;
-            /* send_buf 仍可能被流控挡住：不能丢掉心跳，否则再也没人喂 */
-            if (!quic_timer_is_active(&conn->flush_timer_)) {
-                for (size_t i = 0; i < conn->stream_ctx_.stream_cnt; i++) {
-                    QuicStream *s = conn->stream_ctx_.streams[i];
-                    if (s && s->send_buf_len > 0) {
-                        quic_timer_start(&conn->flush_timer_, on_flush_timer,
-                                         conn, QUIC_TIMER_TICK_MS, 0);
-                        break;
-                    }
+    if (pacing_drain(conn) == 0 && conn->pkt_payload_len_ == 0) {
+        /* 没有发出任何包，且没有待发数据 —— 可能 send_buf 还被流控挡着。
+         * 不能丢掉心跳，否则再也没人来喂。 */
+        conn->flush_backoff_ms_ = 1;
+        if (!quic_timer_is_active(&conn->flush_timer_)) {
+            for (size_t i = 0; i < conn->stream_ctx_.stream_cnt; i++) {
+                QuicStream *s = conn->stream_ctx_.streams[i];
+                if (s && s->send_buf_len > 0) {
+                    quic_timer_start(&conn->flush_timer_, on_flush_timer,
+                                     conn, QUIC_TIMER_TICK_MS, 0);
+                    break;
                 }
             }
-            return;
         }
     }
-
-    if (!quic_recovery_can_send(&conn->recovery_ctx_)) {
-        log_cwnd_block(conn, "flush_timer");
-        /* bif 卡在 cwnd 之上时主动跑一遍丢包检测，回收 inflight */
-        quic_recovery_check_losses(&conn->recovery_ctx_);
-        arm_flush_backoff(conn);
-        return;
-    }
-
-    conn->flush_backoff_ms_ = 1;
-    send_quic_packet(conn, -1, conn->pkt_payload_, conn->pkt_payload_len_);
-    conn->pkt_payload_len_ = 0;
-
-    /* Packet sent → CWND consumed, but stream send_buf may still
-     * have pending data. Feed next chunk. */
-    quic_conn_retry_send(conn);
 }
 
 int quic_conn_queue_frames(void *vconn, const uint8_t *frames, size_t flen) {
@@ -423,6 +500,12 @@ void quic_conn_flush_packet(void *vconn) {
         log_cwnd_block(conn, "flush_packet");
         arm_flush_backoff(conn);
         return; /* 保留 pkt_payload_，等 ACK 释放 cwnd */
+    }
+    /* pacing 准入：cwnd 放行不代表现在就该发 */
+    if (!pacing_allow(conn)) {
+        log_pacing_block(conn);
+        arm_pacing_backoff(conn);
+        return; /* 保留 pkt_payload_，等令牌攒够 */
     }
     conn->flush_backoff_ms_ = 1;
     quic_timer_stop(&conn->flush_timer_);
@@ -2677,6 +2760,15 @@ QuicConnection* QuicConnectionCreate(uv_loop_t *loop) {
 
     conn->loop_ = loop;
     conn->state_ = QUIC_STATE_INIT;
+
+    /* pacing：这里只给初值，rate=0 不代表会有一段「不限速期」——
+     * 首个包发出前 pacing_allow() 会调 refresh_pacing_rate() 从 CC 取速率，
+     * 而 BBR 创建时已有初始 max_bw(mss*100)，所以首包就已受限
+     * （STARTUP 下约 346KB/s）。
+     *
+     * rate=0 真正的用途是给不填 pacing_rate_bps 的算法兜底：
+     * cubic/newreno 永远保持 0 → pacing_allow 恒放行（向后兼容）。 */
+    pacing_send_init(&conn->pacer_, 0, 0);
 
     /* 随机 CID */
     RAND_bytes(conn->src_cid_.data, QUIC_CID_LEN);

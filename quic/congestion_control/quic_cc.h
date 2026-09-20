@@ -31,6 +31,11 @@ struct quic_cc_info {
     int      algo;         /* QUIC_CC_ALGO_* */
     int      state;        /* algo-specific (BBR phase / NewReno SS vs CA) */
     uint64_t min_rtt_us;   /* BBR delivery estimate, us; 0 if unused */
+    /* 发送速率 = pacing_gain × max_bw，字节/秒。
+     * 0 = 不启用 pacing（cubic/newreno 不填）。
+     * 有了它，发送路径按速率而非 cwnd 限速 —— 这是打破「cwnd 既是
+     * 限速器又是被测量对象」循环论证的关键。 */
+    uint64_t pacing_rate_bps;
 };
 
 /* ── CC 算法必须实现的回调 ────────────────── */

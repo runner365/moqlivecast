@@ -12,7 +12,7 @@
         v-model="address"
         class="input"
         :disabled="busy"
-        placeholder="https://www.webrtcserver.com.cn:4433/live/123456.flv"
+        placeholder="https://www.webrtcserver.com.cn:4433/live/<stream>.flv"
       />
       <button class="btn" :class="{ stop: connected }" :disabled="busy" @click="onClick">
         {{ btnText }}

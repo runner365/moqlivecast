@@ -161,6 +161,7 @@ set(QUIC_COMMON_SOURCES
     quic/quic_stream.c
     quic/quic_recovery.c
     quic/quic_timer.c
+    quic/pacing_send.c
     quic/quic_client_api.c
     quic/congestion_control/quic_cc_newreno.c
     quic/congestion_control/quic_cc_bbr.c

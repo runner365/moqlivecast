@@ -1,3 +1,4 @@
+import { sessionStream } from '../config'
 import { hex_preview, log_error, log_info, log_warn } from '../logger'
 import {
   ALIAS_AUDIO,
@@ -20,14 +21,16 @@ export type MoqTxHooks = {
 }
 
 function parseAppStream(url: string): { app: string; stream: string } {
+  /* URL 缺参数时的兜底用 sessionStream()，而不是写死 '123456'：
+   * 保持一致才能让「没填 stream 的推流」与「同标签页的拉流」对上。 */
   try {
     const u = new URL(url)
     return {
       app: u.searchParams.get('app') || 'live',
-      stream: u.searchParams.get('stream') || '123456',
+      stream: u.searchParams.get('stream') || sessionStream(),
     }
   } catch {
-    return { app: 'live', stream: '123456' }
+    return { app: 'live', stream: sessionStream() }
   }
 }
 
@@ -38,7 +41,7 @@ export class MoqPublisher implements AvSink {
   private audioWriter: WritableStreamDefaultWriter<Uint8Array> | null = null
   private closed = false
   private app = 'live'
-  private stream = '123456'
+  private stream = sessionStream()
   private videoGroup = -1
   private videoObj = 0
   private audioObj = 0
