@@ -35,11 +35,16 @@ public:
         LogInfof(logger_, "SslServer construct ...");
     }
     ~SslServer() {
+        /* 先通知栈上正在执行的 HandleSslDataRecv：它可能在
+         * cb_->PlaintextDataRecv() 返回后继续访问本对象。
+         * 该回调会同步触发 CloseSession → 析构，属于重入销毁。 */
+        if (alive_) *alive_ = false;
+
         if (ssl_) {
             SSL_free(ssl_);
             ssl_ = NULL;
         }
-    
+
         if (ssl_ctx_) {
             SSL_CTX_free(ssl_ctx_);
             ssl_ctx_ = NULL;
@@ -93,6 +98,11 @@ public:
     }
 
     int HandleSslDataRecv(uint8_t* data, size_t len) {
+        /* 局部拷贝存活标志：回调里若析构了本对象，*alive 会被置 false，
+         * 而这个 shared_ptr 副本仍保证标志对象在栈帧内有效。
+         * 之后一律用它判断，不再解引用 this 的任何成员。 */
+        std::shared_ptr<bool> alive = alive_;
+
         if (!ssl_ || !bio_in_ || !bio_out_) {     // ← 检查 BIO 是否就绪
             LogErrorf(logger_, "HandleSslDataRecv: ssl/bio not ready, state=%d", tls_state_);
             return -1;
@@ -121,6 +131,17 @@ public:
             if (r0 > 0) {
                 LogInfof(logger_, "ssl plaintext %dB pending=%zu", r0, r2);
                 cb_->PlaintextDataRecv((char*)plaintext_data_, r0);
+
+                /* ★ 回调可能已同步析构本对象：HTTP 层判定非法请求
+                 * （如 HTTP/2 的 "PRI * HTTP/2.0" 前言）时会立刻
+                 * CloseSession → 释放 TcpSession/SslServer，SSL_free
+                 * 连带释放 bio_in_/bio_out_。此时继续读成员就是 UAF，
+                 * 实测崩溃在 BIO_ctrl_pending（BIO_ctrl）。
+                 * 用局部 alive 判断，它是 shared_ptr 副本，安全。 */
+                if (!*alive) {
+                    LogInfof(logger_, "HandleSslDataRecv: destroyed by callback, abort");
+                    return -1;
+                }
             } else if (r1 == SSL_ERROR_WANT_READ || r1 == SSL_ERROR_WANT_WRITE) {
                 break;
             } else {
@@ -137,6 +158,10 @@ public:
 
     int SslWrite(uint8_t* plain_text_data, size_t len) {
         int writen_len = 0;
+        /* 与 HandleSslDataRecv 同样的重入销毁防护：回调之后不得再碰成员。
+         * 发送方向目前不会同步析构（PlaintextDataSend 只做 uv_write），
+         * 但保持一致的防御，改动成本为零。 */
+        std::shared_ptr<bool> alive = alive_;
 
         for (char* p = (char*)plain_text_data; p < (char*)plain_text_data + len;) {
             int left = (int)len - (int)(p - (char*)plain_text_data);
@@ -147,14 +172,16 @@ public:
                         p, left, r0, r1);
                 return -1;
             }
-    
+
             // Move p to the next writing position.
             p += r0;
             writen_len += (ssize_t)r0;
-    
+
             uint8_t* data = NULL;
             int size = BIO_get_mem_data(bio_out_, &data);
             cb_->PlaintextDataSend((char*)data, size);
+
+            if (!*alive) return -1;   /* 回调销毁了本对象，安全退出 */
 
             if ((r0 = BIO_reset(bio_out_)) != 1) {
                 LogErrorf(logger_, "BIO_reset r0=%d", r0);
@@ -358,6 +385,11 @@ private:
 
 private:
     TLS_SERVER_STATE tls_state_ = TLS_SSL_SERVER_ZERO;
+
+    /* 存活标志。用 shared_ptr 是为了让 HandleSslDataRecv 能取一份
+     * 局部副本：回调同步析构本对象时，标志对象本身不能随之失效，
+     * 否则判断存活这一步又是 UAF。析构时置 false。 */
+    std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
 };
 
 }
