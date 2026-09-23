@@ -120,6 +120,18 @@ void WTServerSession::OpenStream(OnStreamOpen cb) {
     wt_session_open_stream(sess_, OnStreamOpenTrampoline, this);
 }
 
+WTServerStream *WTServerSession::OpenUniStream() {
+    if (!sess_) {
+        LOG_ERROR("[wt-session] OpenUniStream: session invalid");
+        return nullptr;
+    }
+    /* 与 OpenStream 不同，单向流创建后即可写，不需要回调通知 ——
+     * 直接包成 WTServerStream 返回。 */
+    wt_stream_t *st = wt_server_open_uni_stream(sess_);
+    if (!st) return nullptr;
+    return EnsureStream(st);
+}
+
 WTServerStream *WTServerSession::EnsureStream(wt_stream_t *st) {
     if (!st) return nullptr;
     auto it = streams_.find(st);

@@ -57,6 +57,11 @@ public:
 
     void Close();
     void OpenStream(OnStreamOpen cb);
+    /* 打开一条【本端发起的单向流】。MOQ 规范要求控制流是一对单向流：
+     * 对端那条用于发请求，本端这条用于回应答（如 SUBSCRIBE_OK）。
+     * 单向流只能写，不会收到 on_stream_data。
+     * 返回新流；失败（如尚无 MAX_STREAMS_UNI 配额）返回 nullptr。 */
+    WTServerStream *OpenUniStream();
 
     /* 底层 QUIC 路径 / 拥塞快照 */
     bool GetQuicStats(QuicConnectionStats *out) const;
