@@ -106,8 +106,25 @@ void  wt_stream_set_user_data(wt_stream_t *st, void *data);
 void *wt_stream_get_user_data(wt_stream_t *st);
 wt_session_t *wt_stream_get_session(wt_stream_t *st);
 
+/* 该流是否为单向流。
+ * 单向流的语义是「只有发起方可以写」：对端（本端）只能读，回写会触发
+ * 对端 PROTOCOL_VIOLATION。wt_stream_write 已内建拒绝，此处供上层
+ * 在路由/记账时区分，不必依赖 write 失败来发现。 */
+int   wt_stream_is_uni(wt_stream_t *st);
+
+/* 服务端主动开一条单向流（MOQ 规范要求对象走单向流）。
+ *
+ * 返回新建的 wt_stream_t（用于 wt_stream_write 发送），失败返回 NULL。
+ * 失败通常是客户端尚未给出 MAX_STREAMS_UNI 配额 —— 这是流控的正常
+ * 情形，调用方应稍后重试，而不是当作致命错误。
+ *
+ * 该流由本端发起：可写、不会收到 on_stream_data（对端不能回写）。
+ * 用毕调 wt_stream_close() 发 FIN。 */
+wt_stream_t *wt_server_open_uni_stream(wt_session_t *sess);
+
 /* 写数据（自动加 WT 帧头）
- * 返回：0 已接受；1 拥塞（未接受，调用方应缓存）；-1 异常 */
+ * 返回：0 已接受；1 拥塞（未接受，调用方应缓存）；-1 异常
+ * 注意：对端发起的单向流上调用会被拒绝（返回 -1）。 */
 int  wt_stream_write(wt_stream_t *st, const uint8_t *data, size_t len);
 void wt_stream_close(wt_stream_t *st);
 

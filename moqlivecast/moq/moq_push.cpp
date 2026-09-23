@@ -22,6 +22,9 @@ constexpr uint64_t kMoqtSetup = 0x2f00;
 constexpr uint64_t kMoqtPublish = 0x1d;
 constexpr uint64_t kMoqtSubscribe = 0x03;
 constexpr uint64_t kMoqtSubscribeOk = 0x04;
+/* GOAWAY 是控制流上的消息之一（draft §10.4，type=0x10）。
+ * 与 SETUP 同属控制流；PUBLISH/SUBSCRIBE 则各自占一条请求双向流。 */
+constexpr uint64_t kMoqtGoaway = 0x10;
 constexpr uint64_t kLocTimescale = 0x08;
 constexpr uint64_t kLocFrameMark = 0x09;
 constexpr uint64_t kLocVideoConfig = 0x0d;
@@ -233,6 +236,7 @@ void MoqPushSession::Close() {
     ClearSendQueue(audio_dl_);
     streams_.clear();
     control_ = nullptr;
+    subscriber_sess_ = nullptr;
     video_dl_ = {};
     audio_dl_ = {};
     pull_ts_base_ = -1;
@@ -243,7 +247,7 @@ void MoqPushSession::AttachPlayer(const std::string &writer_id) {
     if (player_added_) return;
     writer_id_ = writer_id;
     player_added_ = true;
-    /* MoQ 的 GOP 在 BindDownlink/SendGop 发，不走 MSM WriterGop。
+    /* MoQ 的 GOP 在 OpenUniDownlink/SendGop 发，不走 MSM WriterGop。
      * Attach 时 downlink 还没绑，若让 AddPlayer 调 WriterGop，只会空跑并把
      * init_flag 提前置位；这里先标记已 init，跳过那次无效回放。 */
     init_flag_ = true;
@@ -269,6 +273,9 @@ int MoqPushSession::WritePacket(Media_Packet_Ptr pkt) {
     } else {
         return 0;
     }
+    /* 单向流开流失败（配额未到）时在这里重试 —— 否则这条 track 会永久哑掉：
+     * 客户端 SUBSCRIBE_OK 收到了，却再也等不到 SUBGROUP。 */
+    if (!dl->st && subscriber_sess_) OpenUniDownlink(*subscriber_sess_, alias);
     if (!dl->st || !dl->st->Valid() || !dl->header_sent) {
         static int drop_log = 0;
         if ((drop_log++ % 200) == 0) {
@@ -328,10 +335,6 @@ void MoqPushSession::OnData(WTServerSession &sess, WTServerStream &st,
 void MoqPushSession::Pump(WTServerSession &sess, WTServerStream &st,
                           StreamState &ss) {
     for (;;) {
-        if (ss.kind == StreamState::DOWNLINK) {
-            ss.buf.clear();
-            return;
-        }
         if (ss.kind == StreamState::UNKNOWN) {
             if (ss.buf.empty()) return;
             size_t off = 0;
@@ -339,22 +342,18 @@ void MoqPushSession::Pump(WTServerSession &sess, WTServerStream &st,
             if (!MoqReadVarint(ss.buf.data(), ss.buf.size(), off, type)) return;
             LogFirstBytes(ss.buf.data(), ss.buf.size());
             const char *cls = ClassifyFirstType(type, ss.buf.data(), ss.buf.size());
-            if (type == kMoqtSetup || type == kMoqtPublish || type == kMoqtSubscribe) {
+            /* 控制流（单向）：只有 SETUP / GOAWAY。
+             * 请求流（双向）：PUBLISH / SUBSCRIBE 各占一条，响应走本流反向。
+             * 见 draft-ietf-moq-transport §3.3。 */
+            if (type == kMoqtSetup || type == kMoqtGoaway) {
                 ss.kind = StreamState::CONTROL;
                 control_ = &st;
                 LOG_INFO("[moq-rfc] stream CONTROL first type=0x%llx (%s)",
                          (unsigned long long)type, cls);
-            } else if (subscriber_ &&
-                       (type == 0 || type == kAliasVideo || type == kAliasAudio)) {
-                ss.kind = StreamState::DOWNLINK;
-                ss.alias = type;
-                ss.buf.erase(ss.buf.begin(),
-                             ss.buf.begin() + static_cast<long>(off));
-                LOG_INFO("[moq-rfc] stream DOWNLINK bind alias=%llu",
-                         (unsigned long long)type);
-                BindDownlink(sess, st, type);
-                ss.buf.clear();
-                return;
+            } else if (type == kMoqtPublish || type == kMoqtSubscribe) {
+                ss.kind = StreamState::REQUEST;
+                LOG_INFO("[moq-rfc] stream REQUEST first type=0x%llx (%s)",
+                         (unsigned long long)type, cls);
             } else if ((type & 0x10) != 0) {
                 ss.kind = StreamState::DATA;
                 LOG_INFO("[moq-rfc] stream DATA first type=0x%llx (%s)",
@@ -368,7 +367,8 @@ void MoqPushSession::Pump(WTServerSession &sess, WTServerStream &st,
             }
         }
         bool ok = false;
-        if (ss.kind == StreamState::CONTROL) {
+        if (ss.kind == StreamState::CONTROL || ss.kind == StreamState::REQUEST) {
+            /* 两类流都用同一套「varint type + u16 len + body」解析 */
             ok = ParseControl(sess, st, ss);
         } else if (!ss.header_done) {
             ok = ParseSubgroupHeader(ss);
@@ -419,10 +419,18 @@ bool MoqPushSession::ParseControl(WTServerSession &sess, WTServerStream &st,
                                           app_, stream_, sess.ExtraParams());
                 sess.StartMetaStats("moq_pull_stats", "stream_pull");
             }
+            /* 应答走请求流自身的反向（draft §3.3.2） */
             SendSubscribeOk(st, request_id, alias);
             LOG_INFO("[moq-rfc] SUBSCRIBE ok req=%llu name=%s alias=%llu ns=%s/%s",
                      (unsigned long long)request_id, name.c_str(),
                      (unsigned long long)alias, app_.c_str(), stream_.c_str());
+            /* 对象单向流由本端发起；这里只是首次尝试，开不出来（配额未到）
+             * 由 WritePacket 兜底重试，不当作失败。 */
+            subscriber_sess_ = &sess;
+            if (!OpenUniDownlink(sess, alias)) {
+                LOG_WARN("[moq-rfc] open uni downlink alias=%llu deferred",
+                         (unsigned long long)alias);
+            }
         } else {
             LOG_WARN("[moq-rfc] SUBSCRIBE parse failed body=%uB", (unsigned)length);
         }
@@ -508,6 +516,9 @@ bool MoqPushSession::ParseSubscribe(const uint8_t *body, size_t len,
     return !app_.empty() && !stream_.empty();
 }
 
+/* 应答写在【请求流自身的反向】。
+ * draft §3.3.2：对端收到请求后必须把对应的响应消息发回该请求流，
+ * 而不是另开流 —— 所以这里直接写传进来的 st。 */
 void MoqPushSession::SendSubscribeOk(WTServerStream &st, uint64_t request_id,
                                      uint64_t alias) {
     std::vector<uint8_t> body;
@@ -520,32 +531,41 @@ void MoqPushSession::SendSubscribeOk(WTServerStream &st, uint64_t request_id,
              (unsigned long long)request_id, (unsigned long long)alias, msg.size());
 }
 
-void MoqPushSession::BindDownlink(WTServerSession & /*sess*/, WTServerStream &st,
-                                 uint64_t alias) {
+/* 订阅方向的数据单向流 —— 由【服务端】发起（对象走单向流）。
+ * 客户端不再开双向 bind 流；这条流属于哪个 track 由 SUBGROUP 头里的
+ * Track Alias 表达，不再靠"对端开流并写 alias"来绑定。
+ *
+ * 返回 false 表示这条 track 的流暂时没开出来 —— 通常是客户端尚未给出
+ * MAX_STREAMS_UNI 配额（见 quic/quic_stream.c 的流控检查）。这是正常
+ * 时序，由 WritePacket 在下一帧重试，不是致命错误。 */
+bool MoqPushSession::OpenUniDownlink(WTServerSession &sess, uint64_t alias) {
     Downlink *dl = nullptr;
     if (alias == kAliasVideo) dl = &video_dl_;
     else if (alias == kAliasAudio) dl = &audio_dl_;
     else {
-        LOG_INFO("[moq-rfc] bind alias=%llu ignored", (unsigned long long)alias);
-        return;
+        LOG_INFO("[moq-rfc] subscribe alias=%llu ignored",
+                 (unsigned long long)alias);
+        return false;
     }
-    if (dl->st && dl->st != &st) {
-        dl->st->SetOnWritable(nullptr);
-    }
-    ClearSendQueue(*dl);
-    dl->st = &st;
+    if (dl->st && dl->st->Valid()) return true;   /* 已就绪，别重开 */
+
+    WTServerStream *st = sess.OpenUniStream();
+    if (!st) return false;                        /* 配额未到，下帧再来 */
+
+    dl->st = st;
     dl->header_sent = false;
     dl->obj = 0;
     dl->wait_key = false;
     dl->congested = false;
-    st.SetOnWritable([this, alias](WTServerStream &) {
+    ClearSendQueue(*dl);
+    st->SetOnWritable([this, alias](WTServerStream &) {
         Downlink *d = nullptr;
         if (alias == kAliasVideo) d = &video_dl_;
         else if (alias == kAliasAudio) d = &audio_dl_;
         if (d) DrainSendQueue(*d);
     });
     const auto hdr = EncodeSubgroup(alias, 0);
-    const int wr = st.Write(hdr.data(), hdr.size());
+    const int wr = st->Write(hdr.data(), hdr.size());
     if (wr == 1) {
         auto buf = std::make_shared<DataBuffer>(hdr.size() + 64);
         buf->AppendData(reinterpret_cast<const char *>(hdr.data()), hdr.size());
@@ -556,11 +576,14 @@ void MoqPushSession::BindDownlink(WTServerSession & /*sess*/, WTServerStream &st
     } else if (wr < 0) {
         LOG_WARN("[moq-rfc] downlink alias=%llu subgroup write fail",
                  (unsigned long long)alias);
-        return;
+        dl->st = nullptr;                         /* 留待下一帧重开 */
+        return false;
     }
     dl->header_sent = true;
-    LOG_INFO("[moq-rfc] downlink alias=%llu subgroup sent", (unsigned long long)alias);
-    SendGop(*dl, alias);
+    LOG_INFO("[moq-rfc] downlink alias=%llu uni stream ready",
+             (unsigned long long)alias);
+    SendGop(*dl, alias);   /* 订阅即回放缓存 GOP，行为与改动前一致 */
+    return true;
 }
 
 void MoqPushSession::SendGop(Downlink &dl, uint64_t alias) {
@@ -737,13 +760,11 @@ void MoqPushSession::DrainSendQueue(Downlink &dl) {
         dl.send_q.pop();
     }
     dl.congested = false;
-    int64_t now_ms = now_millisec();
-    
-    if ((now_ms/1000) != dl.last_drained_dbg_ts_s) {
-        dl.last_drained_dbg_ts_s = now_ms/1000;
-        LOG_WARN("[moq-rfc] drain write success, drop queued=%zu bytes=%zu",
-             dl.send_q.size(), dl.send_q_bytes);
-    }
+    /* 队列已排空，是正常状态 —— 每秒打一条 WARN 只会淹没上面的
+     * "congested" / "fail" 两条真正需要关注的告警（它们外观一样）。
+     * 降到 DEBUG：排查积压时按需打开即可。 */
+    LOG_DEBUG("[moq-rfc] drain write success, drop queued=%zu bytes=%zu",
+              dl.send_q.size(), dl.send_q_bytes);
 }
 
 void MoqPushSession::EmitLoc(Downlink &dl, uint64_t alias, Media_Packet_Ptr pkt) {

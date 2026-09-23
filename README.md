@@ -102,6 +102,58 @@ Vite listens on `http://127.0.0.1:5174`.
 
 After changing C++ code, rebuild and restart `moqlivecast`. The browser demo does not pick up a new server by itself.
 
+## Wire protocol: how our streams map to the spec
+
+We follow the stream taxonomy of **[draft-ietf-moq-transport](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/)
+§3.3** (the numbering below is from the draft currently tracked here —
+control-flow separation landed on top of the layout described there).
+
+The spec splits messages into three categories, and **they do not all use
+the same stream type**:
+
+| Category | Messages | Stream type | Status here |
+|---|---|---|---|
+| **Control** | `SETUP` (`0x2f00`), `GOAWAY` (`0x10`) | **Unidirectional** — each peer opens one; the pair carries both directions | ✅ implemented |
+| **Request** | `PUBLISH` (`0x1d`), `SUBSCRIBE` (`0x3`) | **Bidirectional** — one stream per request | ✅ implemented |
+| **Response** | `SUBSCRIBE_OK` (`0x4`), `PUBLISH_DONE` (`0xb`) | **Same request stream, reverse direction** — *not* a separate stream | ✅ implemented |
+| **Object** | `SUBGROUP` + `OBJECT` | **Unidirectional** | ✅ implemented — publisher opens them when publishing, server opens them when serving subscribers |
+
+Two points are easy to get wrong and are worth calling out, because we got
+them wrong ourselves first:
+
+1. **Responses ride the request stream back, not the control stream.**
+   §3.3.2: *"A request stream is bidirectional and each direction is closed
+   independently."* So `SUBSCRIBE_OK` travels in the reverse direction of the
+   `SUBSCRIBE` request stream. The message-type table in the draft marks it
+   `Request` (not `Control`), which is the authoritative signal.
+   A response is **not** sent as a newly opened unidirectional stream.
+
+2. **Objects can only go on unidirectional streams** (*"Objects are sent on
+   unidirectional streams"*), which is independent of the control/request
+   split. A unidirectional stream has **no "write the alias back" step**: the
+   receiver learns which track the objects belong to from the Track Alias in
+   the `SUBGROUP` header, and the order streams are opened carries no meaning.
+   So the sender has to open the stream itself — the publisher opens them when
+   publishing, and the server opens them when serving a subscriber (the client
+   no longer opens data streams at all).
+
+### What this means in practice
+
+`flv2moq_client` opens **7 streams** for a push: 1 control (uni, `SETUP`) +
+3 request (bidi, one `PUBLISH` each for catalog/video/audio) + 3 data streams
+(uni). A `moq` pull has the client open only **2 streams**: 1 control
+(uni, `SETUP`) + 1 request (bidi, carrying both `SUBSCRIBE`s and reading their
+`SUBSCRIBE_OK`s back); the data streams are opened by the **server**, one
+unidirectional stream per track.
+
+### Discussing this with others
+
+If you are comparing implementations: the shape to check first is whether a
+peer puts `PUBLISH`/`SUBSCRIBE` on a bidirectional stream (correct) or on the
+control unidirectional stream alongside `SETUP` (a common simplification).
+The second shape works as long as both ends agree, but it is not what the
+draft specifies and it will not interoperate.
+
 ## Repository layout
 
 | Path | What it is |
@@ -119,7 +171,9 @@ This is an early public snapshot, not a complete IETF MoQ implementation.
 
 Working today: publish and play over MoQ, WebTransport FLV, and HTTP-FLV, with GOP catch-up for new subscribers.
 
-Not finished: MoQ catalog / control-plane completeness, and starting the existing RTMP code path from `moqlivecast`.
+Not finished: MoQ catalog / control-plane completeness (`GOAWAY` and other
+control messages are parsed but not acted on), and starting the existing RTMP
+code path from `moqlivecast`.
 
 ## Roadmap
 

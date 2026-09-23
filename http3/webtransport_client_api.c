@@ -42,6 +42,7 @@ enum {
     WT_TASK_CONNECT,
     WT_TASK_CLOSE,
     WT_TASK_OPEN_STREAM,
+    WT_TASK_OPEN_UNI_STREAM,
     WT_TASK_STREAM_WRITE,
     WT_TASK_STREAM_CLOSE
 };
@@ -71,6 +72,7 @@ struct wt_stream {
     wt_stream_t *next;         /* 链表 */
     int          header_sent;      /* WT 帧头是否已发送 */
     int          header_stripped;  /* WT 帧头是否已从入站数据剥离 */
+    int          is_uni;           /* 1 = 单向流（只能写，不能读） */
 };
 
 /* ── Client ────────────────────────────────── */
@@ -153,7 +155,7 @@ static void on_quic_stream(QuicConnection *qc, uint64_t sid,
                             const uint8_t *data, size_t len, int fin);
 static void send_client_settings(wt_client_t *cli);
 static void send_wt_connect_internal(wt_client_t *cli);
-static void do_open_stream(wt_client_t *cli);
+static void do_open_stream(wt_client_t *cli, int is_uni);
 static void do_stream_write(wt_client_t *cli, wt_task_t *t);
 static wt_stream_t *find_stream(wt_client_t *cli, uint64_t sid);
 static void free_task(wt_task_t *t);
@@ -215,6 +217,18 @@ void wt_client_open_stream(wt_client_t *cli) {
     uv_async_send(&cli->async);
 }
 
+void wt_client_open_uni_stream(wt_client_t *cli) {
+    if (!cli) return;
+    wt_task_t *t = (wt_task_t*)calloc(1, sizeof(*t));
+    t->type = WT_TASK_OPEN_UNI_STREAM;
+    task_push(cli, t);
+    uv_async_send(&cli->async);
+}
+
+int wt_stream_is_uni(wt_stream_t *s) {
+    return s ? s->is_uni : 0;
+}
+
 void wt_stream_write_cb(wt_stream_t *s, const uint8_t *data, size_t len,
                          wt_stream_write_cb_fn cb, void *user,
                          uint64_t timeout_ms) {
@@ -270,7 +284,11 @@ static void async_cb(uv_async_t *h) {
             break;
         case WT_TASK_OPEN_STREAM:
             if (cli->state == WT_STATE_CONNECTED && !cli->closing)
-                do_open_stream(cli);
+                do_open_stream(cli, 0);
+            break;
+        case WT_TASK_OPEN_UNI_STREAM:
+            if (cli->state == WT_STATE_CONNECTED && !cli->closing)
+                do_open_stream(cli, 1);
             break;
         case WT_TASK_STREAM_WRITE:
             do_stream_write(cli, t);
@@ -310,13 +328,18 @@ static wt_stream_t *find_stream(wt_client_t *cli, uint64_t sid) {
     return NULL;
 }
 
-static void do_open_stream(wt_client_t *cli) {
-    uint64_t sid = QuicConnectionStreamOpen(cli->qc);
-    if (sid == UINT64_MAX) { LOG_WARN("[wt-api] open stream failed"); return; }
+static void do_open_stream(wt_client_t *cli, int is_uni) {
+    uint64_t sid = is_uni ? QuicConnectionStreamOpenUni(cli->qc)
+                          : QuicConnectionStreamOpen(cli->qc);
+    if (sid == UINT64_MAX) {
+        LOG_WARN("[wt-api] open %s stream failed", is_uni ? "uni" : "bidi");
+        return;
+    }
 
     wt_stream_t *s = (wt_stream_t*)calloc(1, sizeof(*s));
     s->cli       = cli;
     s->stream_id = sid;
+    s->is_uni    = is_uni;
     s->next      = cli->streams;
     cli->streams = s;
 
@@ -324,7 +347,8 @@ static void do_open_stream(wt_client_t *cli) {
     if (cli->cb.on_stream_open)
         cli->cb.on_stream_open(cli, s, cli->cb.user_data);
 
-    LOG_DEBUG("[wt-api] opened stream %llu", (unsigned long long)sid);
+    LOG_DEBUG("[wt-api] opened %s stream %llu", is_uni ? "uni" : "bidi",
+              (unsigned long long)sid);
 }
 
 /* ── QUIC write callback → wt write callback 转发 ── */
@@ -342,15 +366,63 @@ static void wt_write_done_cb(struct QuicStream *qs, int ret,
 static void do_stream_write(wt_client_t *cli, wt_task_t *t) {
     if (!t->stream || !cli->qc) return;
 
+    /* 对端发起的单向流不能回写（低 2 位 0x3 = server-initiated uni），
+     * 发出去会触发对端 PROTOCOL_VIOLATION。本地发起的 uni（0x2）不受
+     * 限制 —— 那条流本来就是给我们写的。 */
+    if ((t->stream->stream_id & 0x3) == 0x3) {
+        LOG_WARN("[wt-api] refuse write on peer-initiated uni stream %llu "
+                 "(%zu bytes dropped)",
+                 (unsigned long long)t->stream->stream_id, t->len);
+        if (t->write_cb) t->write_cb(t->stream, -1, t->write_cb_user);
+        free(t->data);
+        free(t);
+        return;
+    }
+
     /* All writes go through QuicConnectionStreamSendEx with callback.
-     * Task+data freed in wt_write_done_cb after ACK/error. */
+     * Task+data freed in wt_write_done_cb after ACK/error.
+     *
+     * 首包前缀按流类型区分 —— 两者是不同的协议元素，不能混用：
+     *   双向流：WT STREAM 帧 {0x40,0x41,0x00}（frame type 0x41 + session 0）
+     *   单向流：WT 流类型 0x54（draft-ietf-webtrans-http3），标识「本流是
+     *           WebTransport 数据流」。服务端在 http3_server.c 用
+     *           quic_varint_decode 读首字节并与 0x54 比对，发错会被
+     *           当成未知 uni 流丢弃（实测服务端报 type=0x40 not WT 0x54）。 */
     if (!t->stream->header_sent) {
-        uint8_t hdr[3] = { 0x40, 0x41, 0x00 };
-        size_t total = 3 + t->len;
+        /* 首个 varint 是「WT 流类型」，其后紧跟 session_id（varint）。
+         *
+         * 双向流用 0x41（WT STREAM 帧）；单向流用 0x54
+         * （draft-ietf-webtrans-http3 的单向数据流类型）。
+         *
+         * ⚠️ 0x54 必须按 varint 编码成 2 字节 0x40 0x54，不能写成单字节：
+         *    0x54 = 0b01010100，高 2 位是 01，quic_varint_decode 会按
+         *    2 字节读，得到 ((0x54 & 0x3f) << 8) | next ≠ 0x54，
+         *    服务端于是判定「不是 WT 流」直接丢弃。
+         *
+         * 另注意服务端有两处检查，0x54 恰好同时满足：
+         *    http3_server.c       首 varint == 0x54      → 识别为 WT 单向流
+         *    webtransport_server_api.c  首 varint ∈ [0x41,0x5f] → 剥离帧头
+         *    0x54 ∈ [0x41,0x5f]，所以结构与双向流一致，只是类型值不同。 */
+        size_t hdr_len;
+        uint8_t hdr[4];
+        const uint64_t stream_type = (t->stream->is_uni &&
+                                      (t->stream->stream_id & 0x3) == 0x2)
+                                         ? H3_STREAM_TYPE_WEBTRANSPORT  /* 0x54 */
+                                         : 0x41;
+        if (stream_type < 64) {
+            hdr[0] = (uint8_t)stream_type;
+            hdr_len = 1;
+        } else {
+            hdr[0] = (uint8_t)(0x40 | ((stream_type >> 8) & 0x3f));
+            hdr[1] = (uint8_t)(stream_type & 0xff);
+            hdr_len = 2;
+        }
+        hdr[hdr_len++] = 0x00;   /* session_id = 0（varint） */
+        size_t total = hdr_len + t->len;
         uint8_t *framed = (uint8_t*)malloc(total);
         if (!framed) return;
-        framed[0] = hdr[0]; framed[1] = hdr[1]; framed[2] = hdr[2];
-        memcpy(framed + 3, t->data, t->len);
+        memcpy(framed, hdr, hdr_len);
+        memcpy(framed + hdr_len, t->data, t->len);
         QuicConnectionStreamSendEx(cli->qc, t->stream->stream_id,
                                     framed, total, 0, wt_write_done_cb, t,
                                     t->timeout_ms);
@@ -390,23 +462,45 @@ static void on_quic_stream(QuicConnection *qc, uint64_t sid,
     wt_client_t *cli = (wt_client_t*)QuicConnectionGetAppData(qc);
     if (!cli) return;
 
-    /* uni stream: server H3 control */
-    if (sid % 4 != 0) {
-        if (len < 1) return;
-        uint8_t stype = data[0]; data++; len--;
-        if (stype == H3_STREAM_TYPE_CONTROL && len > 0 && cli->state < WT_STATE_CONNECTING_WT) {
-            /* parse server SETTINGS */
-            uint64_t ids[8], vals[8]; int count = 0;
-            if (h3_frame_parse_settings(data, len, ids, vals, 8, &count) > 0) {
-                LOG_DEBUG("[wt-api] server SETTINGS: %d params", count);
-                if (!cli->connect_sent) {
-                    cli->connect_sent = 1;
-                    cli->state = WT_STATE_CONNECTING_WT;
-                    send_wt_connect_internal(cli);
+    /* ── 服务端发起的单向流 (sid & 0x3) == 0x3 ──
+     *
+     * 原判据 `sid % 4 != 0` 过宽：它把 server bidi(0x1)、client uni(0x2)
+     * 也一并截住。对 H3 控制流（确实是 server uni）碰巧正确，但一旦
+     * 服务端在 uni 流上发 WT 数据（MOQ 规范要求对象走单向流），
+     * 这些数据会被当成控制流丢弃。
+     *
+     * 正确做法：只截 server uni，且仅当首字节是 H3 控制流类型时才
+     * 按 SETTINGS 解析；其余 server uni 流继续走下面的 WT 数据路径。 */
+    if ((sid & 0x3) == 0x3) {
+        /* 先按 H3 流类型分流。四种内建类型都必须拦下，只放行 0x54：
+         *   0x00 control / 0x01 push / 0x02 QPACK enc / 0x03 QPACK dec
+         * 遗漏任何一个都会把 H3 内部字节泄露给应用层 —— 例如服务端开
+         * QPACK 流时先写 1 字节类型 0x02，若放行就成了 WT 数据的首字节，
+         * 破坏上层（LOC）解析。 */
+        if (len >= 1) {
+            uint64_t stype = 0;
+            size_t stlen = quic_varint_read(data, len, &stype);
+            if (stlen > 0 && stype <= H3_STREAM_TYPE_QPACK_DEC) {
+                if (stype == H3_STREAM_TYPE_CONTROL) {
+                    const uint8_t *sdata = data + stlen;
+                    size_t slen = len - stlen;
+                    if (slen > 0 && cli->state < WT_STATE_CONNECTING_WT) {
+                        uint64_t ids[8], vals[8]; int count = 0;
+                        if (h3_frame_parse_settings(sdata, slen, ids, vals, 8,
+                                                    &count) > 0) {
+                            LOG_DEBUG("[wt-api] server SETTINGS: %d params", count);
+                            if (!cli->connect_sent) {
+                                cli->connect_sent = 1;
+                                cli->state = WT_STATE_CONNECTING_WT;
+                                send_wt_connect_internal(cli);
+                            }
+                        }
+                    }
                 }
+                return;   /* H3 内建流：不产生应用层数据 */
             }
         }
-        return;
+        /* 其余 server uni 流（含 WT 数据流 0x54）→ 落到下方 WT 数据路径 */
     }
 
     /* bidi stream — if not yet connected, this is CONNECT 200 */
@@ -422,19 +516,33 @@ static void on_quic_stream(QuicConnection *qc, uint64_t sid,
     if (!s) {
         s = (wt_stream_t*)calloc(1, sizeof(*s));
         s->cli = cli; s->stream_id = sid;
+        /* 对端发起的流：低 2 位 0x2/0x3 即单向。
+         * 记录以便上层判断「这条流能否回写」。 */
+        s->is_uni = ((sid & 0x3) == 0x2 || (sid & 0x3) == 0x3);
         s->next = cli->streams; cli->streams = s;
     }
 
-    /* Strip WebTransport STREAM frame header — once per stream.
-     * Header is {0x40,0x41,0x00}, prepended on peer's first write.
-     * Guard with flag: data bytes can coincidentally match. */
+    /* Strip WebTransport header — once per stream.
+     * 格式为「流类型 varint + session_id varint」，不能用硬编码字节比对：
+     *   双向流类型 0x41（1 字节）
+     *   单向流类型 0x54（varint 编码成 2 字节 0x40 0x54）
+     * 原实现写死 {0x40,0x41,0x00}，遇到服务端单向流的 0x40 0x54 0x00
+     * 匹配不上，会把 3 字节头当成载荷交给上层（内容前带乱码）。
+     * 改为按 varint 解析：首 token 落在 [0x41,0x5f] 即视为 WT 头。 */
     const uint8_t *payload = data;
     size_t payload_len = len;
-    if (!s->header_stripped && len >= 3
-        && data[0] == 0x40 && data[1] == 0x41 && data[2] == 0x00) {
-        payload     = data + 3;
-        payload_len = len - 3;
-        s->header_stripped = 1;
+    if (!s->header_stripped && len >= 2) {
+        uint64_t ftype = 0;
+        size_t n = quic_varint_read(data, len, &ftype);
+        if (n > 0 && ftype >= 0x41 && ftype <= 0x5f) {
+            uint64_t sess_id = 0;
+            size_t m = (n < len) ? quic_varint_read(data + n, len - n, &sess_id) : 0;
+            if (m > 0) {
+                payload     = data + n + m;
+                payload_len = len - n - m;
+                s->header_stripped = 1;
+            }
+        }
     }
     if (cli->cb.on_stream_data && payload_len > 0)
         cli->cb.on_stream_data(cli, s, payload, payload_len, cli->cb.user_data);

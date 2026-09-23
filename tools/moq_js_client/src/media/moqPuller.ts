@@ -9,7 +9,7 @@ import {
   tryReadSubgroup,
   type LocObject,
 } from '../moq/decode'
-import { ByteReader, encodeVarint } from '../moq/varint'
+import { ByteReader } from '../moq/varint'
 import {
   ALIAS_AUDIO,
   ALIAS_VIDEO,
@@ -80,7 +80,8 @@ function parseAppStream(url: string): { app: string; stream: string } {
 
 export class MoqPuller {
   private wt: WebTransport | null = null
-  private controlReader: ReadableStreamDefaultReader<Uint8Array> | null = null
+  /* 控制流是单向只写（SETUP），不再有 reader。
+   * SUBSCRIBE_OK 读自请求流的 readable 端，见 start()。 */
   private controlWriter: WritableStreamDefaultWriter<Uint8Array> | null = null
   private player: ReturnType<typeof flvjs.createPlayer> | null = null
   private source = new FlvChunkSource()
@@ -204,23 +205,46 @@ export class MoqPuller {
     log_info('moq-pull', 'WebTransport ready')
     this.setPhase('connected and waiting for stream')
 
-    const control = await wt.createBidirectionalStream()
+    /* 订阅方向的数据流由【服务端】发起（对象走单向流），客户端不再开双向
+     * bind 流 —— 改为在这里接收。incomingUnidirectionalStreams 本身是个会
+     * 排队的 ReadableStream：服务端的流先于我们开始读到达也不会丢，
+     * 但早读能更早暴露解析问题。 */
+    void this.pumpIncomingUni(wt, gen)
+
+    /* 流布局（draft-ietf-moq-transport §3.3）：
+     *   控制流 —— 单向，本端只发 SETUP
+     *   请求流 —— 双向，SUBSCRIBE 各占一条；响应走同流反向（§3.3.2）
+     * 所以 SUBSCRIBE_OK 从我们开的那条双向请求流读回，而不是控制流。 */
+    const control = await wt.createUnidirectionalStream()
     if (gen !== this.connGen || this.wt !== wt) return
-    this.controlWriter = control.writable.getWriter()
-    this.controlReader = control.readable.getReader()
-    log_info('moq-pull', 'control bidi opened')
+    this.controlWriter = control.getWriter()
+    log_info('moq-pull', 'control outbound uni opened')
 
     await this.writeControl(encodeSetup(), 'SETUP')
-    await this.writeControl(
+
+    const req = await wt.createBidirectionalStream()
+    if (gen !== this.connGen || this.wt !== wt) return
+    const reqWriter = req.writable.getWriter()
+    const reqReader = req.readable.getReader()
+    log_info('moq-pull', 'request bidi opened')
+
+    const sendReq = async (buf: Uint8Array, label: string) => {
+      await reqWriter.ready
+      await reqWriter.write(buf)
+      log_info('moq-pull', `TX ${label} ${buf.byteLength}B`)
+    }
+    await sendReq(
       encodeSubscribe({ requestId: 1, app: id.app, stream: id.stream, trackName: 'video', alias: ALIAS_VIDEO }),
       'SUBSCRIBE video',
     )
-    await this.writeControl(
+    await sendReq(
       encodeSubscribe({ requestId: 2, app: id.app, stream: id.stream, trackName: 'audio', alias: ALIAS_AUDIO }),
       'SUBSCRIBE audio',
     )
 
-    await this.waitSubscribeOk(2)
+    await this.waitSubscribeOk(reqReader, 2)
+    try { reqReader.releaseLock() } catch { /* ignore */ }
+    try { await reqWriter.close() } catch { /* ignore */ }
     if (gen !== this.connGen || this.wt !== wt) return
     if (this.mode === 'webcodecs') {
       log_info('moq-pull', 'webcodecs playback mode: decoder sink ready')
@@ -229,9 +253,9 @@ export class MoqPuller {
       this.startPlayer(video)
     }
 
-    void this.readControl()
-    void this.openTrack(ALIAS_VIDEO, 'video')
-    void this.openTrack(ALIAS_AUDIO, 'audio')
+    /* 控制流现在只写（SETUP），没有常驻读取 —— SUBSCRIBE_OK 已在上面的
+     * 请求流里读完。服务端若有 GOAWAY 等控制消息，将来需要另加读取。
+     * 数据流不再在这里开：入口是上面那行 pumpIncomingUni。 */
 
     wt.closed.catch((e) => {
       if (gen !== this.connGen || this.wt !== wt) return
@@ -264,8 +288,6 @@ export class MoqPuller {
     this.aacAsc = null
     this.avcConfigured = false
     this.aacConfigured = false
-    try { this.controlReader?.releaseLock() } catch { /* ignore */ }
-    this.controlReader = null
     try { await this.controlWriter?.close() } catch { /* ignore */ }
     this.controlWriter = null
     try { this.player?.pause() } catch { /* ignore */ }
@@ -289,8 +311,13 @@ export class MoqPuller {
     log_info('moq-pull', `TX ${label} ${buf.byteLength}B hex=${hex_preview(buf, 24)}`)
   }
 
-  private async waitSubscribeOk(need: number) {
-    if (!this.controlReader) throw new Error('control reader missing')
+  /* SUBSCRIBE_OK 从【请求流自身的反向】读回（draft §3.3.2：
+   * 对端必须把响应发回该请求流），所以 reader 传请求流的 readable 端，
+   * 而不是控制流。 */
+  private async waitSubscribeOk(
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    need: number,
+  ) {
     const r = new ByteReader()
     let got = 0
     const t0 = performance.now()
@@ -298,8 +325,8 @@ export class MoqPuller {
       if (performance.now() - t0 > SUBSCRIBE_TIMEOUT_MS) {
         throw new Error(`SUBSCRIBE_OK timeout (${got}/${need})`)
       }
-      const { value, done } = await this.controlReader.read()
-      if (done) throw new Error('control stream closed before SUBSCRIBE_OK')
+      const { value, done } = await reader.read()
+      if (done) throw new Error('request stream closed before SUBSCRIBE_OK')
       if (value) r.push(value)
       for (;;) {
         const msg = tryReadControl(r)
@@ -318,38 +345,40 @@ export class MoqPuller {
     }
   }
 
-  private async readControl() {
-    if (!this.controlReader) return
-    const r = new ByteReader()
+  /* 控制流已改为单向只写，不再有常驻 reader —— 服务端控制消息
+   * （GOAWAY 等）目前不处理。若将来需要，从 incomingUnidirectionalStreams
+   * 取流读取。 */
+
+  /* 服务端发起的单向数据流入口。
+   * 每条流属于哪条 track 由 SUBGROUP 头里的 Track Alias 决定，开流顺序
+   * 不作数（服务端按 SUBSCRIBE 处理顺序开，那是实现细节）——
+   * 所以这里只负责取流，解析与路由交给 openTrack。 */
+  private async pumpIncomingUni(wt: WebTransport, gen: number) {
+    const reader = wt.incomingUnidirectionalStreams.getReader()
     try {
-      while (!this.closed && this.controlReader) {
-        const { value, done } = await this.controlReader.read()
+      for (;;) {
+        const { value, done } = await reader.read()
         if (done) break
-        if (value) r.push(value)
-        for (;;) {
-          const msg = tryReadControl(r)
-          if (!msg) break
-          log_debug('moq-pull', `RX control type=0x${msg.type.toString(16)} ${msg.body.byteLength}B`)
-        }
+        if (this.closed || gen !== this.connGen || this.wt !== wt) return
+        if (value) void this.openTrack(value, gen)
       }
     } catch (e) {
       if (!this.closed) {
-        log_error('moq-pull', `control: ${e instanceof Error ? e.message : String(e)}`)
+        log_error('moq-pull', `incoming uni: ${e instanceof Error ? e.message : String(e)}`)
       }
+    } finally {
+      try { reader.releaseLock() } catch { /* ignore */ }
     }
   }
 
-  private async openTrack(alias: number, name: string) {
-    if (!this.wt) return
-    log_info('moq-pull', `open bidi ${name} alias=${alias}`)
-    const stream = await this.wt.createBidirectionalStream()
-    const w = stream.writable.getWriter()
-    const bind = encodeVarint(alias)
-    await w.ready
-    await w.write(bind)
-    log_info('moq-pull', `TX bind ${name} alias=${alias} hex=${hex_preview(bind)}`)
-    const reader = stream.readable.getReader()
+  /* 一条服务端发起的单向数据流。alias / name 要等 SUBGROUP 头解析出来才知道，
+   * 在那之前它们还是占位值。 */
+  private async openTrack(stream: ReadableStream<Uint8Array>, gen: number) {
+    if (gen !== this.connGen) return
+    const reader = stream.getReader()
     const r = new ByteReader()
+    let name = '?'
+    let alias = -1
     let header = false
     let hasProps = true
     let objs = 0
@@ -366,7 +395,13 @@ export class MoqPuller {
           if (!sg) continue
           header = true
           hasProps = sg.hasProps
-          log_info('moq-pull', `RX SUBGROUP ${name} alias=${sg.alias} props=${hasProps ? 1 : 0}`)
+          /* 流身份来自这里 —— 服务端不再靠"开流 + 写 alias"绑定 track，
+           * SUBGROUP 头里的 alias 是唯一的归属依据。 */
+          alias = sg.alias
+          name = alias === ALIAS_VIDEO ? 'video'
+               : alias === ALIAS_AUDIO ? 'audio'
+               : `alias=${alias}`
+          log_info('moq-pull', `RX SUBGROUP ${name} alias=${alias} props=${hasProps ? 1 : 0}`)
         }
         for (;;) {
           const obj = tryReadObject(r, hasProps)
@@ -388,7 +423,6 @@ export class MoqPuller {
         log_error('moq-pull', `${name}: ${e instanceof Error ? e.message : String(e)}`)
       }
     } finally {
-      try { await w.close() } catch { /* ignore */ }
       try { reader.releaseLock() } catch { /* ignore */ }
     }
   }

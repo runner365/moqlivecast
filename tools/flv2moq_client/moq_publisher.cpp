@@ -39,9 +39,12 @@ std::string CatalogJson(const std::string &app, const std::string &stream) {
 const char *SlotName(int slot) {
     switch (slot) {
     case 0: return "control";
-    case 1: return "catalog";
-    case 2: return "video";
-    case 3: return "audio";
+    case 1: return "req-catalog";
+    case 2: return "req-video";
+    case 3: return "req-audio";
+    case 4: return "catalog";
+    case 5: return "video";
+    case 6: return "audio";
     default: return "?";
     }
 }
@@ -96,7 +99,22 @@ void MoqPublisher::OnConnect(wt_client_t * /*cli*/, int status, void *user) {
  * 这样「第几条开出来」就是稳定的流身份。 */
 void MoqPublisher::OpenNextStream() {
     if (opened_count_ >= kSlotCount) return;
-    wt_client_open_stream(cli_);
+    /* 按 draft-ietf-moq-transport §3.4 / §11 决定流的类型与方向：
+     *   控制流 —— 单向（本端只发 SETUP）
+     *   请求流 —— 双向（PUBLISH 各占一条，响应走同流反向）
+     *   数据流 —— 单向（publisher 开流发送 SUBGROUP/OBJECT；
+     *             对端靠 SUBGROUP 头里的 Track Alias 识别 track，
+     *             规范中没有 bind 这一步）
+     * 本端是 publisher：publisher 开数据流并只发不收（§5.1）。 */
+    const bool uni = (opened_count_ == kSlotControl ||
+                      opened_count_ == kSlotCatalog ||
+                      opened_count_ == kSlotVideo ||
+                      opened_count_ == kSlotAudio);
+    if (uni) {
+        wt_client_open_uni_stream(cli_);
+    } else {
+        wt_client_open_stream(cli_);
+    }
 }
 
 void MoqPublisher::OnStreamOpen(wt_client_t * /*cli*/, wt_stream_t *st,
@@ -113,19 +131,33 @@ void MoqPublisher::OnOpened(int slot, wt_stream_t *st) {
     LOG_INFO("[flv2moq] 流就绪 %s", SlotName(slot));
 
     if (slot == kSlotControl) {
-        /* SETUP 必须最先发，服务端 ParseControl 依赖它建立 session 语义 */
+        /* 控制单向流：只发 SETUP。PUBLISH 走各自的请求双向流
+         * （draft §3.3：请求用双向流，控制流只有 SETUP/GOAWAY）。 */
         Bytes setup = EncodeSetup();
-        SendControl(setup.data(), setup.size(), "SETUP");
+        SendControl(kSlotControl, setup.data(), setup.size(), "SETUP");
+        OpenNextStream(); /* → req-catalog */
+        return;
+    }
 
-        Bytes p1 = EncodePublish(kReqCatalog, app_, stream_, "catalog",
-                                 kAliasCatalog);
-        Bytes p2 = EncodePublish(kReqVideo, app_, stream_, "video", kAliasVideo);
-        Bytes p3 = EncodePublish(kReqAudio, app_, stream_, "audio", kAliasAudio);
-        SendControl(p1.data(), p1.size(), "PUBLISH catalog");
-        SendControl(p2.data(), p2.size(), "PUBLISH video");
-        SendControl(p3.data(), p3.size(), "PUBLISH audio");
+    if (slot == kSlotReqCatalog) {
+        Bytes p = EncodePublish(kReqCatalog, app_, stream_, "catalog",
+                                kAliasCatalog);
+        SendControl(slot, p.data(), p.size(), "PUBLISH catalog");
+        OpenNextStream(); /* → req-video */
+        return;
+    }
 
-        OpenNextStream(); /* → catalog */
+    if (slot == kSlotReqVideo) {
+        Bytes p = EncodePublish(kReqVideo, app_, stream_, "video", kAliasVideo);
+        SendControl(slot, p.data(), p.size(), "PUBLISH video");
+        OpenNextStream(); /* → req-audio */
+        return;
+    }
+
+    if (slot == kSlotReqAudio) {
+        Bytes p = EncodePublish(kReqAudio, app_, stream_, "audio", kAliasAudio);
+        SendControl(slot, p.data(), p.size(), "PUBLISH audio");
+        OpenNextStream(); /* → catalog 数据流 */
         return;
     }
 
@@ -163,10 +195,10 @@ void MoqPublisher::OnOpened(int slot, wt_stream_t *st) {
     }
 }
 
-void MoqPublisher::SendControl(const uint8_t *data, size_t len,
+void MoqPublisher::SendControl(int slot, const uint8_t *data, size_t len,
                                const char *what) {
-    if (!streams_[kSlotControl]) return;
-    wt_stream_write_cb(streams_[kSlotControl], data, len,
+    if (slot < 0 || slot >= kSlotCount || !streams_[slot]) return;
+    wt_stream_write_cb(streams_[slot], data, len,
                        &MoqPublisher::OnWriteDone, this, 5000);
     LOG_DEBUG("[flv2moq] → %s (%zuB)", what, len);
 }

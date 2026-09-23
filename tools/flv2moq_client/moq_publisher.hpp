@@ -71,10 +71,16 @@ public:
     static void OnWriteDone(wt_stream_t *st, int ret, void *user);
 
 private:
-    /* 四条流，顺序即 open 的先后 */
+    /* 流布局（顺序即 open 的先后）。draft-ietf-moq-transport §3.3：
+     *   控制消息 → 一对单向流（本端这条只发 SETUP）
+     *   请求     → 每条一个双向流（PUBLISH 各占一条）
+     *   对象     → 单向流（本阶段暂沿用现有数据流，B 阶段再改） */
     enum StreamSlot {
-        kSlotControl = 0,
-        kSlotCatalog,
+        kSlotControl = 0,   /* uni  : SETUP */
+        kSlotReqCatalog,    /* bidi : PUBLISH catalog */
+        kSlotReqVideo,      /* bidi : PUBLISH video */
+        kSlotReqAudio,      /* bidi : PUBLISH audio */
+        kSlotCatalog,       /* data : SUBGROUP + OBJECT */
         kSlotVideo,
         kSlotAudio,
         kSlotCount
@@ -94,7 +100,8 @@ private:
     static const int64_t kResyncLateMs = 3000;
 
     void OnOpened(int slot, wt_stream_t *st);
-    void SendControl(const uint8_t *data, size_t len, const char *what);
+    void SendControl(int slot, const uint8_t *data, size_t len,
+                     const char *what);
     void SendMedia(int slot, const uint8_t *data, size_t len, const char *what);
 
     /* 视频与音频各自独立推进 —— 二者在不同 QUIC 流上，
@@ -120,7 +127,7 @@ private:
     void SendOneAudio(FlvFrame f);
 
     wt_client_t *cli_ = nullptr;
-    wt_stream_t *streams_[kSlotCount] = {nullptr, nullptr, nullptr, nullptr};
+    wt_stream_t *streams_[kSlotCount] = {};
     int opened_count_ = 0;
     bool media_ready_ = false;
     bool failed_ = false;

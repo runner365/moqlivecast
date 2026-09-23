@@ -354,6 +354,47 @@ static void bbr_get_info(const struct quic_cc *cc, struct quic_cc_info *out) {
         double pg = bbr_pacing_gain(bbr);
         double rate = pg * (double)bbr->max_bw;
         if (rate < 0.0) rate = 0.0;
+
+        /* ── pacing 下限：不低于 cwnd 地板对应的速率 ──
+         *
+         * 没有这道下限时，max_bw 会被拖到远低于应用需求的水平
+         * （实测下行 116KB/s vs 需求 500KB/s）。后果是 pacing 自己
+         * 成为瓶颈：单个大 object（关键帧可达 81~190KB）在低速率下
+         * 需要数百 ms 才能发完，chunk 迟迟无法完成而被 PTO 判为
+         * 「该重传」，反复 20 次后连接被误判 dead。
+         *
+         * 下限取 4×MSS/min_rtt —— 即 cwnd 地板所对应的带宽。
+         * 物理含义：只要 cwnd 允许在途 4 个包，发送速率就不该低于
+         * 「每个 RTT 送完这 4 个包」。这是从现有参数推导的，不是拍脑袋值。
+         *
+         * 注意这只抬 pace_rate，不动 max_bw 本身 —— max_bw 仍可继续
+         * 衰减，只是不再把发送速率一起拖下去。
+         *
+         * min_rtt 未测量时（=0）必须跳过下限，不能用 1us 兜底：
+         * 那样会算出 4×MSS/1us ≈ 4.8GB/s 的"下限"，实际等价于禁用 pacing
+         * ——而 STARTUP 恰恰是最需要 pacing 抑制突发的阶段。
+         * 此阶段 pacing_rate 本就由初始 max_bw 推得，无需额外保护。 */
+        if (bbr->min_rtt_us > 0) {
+            const double floor_rate =
+                (4.0 * (double)bbr->mss * 1e6) / (double)bbr->min_rtt_us;
+            if (rate < floor_rate) {
+                /* 诊断：下限生效说明 max_bw 被估到了远低于「cwnd 地板对应
+                 * 速率」的水平。若这条频繁出现，问题在测量侧（ACK 稀疏 /
+                 * 窗口自锁），而不是发送侧。1 秒限流，避免每包一条。 */
+                static uint64_t last_floor_log_ms = 0;
+                const uint64_t now_ms = bbr_now_us() / 1000;
+                if (now_ms - last_floor_log_ms >= 1000) {
+                    last_floor_log_ms = now_ms;
+                    LOG_INFO("[cc-bbr] pacing floor applied: rate=%.0f -> %.0f B/s "
+                             "(max_bw=%llu pacing_gain=%.2f min_rtt=%lluus state=%d)",
+                             rate, floor_rate,
+                             (unsigned long long)bbr->max_bw, pg,
+                             (unsigned long long)bbr->min_rtt_us, bbr->state);
+                }
+                rate = floor_rate;
+            }
+        }
+
         if (rate > 1e12) rate = 1e12;   /* 防溢出到 uint64 之外 */
         out->pacing_rate_bps = (uint64_t)rate;
     }

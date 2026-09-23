@@ -37,6 +37,8 @@ function parseAppStream(url: string): { app: string; stream: string } {
 export class MoqPublisher implements AvSink {
   private wt: WebTransport | null = null
   private control: WritableStreamDefaultWriter<Uint8Array> | null = null
+  /* 每条 PUBLISH 一条请求双向流，需持有 writer 避免被 GC / 提前 FIN */
+  private reqWriters: WritableStreamDefaultWriter<Uint8Array>[] = []
   private videoWriter: WritableStreamDefaultWriter<Uint8Array> | null = null
   private audioWriter: WritableStreamDefaultWriter<Uint8Array> | null = null
   private closed = false
@@ -90,23 +92,28 @@ export class MoqPublisher implements AvSink {
       hooks.onClosed?.()
     })
 
-    const bidi = await this.wt.createBidirectionalStream()
-    this.control = bidi.writable.getWriter()
-    this.tx('control bidi opened')
+    /* 流布局（draft §3.3 / §3.4）：
+     *   控制流 —— 单向，只发 SETUP
+     *   请求流 —— 双向，每条 PUBLISH 各占一条（响应走同流反向）
+     *   数据流 —— 单向（openMediaUni） */
+    const ctrl = await this.wt.createUnidirectionalStream()
+    this.control = ctrl.getWriter()
+    this.tx('control uni opened')
 
     await this.sendControl(encodeSetup(), 'SETUP')
+    this.tx('SETUP sent')
     await this.sendPublish(0, 'catalog', ALIAS_CATALOG)
     await this.sendPublish(2, 'video', ALIAS_VIDEO)
     await this.sendPublish(4, 'audio', ALIAS_AUDIO)
-    this.tx('signaling PUBLISH done, next=bidi catalog/audio')
+    this.tx('signaling PUBLISH done, next=uni catalog/audio')
     await this.sendCatalog(status)
 
-    this.audioWriter = await this.openMediaBidi(`audio alias=${ALIAS_AUDIO} group=0`)
+    this.audioWriter = await this.openMediaUni(`audio alias=${ALIAS_AUDIO} group=0`)
     await this.write(this.audioWriter, encodeSubgroupHeader(ALIAS_AUDIO, 0),
       `SUBGROUP audio alias=${ALIAS_AUDIO} group=0`)
 
     this.videoGroup = 0
-    this.videoWriter = await this.openMediaBidi(`video alias=${ALIAS_VIDEO} group=0`)
+    this.videoWriter = await this.openMediaUni(`video alias=${ALIAS_VIDEO} group=0`)
     await this.write(this.videoWriter, encodeSubgroupHeader(ALIAS_VIDEO, 0),
       `SUBGROUP video alias=${ALIAS_VIDEO} group=0`)
 
@@ -204,6 +211,10 @@ export class MoqPublisher implements AvSink {
     try { await this.videoWriter?.close() } catch { /* ignore */ }
     try { await this.audioWriter?.close() } catch { /* ignore */ }
     try { await this.control?.close() } catch { /* ignore */ }
+    for (const w of this.reqWriters) {
+      try { await w.close() } catch { /* ignore */ }
+    }
+    this.reqWriters = []
     this.videoWriter = null
     this.audioWriter = null
     this.control = null
@@ -217,6 +228,9 @@ export class MoqPublisher implements AvSink {
     await this.write(this.control, buf, `control ${name}`, true)
   }
 
+  /* PUBLISH 各占一条【双向请求流】（draft §3.3）。响应（PUBLISH_OK /
+   * REQUEST_ERROR）会走同一条流的反向，所以这里保留 readable 以便后续读取，
+   * 但当前实现没有等待响应 —— 若要处理 PUBLISH_OK，从 reader 读即可。 */
   private async sendPublish(requestId: number, trackName: string, alias: number) {
     const buf = encodePublish({
       requestId,
@@ -228,7 +242,13 @@ export class MoqPublisher implements AvSink {
     this.tx(
       `encode PUBLISH req=${requestId} ns=${this.app}/${this.stream} name=${trackName} alias=${alias} ${buf.byteLength}B`,
     )
-    await this.sendControl(buf, `PUBLISH ${trackName}`)
+    const req = await this.wt!.createBidirectionalStream()
+    const w = req.writable.getWriter()
+    await w.ready
+    await w.write(buf)
+    this.tx(`TX PUBLISH ${trackName} on own bidi req stream ${buf.byteLength}B`)
+    /* 保持 writer 打开：请求流在其生命周期内有效，提前 close 会发 FIN */
+    this.reqWriters.push(w)
   }
 
   private async sendCatalog(status: EncoderStatus) {
@@ -240,20 +260,20 @@ export class MoqPublisher implements AvSink {
       width: status.width,
       height: status.height,
     })
-    const w = await this.openMediaBidi(`catalog alias=${ALIAS_CATALOG}`)
+    const w = await this.openMediaUni(`catalog alias=${ALIAS_CATALOG}`)
     const hdr = encodeSubgroupHeader(ALIAS_CATALOG, 0)
     const obj = encodeObject({ objectIdDelta: 0, timestampMs: 0, payload: json })
     await this.write(w, hdr, `SUBGROUP catalog alias=${ALIAS_CATALOG} group=0`)
     await this.write(w, obj, `OBJECT catalog ${json.byteLength}B`)
     this.tx(`catalog json=${new TextDecoder().decode(json)}`)
     try { await w.close() } catch { /* ignore */ }
-    this.tx('catalog bidi closed')
+    this.tx('catalog uni closed')
   }
 
   private async sendVideo(payload: Uint8Array, dtsMs: number, key: boolean) {
     try {
       if (!this.videoWriter) {
-        this.tx('skip video: no bidi writer')
+        this.tx('skip video: no uni writer')
         return
       }
       const cfg = !this.avcCSent && this.avcC ? this.avcC : undefined
@@ -282,7 +302,7 @@ export class MoqPublisher implements AvSink {
   private async sendAudio(payload: Uint8Array, dtsMs: number) {
     try {
       if (!this.audioWriter) {
-        if (this.audioObj === 0) this.tx('skip audio: no bidi writer')
+        if (this.audioObj === 0) this.tx('skip audio: no uni writer')
         return
       }
       const cfg = !this.aacSent && this.aacAsc ? this.aacAsc : undefined
@@ -307,19 +327,22 @@ export class MoqPublisher implements AvSink {
     }
   }
 
-  /* 媒体暂用 bidi，与 FLV 推流同一路径；uni 以后再接 */
-  private async openMediaBidi(label: string): Promise<WritableStreamDefaultWriter<Uint8Array>> {
+  /* 媒体数据流走单向（draft §3.4），见 openMediaUni */
+  /* 数据流用【单向】（draft §3.4：SUBGROUP_HEADER 是单向流类型）。
+   * 本端是 publisher，按 §5.1 由 publisher 开数据流并只发不收 ——
+   * 所以此前"开双向流再 cancel 掉 readable"的写法是多余且不合规的，
+   * 直接开单向流即可。对端靠 SUBGROUP 头里的 Track Alias 识别 track。 */
+  private async openMediaUni(label: string): Promise<WritableStreamDefaultWriter<Uint8Array>> {
     if (!this.wt) throw new Error('wt closed')
-    this.tx(`bidi open begin ${label}`)
+    this.tx(`uni open begin ${label}`)
     const t0 = performance.now()
     try {
-      const stream = await this.wt.createBidirectionalStream()
-      try { void stream.readable.cancel() } catch { /* ignore */ }
-      this.tx(`bidi open ok ${label} ${Math.round(performance.now() - t0)}ms`)
-      return stream.writable.getWriter()
+      const stream = await this.wt.createUnidirectionalStream()
+      this.tx(`uni open ok ${label} ${Math.round(performance.now() - t0)}ms`)
+      return stream.getWriter()
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
-      this.tx(`bidi open FAIL ${label} ${msg}`, 'error')
+      this.tx(`uni open FAIL ${label} ${msg}`, 'error')
       throw e
     }
   }

@@ -32,6 +32,7 @@ struct wt_stream {
     int           header_sent;      /* WT 帧头是否已发送 */
     int           header_stripped;  /* WT 帧头是否已从入站数据剥离 */
     int           peer_initiated;   /* 是否由对端初始化的流 */
+    int           is_uni;           /* 1 = 单向流（对端只能发，本端不能回写） */
     wt_stream_on_writable_fn on_writable;
     void         *on_writable_user;
 };
@@ -190,6 +191,35 @@ void *wt_stream_get_user_data(wt_stream_t *st)
     { return st ? st->user_data : NULL; }
 wt_session_t *wt_stream_get_session(wt_stream_t *st)
     { return st ? st->sess : NULL; }
+int wt_stream_is_uni(wt_stream_t *st)
+    { return st ? st->is_uni : 0; }
+
+wt_stream_t *wt_server_open_uni_stream(wt_session_t *sess) {
+    if (!sess || !sess->ws) return NULL;
+
+    /* 服务端需已从客户端收到 MAX_STREAMS_UNI 配额，否则 open 返回
+     * UINT64_MAX。此时上层应稍后重试，而不是当作致命错误。 */
+    QuicConnection *qc = (QuicConnection*)sess->ws->conn;
+    if (!qc) return NULL;
+
+    uint64_t sid = QuicConnectionStreamOpenUni(qc);
+    if (sid == UINT64_MAX) {
+        LOG_WARN("[wt-srv] open uni stream failed (no MAX_STREAMS_UNI credit?)");
+        return NULL;
+    }
+
+    wt_stream_t *st = (wt_stream_t*)calloc(1, sizeof(*st));
+    if (!st) return NULL;
+    st->sess = sess;
+    st->stream_id = sid;
+    st->is_uni = 1;
+    st->peer_initiated = 0;   /* 本端发起 —— 可以写，收包回调不会来 */
+    st->next = sess->streams;
+    sess->streams = st;
+
+    LOG_INFO("[wt-srv] opened uni stream %llu", (unsigned long long)sid);
+    return st;
+}
 
 static void wt_quic_writable_tramp(QuicStream *s, void *user) {
     (void)s;
@@ -210,14 +240,36 @@ int wt_stream_write(wt_stream_t *st, const uint8_t *data, size_t len) {
     if (!st || !st->sess || !st->sess->ws) return -1;
     if (!data && len > 0) return -1;
 
-    /* WT frame header only on first write per stream */
+    /* 对端发起的单向流本端不能回写 —— 发出去会触发对端
+     * PROTOCOL_VIOLATION（RFC 9114 §6.1）。这里直接拒绝并提示，
+     * 避免上层误用后表现为「对端莫名断连」。 */
+    if (st->peer_initiated && st->is_uni) {
+        LOG_WARN("[wt-srv] refuse write on peer-initiated uni stream %llu "
+                 "(%zu bytes dropped)", (unsigned long long)st->stream_id, len);
+        return -1;
+    }
+
+    /* WT 首包前缀：流类型 varint + session_id varint。
+     *   双向流：0x41（WT STREAM 帧）
+     *   单向流：0x54（WT 单向数据流类型，draft-ietf-webtrans-http3）
+     * ⚠️ 0x54 必须按 varint 编码成 2 字节 0x40 0x54 —— 0x54 的高 2 位
+     * 是 01，单字节写会被解析成 2 字节 varint，对端判不出流类型。 */
     if (!st->header_sent && !st->peer_initiated) {
-        uint8_t hdr[3] = {0x40, 0x41, 0x00};
-        size_t total = 3 + len;
+        uint8_t hdr[4];
+        size_t n = 0;
+        const uint64_t stype = st->is_uni ? 0x54 : 0x41;
+        if (stype < 64) {
+            hdr[n++] = (uint8_t)stype;
+        } else {
+            hdr[n++] = (uint8_t)(0x40 | ((stype >> 8) & 0x3f));
+            hdr[n++] = (uint8_t)(stype & 0xff);
+        }
+        hdr[n++] = 0x00;   /* session_id */
+        size_t total = n + len;
         uint8_t *framed = (uint8_t*)malloc(total);
         if (!framed) return -1;
-        framed[0] = hdr[0]; framed[1] = hdr[1]; framed[2] = hdr[2];
-        if (len > 0) memcpy(framed + 3, data, len);
+        memcpy(framed, hdr, n);
+        if (len > 0) memcpy(framed + n, data, len);
         int r = webtransport_session_send_stream_data(st->sess->ws, st->stream_id,
                                                        framed, total, 0);
         free(framed);
@@ -331,7 +383,7 @@ static void on_internal_wt_close(webtransport_session *ws) {
 static void on_internal_wt_stream(webtransport_session *ws,
                                    uint64_t sid, int is_uni,
                                    const uint8_t *data, size_t len, int fin) {
-    (void)is_uni; (void)fin;
+    (void)fin;
     if (!g_srv) return;
     wt_session_t *sess = (wt_session_t*)ws->user_data;
     if (!sess) return;
@@ -343,6 +395,9 @@ static void on_internal_wt_stream(webtransport_session *ws,
         st->sess = sess; st->stream_id = sid;
         st->next = sess->streams; sess->streams = st;
         st->peer_initiated = 1;  /* mark as peer-initiated stream */
+        /* 单向流：对端只能发，本端不得回写。记录下来供上层决策，
+         * 也供 wt_stream_write 拒绝非法回写（会触发 PROTOCOL_VIOLATION）。 */
+        st->is_uni = is_uni;
     }
 
     /* Strip WebTransport STREAM frame header — once per stream.

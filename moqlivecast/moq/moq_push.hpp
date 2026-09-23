@@ -39,7 +39,14 @@ public:
 private:
     struct StreamState {
         std::vector<uint8_t> buf;
-        enum Kind { UNKNOWN, CONTROL, DATA, DOWNLINK } kind = UNKNOWN;
+        /* CONTROL : 控制单向流，只有 SETUP / GOAWAY
+         * REQUEST : 请求双向流，首条消息为 PUBLISH 或 SUBSCRIBE；
+         *           响应（SUBSCRIBE_OK 等）走本流反向
+         * DATA    : 对象流（SUBGROUP + OBJECT）
+         * 订阅方向的下行流不再经过这里：它由本端发起（OpenUniDownlink），
+         * 只写不收，不会收到 on_stream_data。
+         * 见 draft-ietf-moq-transport §3.3。 */
+        enum Kind { UNKNOWN, CONTROL, REQUEST, DATA } kind = UNKNOWN;
         bool header_done = false;
         bool has_props = false;
         uint64_t alias = 0;
@@ -56,7 +63,6 @@ private:
         std::queue<std::shared_ptr<DataBuffer>> send_q;
         size_t send_q_bytes = 0;
         int64_t last_congested_dbg_ts_s = 0;
-        int64_t last_drained_dbg_ts_s = 0;
         int64_t last_send_dbg_ts_s = 0;
     };
 
@@ -68,8 +74,13 @@ private:
     bool ParsePublish(const uint8_t *body, size_t len);
     bool ParseSubscribe(const uint8_t *body, size_t len,
                         uint64_t &request_id, uint64_t &alias, std::string &name);
+    /* 应答走【请求流自身的反向】（draft §3.3.2：发送响应的一端必须把
+     * 对应的响应消息发回该请求流），因此 st 传请求流本身。 */
     void SendSubscribeOk(WTServerStream &st, uint64_t request_id, uint64_t alias);
-    void BindDownlink(WTServerSession &sess, WTServerStream &st, uint64_t alias);
+    /* 订阅方向的数据单向流由【服务端】发起（对象走单向流）—— 客户端不再
+     * 开双向 bind 流。返回 false 表示该 track 的流暂未开出来（通常是客户端
+     * MAX_STREAMS_UNI 配额还没到），由媒体路径重试，不是致命错误。 */
+    bool OpenUniDownlink(WTServerSession &sess, uint64_t alias);
     void SendGop(Downlink &dl, uint64_t alias);
     void EnsurePullTsBase();
     int64_t PullTs(Media_Packet_Ptr pkt);
@@ -96,7 +107,10 @@ private:
     bool writer_closed_ = false;
     bool avc_seq_sent_ = false;
     bool aac_seq_sent_ = false;
+    /* 对端的控制单向流（只读，承载 SETUP）。 */
     WTServerStream *control_ = nullptr;
+    /* 订阅方所属 session —— 媒体路径重试开单向流时要用（见 OpenUniDownlink）。 */
+    WTServerSession *subscriber_sess_ = nullptr;
     Downlink video_dl_;
     Downlink audio_dl_;
     int64_t pull_ts_base_ = -1;

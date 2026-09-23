@@ -20,11 +20,62 @@ static void on_session(wt_server_t *srv, wt_session_t *sess, void *user) {
     LOG_WARN("[wt-echo-srv] >>>SESSION path=%s", path ? path : "/");
 }
 
+/* 回送用的单向流出流：每个会话一条，惰性创建后挂在 session 上。
+ * 收到客户端单向流数据时，在这条【服务端发起的】流上把原样内容送回 ——
+ * 单向流不能在对端发起的流上回写（会触发 PROTOCOL_VIOLATION），
+ * 所以 echo 的「回」只能靠新开一条单向流完成。 */
+static wt_stream_t *echo_stream_of(wt_session_t *sess) {
+    wt_stream_t *out = (wt_stream_t*)wt_session_get_user_data(sess);
+    if (out) return out;
+
+    out = wt_server_open_uni_stream(sess);
+    if (!out) {
+        /* 通常是客户端还没给出 MAX_STREAMS_UNI 配额 —— 流控的正常情形。
+         * 本会话首包可能早于配额到达，此处放弃本条回送，后续再试。 */
+        LOG_WARN("[wt-echo-srv] open echo uni stream failed (no credit yet)");
+        return NULL;
+    }
+    wt_session_set_user_data(sess, out);
+    LOG_WARN("[wt-echo-srv] echo uni stream ready");
+    return out;
+}
+
+static uint64_t g_uni_recv_bytes = 0;
+static int      g_uni_recv_count = 0;
+
 static void on_stream_data(wt_server_t *srv, wt_session_t *sess,
                             wt_stream_t *st,
                             const uint8_t *data, size_t len, void *user) {
-    (void)srv; (void)sess; (void)user;
-    LOG_INFO("[wt-echo-srv] echo %zu bytes", len);
+    (void)srv; (void)user;
+
+    if (wt_stream_is_uni(st)) {
+        g_uni_recv_bytes += len;
+        g_uni_recv_count++;
+
+        char preview[160];
+        size_t n = len < sizeof(preview) - 1 ? len : sizeof(preview) - 1;
+        memcpy(preview, data, n);
+        preview[n] = '\0';
+        LOG_WARN("[wt-echo-srv] recv %zu bytes on UNI stream "
+                 "(total %zu bytes in %d frames) payload=\"%s\"",
+                 len, (size_t)g_uni_recv_bytes, g_uni_recv_count, preview);
+
+        /* echo：原样回送到本会话的回流上。
+         * 不能在本流回写，故走服务端自建的单向流。 */
+        wt_stream_t *out = echo_stream_of(sess);
+        if (out) {
+            int r = wt_stream_write(out, data, len);
+            LOG_WARN("[wt-echo-srv] echo back %zu bytes on uni stream, r=%d",
+                     len, r);
+        }
+        return;
+    }
+
+    char preview[160];
+    size_t n = len < sizeof(preview) - 1 ? len : sizeof(preview) - 1;
+    memcpy(preview, data, n);
+    preview[n] = '\0';
+    LOG_INFO("[wt-echo-srv] echo %zu bytes payload=\"%s\"", len, preview);
     wt_stream_write(st, data, len);
 }
 

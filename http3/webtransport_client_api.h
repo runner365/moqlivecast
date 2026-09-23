@@ -79,6 +79,16 @@ int wt_client_get_quic_stats(wt_client_t *cli, QuicConnectionStats *out);
  * 初始化完成后通过 cb.on_stream_data 接收数据。 */
 void wt_client_open_stream(wt_client_t *cli);
 
+/* 打开一个单向 stream（任意线程调用）。
+ * 语义：本端只写，对端只读；不会收到该流上的 on_stream_data。
+ * 通过 cb.on_stream_open 拿到 wt_stream_t，再用
+ * wt_stream_is_uni() 区分它与双向流。
+ * MOQ 规范要求对象走单向流，控制流也是一对单向流。 */
+void wt_client_open_uni_stream(wt_client_t *cli);
+
+/* 该流是否为单向流（0 = 双向）。 */
+int wt_stream_is_uni(wt_stream_t *s);
+
 /* 写数据回调：ret=0 全部 ACK，ret=-2 超时，ret<0 错误。
  * 回调在 loop 线程中调用，可安全再次调用 wt_stream_write_cb 继续发送。
  * timeout_ms=0 默认 5000ms。 */
