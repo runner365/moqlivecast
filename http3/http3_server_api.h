@@ -4,6 +4,9 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <uv.h>
+/* 需要 http3_on_other_alpn_fn —— 本头文件把它再暴露给上层（wt_server 等）。
+ * 该回调参数里有 QuicConnection，所以这一层也跟着把 quic 头拉进来。 */
+#include "http3_server.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -73,6 +76,11 @@ typedef void (*http3_handler_fn)(http3_request *req, http3_response *resp);
 /* 创建 HTTP/3 服务端，自动绑定并监听。
  * 失败返回 NULL；成功返回 handle。
  */
+http3_server_api *http3_server_api_create_alpn(
+    uv_loop_t *loop, const char *cert_file, const char *key_file,
+    const char *ip, int port, const char *const *alpn, int alpn_count);
+
+/* alpn = NULL / alpn_count = 0 → 默认列表（h3 + quic-echo） */
 http3_server_api *http3_server_api_create(
     uv_loop_t  *loop,
     const char *cert_file,
@@ -106,6 +114,12 @@ void http3_server_api_set_on_datagram(http3_server_api *srv,
 typedef void (*http3_on_wt_session_fn)(http3_server_api *srv,
                                         webtransport_session *session,
                                         const char *path);
+
+/* 非 h3 的 ALPN 连接（同端口跑别的 QUIC 协议，如裸 moq-lite）。
+ * 回调在握手完成时触发，注册方自行接线。见 http3_server.h 的说明。 */
+void http3_server_api_set_on_other_alpn(http3_server_api *srv,
+                                         http3_on_other_alpn_fn cb,
+                                         void *user_data);
 
 void http3_server_api_set_on_wt_session(http3_server_api *srv,
                                          http3_on_wt_session_fn cb);

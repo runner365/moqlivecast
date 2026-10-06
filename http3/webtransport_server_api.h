@@ -58,6 +58,20 @@ typedef struct {
 wt_server_t *wt_server_create(uv_loop_t *loop);
 
 /* 绑定 + TLS + 启动监听 */
+/* 非 h3 的 ALPN 连接（同端口跑别的 QUIC 协议，如裸 moq-lite）。
+ * 回调在**握手完成**时触发（ALPN 那时才定得下来），注册方自行接线。
+ * listen 前后注册都可以。 */
+void wt_server_set_on_other_alpn(wt_server_t *srv,
+                                  http3_on_other_alpn_fn cb, void *user_data);
+
+/* 本端口接受的应用协议（ALPN），服务端偏好优先。
+ * alpn = NULL / alpn_count = 0 → 默认列表（h3 + quic-echo）。
+ * 想在同一个 UDP 端口上再开裸 QUIC 的 moq-lite，就往表里加 "moq-lite-06"。 */
+int wt_server_listen_ex(wt_server_t *srv,
+                         const char *cert_file, const char *key_file,
+                         const char *ip, int port,
+                         const char *const *alpn, int alpn_count);
+
 int wt_server_listen(wt_server_t *srv,
                       const char *cert_file, const char *key_file,
                       const char *ip, int port);

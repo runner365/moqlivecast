@@ -156,7 +156,7 @@ static void bbr_enter_probe_bw(quic_cc_bbr_t *bbr) {
     bbr->state = BBR_PROBE_BW;
     bbr->probe_bw_phase = 0;
     bbr_set_cwnd(bbr);
-    LOG_DEBUG("[cc-bbr] → PROBE_BW  max_bw=%llu min_rtt=%llu cwnd=%llu",
+    LOG_INFO("[cc-bbr] → PROBE_BW  max_bw=%llu min_rtt=%llu cwnd=%llu",
              (unsigned long long)bbr->max_bw,
              (unsigned long long)bbr->min_rtt_us,
              (unsigned long long)bbr->cwnd_);
@@ -316,7 +316,7 @@ static void bbr_on_persistent_congestion(struct quic_cc *cc, uint64_t now_ms) {
     bbr->bw_idx = bbr->bw_count = 0;
     bbr_enter_startup(bbr, now_ms);
 
-    LOG_DEBUG("[cc-bbr] persistent congestion — RESET to startup cwnd=%llu max_bw=%llu",
+    LOG_INFO("[cc-bbr] persistent congestion — RESET to startup cwnd=%llu max_bw=%llu",
              (unsigned long long)bbr->cwnd_, (unsigned long long)bbr->max_bw);
 }
 

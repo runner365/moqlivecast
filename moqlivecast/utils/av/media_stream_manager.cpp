@@ -1,11 +1,30 @@
 #include "media_stream_manager.hpp"
 #include "media_packet.hpp"
 #include "logger.hpp"
+#include <chrono>
 #include <sstream>
 #include <vector>
 
 namespace cpp_streamer
 {
+
+    namespace {
+
+    /* 顶替防抖：同一个 key 在窗口内被顶超过 kMaxTakeOverPerWindow 次就拒新。
+     * 目的只是拦住「两个真实推流端撞名 / 客户端断了就自动重连」这种互相踢的
+     * 死循环；正常的重启（旧的已经干净摘牌）走不到这里，因为那时
+     * publisher_id_ 已被清空，claim 结果是 kReused。 */
+    constexpr int64_t kTakeOverWindowMs = 10000;
+    constexpr int kMaxTakeOverPerWindow = 3;
+
+    int64_t NowMs() {
+        return static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+
+    } /* namespace */
+
     std::unordered_map<std::string, MEDIA_STREAM_PTR> MediaStreamManager::media_streams_map_;
     std::vector<StreamManagerCallbackI*> MediaStreamManager::cb_vec_;
     AvWriterInterface* MediaStreamManager::hls_writer_ = nullptr;
@@ -180,6 +199,7 @@ namespace cpp_streamer
 
         LogInfof(logger_, "remove publisher in media stream:%s", stream_key.c_str());
         iter->second->publisher_exist_ = false;
+        iter->second->publisher_id_.clear();
         iter->second->clock_reset_pending_ = true;
         iter->second->cache_.Clear();
         LogInfof(logger_, "clear gop after unpublish key:%s", stream_key.c_str());
@@ -196,6 +216,111 @@ namespace cpp_streamer
             }
         }
         return;
+    }
+
+    PublishClaimResult MediaStreamManager::ClaimPublisher(const std::string& stream_key,
+                                                          const std::string& owner_id) {
+        PublishClaimResult ret;
+
+        auto iter = media_streams_map_.find(stream_key);
+        if (iter == media_streams_map_.end()) {
+            MEDIA_STREAM_PTR stream_ptr = std::make_shared<MediaStream>();
+            stream_ptr->publisher_exist_ = true;
+            stream_ptr->publisher_id_ = owner_id;
+            stream_ptr->stream_key_ = stream_key;
+            LogInfof(logger_, "add new publisher stream key:%s, owner:%s, stream_p:%p",
+                stream_key.c_str(), owner_id.c_str(), (void*)stream_ptr.get());
+            media_streams_map_.insert(std::make_pair(stream_key, stream_ptr));
+
+            std::string app;
+            std::string streamname;
+            if (GetAppStreamname(stream_key, app, streamname)) {
+                for (auto cb : cb_vec_) {
+                    cb->OnPublish(app, streamname);
+                }
+            }
+
+            ret.action = PublishClaim::kCreated;
+            return ret;
+        }
+
+        MEDIA_STREAM_PTR stream_ptr = iter->second;
+        /* 同一个会话重复 PUBLISH（catalog/video/audio 各一条），或者流上还没
+         * 登记过 owner（老路径/媒体先到），都按复用处理，不触发顶替。 */
+        if (stream_ptr->publisher_id_.empty() || stream_ptr->publisher_id_ == owner_id) {
+            stream_ptr->publisher_exist_ = true;
+            if (stream_ptr->publisher_id_.empty()) {
+                stream_ptr->publisher_id_ = owner_id;
+            }
+            ret.action = PublishClaim::kReused;
+            return ret;
+        }
+
+        const int64_t now = NowMs();
+        if (stream_ptr->claim_window_ms_ != 0
+            && now - stream_ptr->claim_window_ms_ <= kTakeOverWindowMs) {
+            stream_ptr->claim_takeovers_++;
+            if (stream_ptr->claim_takeovers_ > kMaxTakeOverPerWindow) {
+                LogErrorf(logger_, "publisher take over rejected key:%s current:%s new:%s"
+                    " takeovers:%d in %lldms",
+                    stream_key.c_str(), stream_ptr->publisher_id_.c_str(),
+                    owner_id.c_str(), stream_ptr->claim_takeovers_,
+                    (long long)(now - stream_ptr->claim_window_ms_));
+                ret.action = PublishClaim::kRejected;
+                ret.previous_owner = stream_ptr->publisher_id_;
+                return ret;
+            }
+        }
+        else {
+            stream_ptr->claim_window_ms_ = now;
+            stream_ptr->claim_takeovers_ = 1;
+        }
+
+        /* 新顶旧：先把 owner 换成新的，调用方随后去断旧会话。
+         * 顺序不能反 —— 被顶掉的会话关闭时会走到 ReleasePublisher，那时 owner
+         * 已经不是它，才不会把新 publisher 刚建立的 cache 清掉。 */
+        ret.action = PublishClaim::kTakeOver;
+        ret.previous_owner = stream_ptr->publisher_id_;
+        LogWarnf(logger_, "publisher take over key:%s old:%s new:%s takeovers:%d",
+            stream_key.c_str(), ret.previous_owner.c_str(), owner_id.c_str(),
+            stream_ptr->claim_takeovers_);
+        stream_ptr->publisher_id_ = owner_id;
+        stream_ptr->publisher_exist_ = true;
+        return ret;
+    }
+
+    bool MediaStreamManager::IsPublisherOwner(const std::string& stream_key,
+                                              const std::string& owner_id) {
+        auto iter = media_streams_map_.find(stream_key);
+        if (iter == media_streams_map_.end()) {
+            return false;
+        }
+        /* owner 为空 = 这条流没登记过来源（RTMP 等老路径不会登记）。此时不能
+         * 判定「被顶掉」：老路径的 RemovePublisher 会把 owner 清空，若在这里
+         * 返回 false，还在正常推流的 moq 会话会被永久丢包。 */
+        if (iter->second->publisher_id_.empty()) {
+            return true;
+        }
+        return iter->second->publisher_id_ == owner_id;
+    }
+
+    bool MediaStreamManager::ReleasePublisher(const std::string& stream_key,
+                                              const std::string& owner_id) {
+        auto iter = media_streams_map_.find(stream_key);
+        if (iter == media_streams_map_.end()) {
+            return false;
+        }
+        /* 同上：没登记 owner 的流按老行为直接摘牌，否则 publisher_exist_ 会
+         * 一直挂着，流要等到最后一个 player 离开才回收。 */
+        if (!iter->second->publisher_id_.empty()
+            && iter->second->publisher_id_ != owner_id) {
+            LogWarnf(logger_, "skip stale publisher release key:%s owner:%s current:%s",
+                stream_key.c_str(), owner_id.c_str(),
+                iter->second->publisher_id_.c_str());
+            return false;
+        }
+        RemovePublisher(stream_key);
+        return true;
     }
 
     void MediaStreamManager::SetHlsWriter(AvWriterInterface* writer) {
@@ -225,6 +350,56 @@ namespace cpp_streamer
         if (!gop) return false;
         if (gop->VideoHdr() || gop->AudioHdr()) return true;
         return !gop->Packets().empty();
+    }
+
+    std::vector<std::string> MediaStreamManager::ListPublisherKeys() {
+        std::vector<std::string> keys;
+        /* 单线程假设：整个进程只有一个 uv loop（moq.cpp 的 uv_run），
+         * WriterMediaPacket 的扇出与 QUIC 回调都跑在它上面，所以这里不加锁
+         * —— 与 MoqPushSession 从别的连接线程直接写 QUIC 是同一套前提。 */
+        keys.reserve(media_streams_map_.size());
+        for (const auto &item : media_streams_map_) {
+            if (item.second && item.second->publisher_exist_) {
+                keys.push_back(item.first);
+            }
+        }
+        return keys;
+    }
+
+    bool MediaStreamManager::SetCatalogJson(const std::string &stream_key,
+                                            const std::string &owner_id,
+                                            const std::string &json) {
+        if (json.empty()) return false;
+
+        auto iter = media_streams_map_.find(stream_key);
+        if (iter == media_streams_map_.end() || !iter->second) return false;
+
+        /* 被顶掉的旧会话仍在途中的 catalog 不许覆盖新 publisher 的 —— 判据与
+         * IsPublisherOwner 完全一致（owner 为空的老路径不做校验）。 */
+        if (!iter->second->publisher_id_.empty()
+            && iter->second->publisher_id_ != owner_id) {
+            LogWarnf(logger_, "skip stale catalog key:%s owner:%s current:%s",
+                     stream_key.c_str(), owner_id.c_str(),
+                     iter->second->publisher_id_.c_str());
+            return false;
+        }
+        if (iter->second->catalog_json_ == json) return true;
+
+        iter->second->catalog_json_ = json;
+        iter->second->catalog_rev_++;
+        LogInfof(logger_, "catalog stored key:%s bytes:%zu rev:%llu",
+                 stream_key.c_str(), json.size(),
+                 (unsigned long long)iter->second->catalog_rev_);
+        return true;
+    }
+
+    bool MediaStreamManager::GetCatalogJson(const std::string &stream_key,
+                                            std::string &out) {
+        auto iter = media_streams_map_.find(stream_key);
+        if (iter == media_streams_map_.end() || !iter->second) return false;
+        if (iter->second->catalog_json_.empty()) return false;
+        out = iter->second->catalog_json_;
+        return true;
     }
 
     int MediaStreamManager::WriterMediaPacket(Media_Packet_Ptr pkt_ptr) {

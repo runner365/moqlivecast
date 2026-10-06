@@ -24,6 +24,12 @@ static QuicCipherSuite g_suite = QUIC_CIPHER_AES_128_GCM;
 /* 各 suite 的 AEAD key 长度 */
 static const int g_key_len[3] = {16, 32, 32};
 
+/* 各 suite 的 **hash 长度** —— 与上面的 AEAD key 长度**不是一回事**。
+ * TLS 流量密钥的长度等于 hash 长度：AES-256-GCM 用 SHA-384 → 48 字节。
+ * 密钥更新的 IKM 长度必须用这个值，用 g_key_len 会让 AES-256 连接的
+ * 下一代密钥永远对不上对端（RFC 9001 §6）。 */
+static const int g_hash_len[3] = {32, 48, 32};
+
 static const char *get_digest_name(int suite_idx) {
     switch (suite_idx) {
     case 0:  return "SHA-256";   /* AES-128-GCM */
@@ -75,6 +81,11 @@ void quic_crypto_set_cipher_suite_from_ssl(void *ssl_ptr) {
 
 QuicCipherSuite quic_crypto_get_suite(void) {
     return g_suite;
+}
+
+int quic_crypto_hash_len(int suite) {
+    if (suite < 0 || suite > 2) return g_hash_len[0];
+    return g_hash_len[suite];
 }
 
 /* ============================================
@@ -285,28 +296,42 @@ int quic_crypto_derive_from_secret(QuicCipherKeys *keys,
  * Key Update (RFC 9001 §6)
  * ============================================ */
 
+/* ⚠️ 当前**无调用者**（线上只用下面的 _aead 版本）。若要启用：这里传下去
+ * 的 derive_quic_keys 内部读的是全局 g_suite，会把 keys->suite 覆盖掉 ——
+ * 并发连接下那条路径也要一并改成按 keys->suite 推导。 */
 int quic_crypto_derive_key_update(QuicCipherKeys *keys,
                                    const uint8_t *current_secret, size_t secret_len,
                                    uint8_t *new_secret_out, size_t new_secret_cap) {
-    if (new_secret_cap < 32) return -1;
+    /* suite 取自 keys —— 不能读全局 g_suite：并发的另一条连接（浏览器
+     * AES-128 与 moq-cli AES-256 可能同时在）会把它改掉。 */
+    const int suite = keys->suite;
+    const int hlen  = quic_crypto_hash_len(suite);
 
-    /* updated_secret = HKDF-Expand-Label(current_secret, "quic ku", "", 32) */
-    uint8_t updated_secret[32];
-    if (hkdf_expand_label_digest(get_digest_name(keys->suite),
+    if (new_secret_cap < (size_t)hlen) return -1;
+    if (secret_len != (size_t)hlen) {
+        LOG_WARN("[quic-crypto] key update: secret_len=%zu != hash_len=%d"
+                 " (suite=%d), derivation will not match the peer",
+                 secret_len, hlen, suite);
+    }
+
+    /* updated_secret = HKDF-Expand-Label(current_secret, "quic ku", "", Hash.length) */
+    uint8_t updated_secret[QUIC_SECRET_MAX_LEN];
+    if (hkdf_expand_label_digest(get_digest_name(suite),
                                   current_secret, secret_len, "quic ku",
-                                  NULL, 0, updated_secret, 32) < 0) {
+                                  NULL, 0, updated_secret, hlen) < 0) {
         LOG_ERROR("[quic-crypto] key update HKDF-Expand-Label failed");
         return -1;
     }
 
-    memcpy(new_secret_out, updated_secret, 32);
+    memcpy(new_secret_out, updated_secret, hlen);
 
-    if (derive_quic_keys(keys, updated_secret, 32) < 0) {
+    if (derive_quic_keys(keys, updated_secret, hlen) < 0) {
         LOG_ERROR("[quic-crypto] key update derive_quic_keys failed");
         return -1;
     }
 
-    LOG_DEBUG("[quic-crypto] key update: derived next-generation keys");
+    LOG_DEBUG("[quic-crypto] key update: derived next-generation keys"
+              " (suite=%d secret=%d bytes)", suite, hlen);
     return 0;
 }
 
@@ -320,33 +345,44 @@ int quic_crypto_derive_key_update(QuicCipherKeys *keys,
 int quic_crypto_derive_key_update_aead(QuicCipherKeys *keys,
                                         const uint8_t *current_secret, size_t secret_len,
                                         uint8_t *new_secret_out, size_t new_secret_cap) {
-    if (new_secret_cap < 32) return -1;
+    /* suite 取自 keys —— 见 quic_crypto_derive_key_update 里的说明。
+     * 原来这里读 g_suite，并在结束时把 keys->suite 覆盖成它：并发连接下
+     * 另一条连接的握手会把本连接的 key 长度一起带偏。 */
+    const int suite = keys->suite;
+    const int hlen  = quic_crypto_hash_len(suite);
 
-    uint8_t updated_secret[32];
-    if (hkdf_expand_label_digest(get_digest_name(keys->suite),
+    if (new_secret_cap < (size_t)hlen) return -1;
+    if (secret_len != (size_t)hlen) {
+        LOG_WARN("[quic-crypto] key update aead: secret_len=%zu != hash_len=%d"
+                 " (suite=%d), derivation will not match the peer",
+                 secret_len, hlen, suite);
+    }
+
+    uint8_t updated_secret[QUIC_SECRET_MAX_LEN];
+    if (hkdf_expand_label_digest(get_digest_name(suite),
                                   current_secret, secret_len, "quic ku",
-                                  NULL, 0, updated_secret, 32) < 0) {
+                                  NULL, 0, updated_secret, hlen) < 0) {
         LOG_ERROR("[quic-crypto] key update aead HKDF-Expand-Label failed");
         return -1;
     }
 
-    memcpy(new_secret_out, updated_secret, 32);
+    memcpy(new_secret_out, updated_secret, hlen);
 
     /* 只推导 quic key 和 quic iv，保留原有 hp_key */
-    int klen = g_key_len[g_suite];
+    int klen = g_key_len[suite];
     keys->key_len = klen;
-    keys->suite   = g_suite;
-    uint8_t ok = (uint8_t)(hkdf_expand_label_digest(get_digest_name(keys->suite),
-                                                      updated_secret, 32,
+    uint8_t ok = (uint8_t)(hkdf_expand_label_digest(get_digest_name(suite),
+                                                      updated_secret, hlen,
                                                       "quic key",
                                                       NULL, 0,
                                                       keys->key, klen) == 0);
-    ok &= (uint8_t)(hkdf_expand_label_digest(get_digest_name(keys->suite),
-                                             updated_secret, 32, "quic iv",
+    ok &= (uint8_t)(hkdf_expand_label_digest(get_digest_name(suite),
+                                             updated_secret, hlen, "quic iv",
                                              NULL, 0, keys->iv, 12) == 0);
     keys->initialized = ok ? 1 : 0;
 
-    LOG_DEBUG("[quic-crypto] key update aead: %d-byte keys (hp unchanged)", klen);
+    LOG_DEBUG("[quic-crypto] key update aead: %d-byte keys secret=%d bytes"
+              " (hp unchanged)", klen, hlen);
     return ok ? 0 : -1;
 }
 

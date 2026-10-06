@@ -54,16 +54,50 @@ static void ConfigFail(const char *msg) {
     LOG_ERROR("%s", msg);
 }
 
-static bool LoadSubPathList(const YAML::Node &node,
+/* ALPN 候选表。缺省保持历史行为：h3（浏览器 WebTransport）+ quic-echo（测试）。
+ * 加 "moq-lite-06" 就同时在这个 UDP 端口上开放裸 QUIC 的 moq-lite。 */
+static bool LoadAlpnList(const YAML::Node &node,
+                         std::vector<std::string> &out) {
+    if (!node || !node.IsSequence() || node.size() == 0) {
+        LOG_ERROR("[config] alpn must be a non-empty list");
+        return false;
+    }
+    out.clear();
+    for (const auto &item : node) {
+        std::string name = TrimCopy(item.as<std::string>());
+        if (name.empty()) {
+            LOG_ERROR("[config] alpn item is empty");
+            return false;
+        }
+        if (name.size() > 255) {
+            LOG_ERROR("[config] alpn item too long: %s", name.c_str());
+            return false;
+        }
+        /* 重复项没有意义（选择器取第一个命中），还说明配置写错了 —— 直接报错，
+         * 别让它在握手时变成一个看不懂的现象 */
+        for (const auto &seen : out) {
+            if (seen == name) {
+                LOG_ERROR("[config] duplicate alpn entry: %s", name.c_str());
+                return false;
+            }
+        }
+        out.push_back(std::move(name));
+    }
+    return true;
+}
+
+/* key 只用来写日志：subpath 与 moq_lite_subpath 的校验规则一样，报错时要能
+ * 看出是哪一项写坏了。 */
+static bool LoadSubPathList(const char *key, const YAML::Node &node,
                             std::vector<SubPathItem> &out) {
     if (!node || !node.IsSequence() || node.size() == 0) {
-        LOG_ERROR("[config] subpath must be a non-empty list");
+        LOG_ERROR("[config] %s must be a non-empty list", key);
         return false;
     }
     out.clear();
     for (const auto &item : node) {
         if (!item || !item.IsMap() || !item["path"]) {
-            LOG_ERROR("[config] subpath item needs path");
+            LOG_ERROR("[config] %s item needs path", key);
             return false;
         }
         SubPathItem sp;
@@ -72,7 +106,7 @@ static bool LoadSubPathList(const YAML::Node &node,
             sp.desc = item["desc"].as<std::string>();
         }
         if (sp.path.empty() || sp.path == "/") {
-            LOG_ERROR("[config] invalid subpath path");
+            LOG_ERROR("[config] invalid %s path", key);
             return false;
         }
         out.push_back(std::move(sp));
@@ -111,9 +145,35 @@ bool Config::Load(const std::string &filename) {
             port_ = srv["port"].as<int>();
         }
         if (srv["subpath"]) {
-            if (!LoadSubPathList(srv["subpath"], sub_paths_)) {
+            if (!LoadSubPathList("subpath", srv["subpath"], sub_paths_)) {
                 return false;
             }
+        }
+        /* moq-lite 的路由表。缺省 "anon" 的理由：
+         *  1) moq-cli / libmoq 生态的匿名入口约定就是 /anon
+         *     （目标命令 `moql://<host>:4433/anon` 零改动可跑）；
+         *  2) 这是**新增**的一项，缺省值不会改变任何既有部署的行为 ——
+         *     只有 alpn 表里写了 moq-lite-* 才会走到这里。
+         * 想彻底关掉 moq-lite 就把 alpn 里的 moq-lite-06 去掉；写了这一项
+         * 但给空列表是配置错误（同 subpath），不给"空表"这个中间态。 */
+        if (srv["moq_lite_subpath"]) {
+            if (!LoadSubPathList("moq_lite_subpath", srv["moq_lite_subpath"],
+                                 moq_lite_sub_paths_)) {
+                return false;
+            }
+        } else {
+            SubPathItem sp;
+            sp.desc = "moq-lite anonymous entry";
+            sp.path = "/anon";
+            moq_lite_sub_paths_.push_back(std::move(sp));
+        }
+        /* alpn 缺省 = 历史默认值，保证不写这项时行为完全不变 */
+        if (srv["alpn"]) {
+            if (!LoadAlpnList(srv["alpn"], alpn_list_)) {
+                return false;
+            }
+        } else {
+            alpn_list_ = { "h3", "quic-echo" };
         }
         cert_file_ = YamlStringOrEmpty(srv["certfile"]);
         key_file_ = YamlStringOrEmpty(srv["keyfile"]);

@@ -1,4 +1,4 @@
-import { concatBytes, encodeU16, encodeUtf8, encodeVarint } from './varint'
+import { concatBytes, encodeU16, encodeUtf8, encodeVi64 } from './varint'
 
 /** draft-ietf-moq-transport */
 export const MOQT_SETUP = 0x2f00
@@ -28,13 +28,13 @@ function encodeKvp(prevType: number, type: number, value: Uint8Array | number): 
   type: number
 } {
   const delta = type - prevType
-  const head = encodeVarint(delta)
+  const head = encodeVi64(delta)
   if ((type & 1) === 0) {
-    const v = typeof value === 'number' ? encodeVarint(value) : encodeVarint(0)
+    const v = typeof value === 'number' ? encodeVi64(value) : encodeVi64(0)
     return { bytes: concatBytes([head, v]), type }
   }
-  const raw = typeof value === 'number' ? encodeVarint(value) : value
-  return { bytes: concatBytes([head, encodeVarint(raw.byteLength), raw]), type }
+  const raw = typeof value === 'number' ? encodeVi64(value) : value
+  return { bytes: concatBytes([head, encodeVi64(raw.byteLength), raw]), type }
 }
 
 export function encodeProperties(items: Array<{ type: number; value: Uint8Array | number }>): Uint8Array {
@@ -47,15 +47,15 @@ export function encodeProperties(items: Array<{ type: number; value: Uint8Array 
     prev = k.type
   }
   const body = concatBytes(parts)
-  return concatBytes([encodeVarint(body.byteLength), body])
+  return concatBytes([encodeVi64(body.byteLength), body])
 }
 
 export function encodeSetup(): Uint8Array {
-  return concatBytes([encodeVarint(MOQT_SETUP), encodeU16(0)])
+  return concatBytes([encodeVi64(MOQT_SETUP), encodeU16(0)])
 }
 
 export function encodeNamespace(fields: string[]): Uint8Array {
-  const parts: Uint8Array[] = [encodeVarint(fields.length)]
+  const parts: Uint8Array[] = [encodeVi64(fields.length)]
   for (const f of fields) parts.push(encodeUtf8(f))
   return concatBytes(parts)
 }
@@ -69,15 +69,15 @@ export function encodePublish(opts: {
 }): Uint8Array {
   const name = new TextEncoder().encode(opts.trackName)
   const body = concatBytes([
-    encodeVarint(opts.requestId),
+    encodeVi64(opts.requestId),
     encodeNamespace([opts.app, opts.stream]),
-    encodeVarint(name.byteLength),
+    encodeVi64(name.byteLength),
     name,
-    encodeVarint(opts.alias),
-    encodeVarint(0),
-    encodeVarint(0),
+    encodeVi64(opts.alias),
+    encodeVi64(0),
+    encodeVi64(0),
   ])
-  return concatBytes([encodeVarint(MOQT_PUBLISH), encodeU16(body.byteLength), body])
+  return concatBytes([encodeVi64(MOQT_PUBLISH), encodeU16(body.byteLength), body])
 }
 
 /** 与 PUBLISH 同布局：req + ns[app,stream] + name + alias */
@@ -90,20 +90,20 @@ export function encodeSubscribe(opts: {
 }): Uint8Array {
   const name = new TextEncoder().encode(opts.trackName)
   const body = concatBytes([
-    encodeVarint(opts.requestId),
+    encodeVi64(opts.requestId),
     encodeNamespace([opts.app, opts.stream]),
-    encodeVarint(name.byteLength),
+    encodeVi64(name.byteLength),
     name,
-    encodeVarint(opts.alias),
+    encodeVi64(opts.alias),
   ])
-  return concatBytes([encodeVarint(MOQT_SUBSCRIBE), encodeU16(body.byteLength), body])
+  return concatBytes([encodeVi64(MOQT_SUBSCRIBE), encodeU16(body.byteLength), body])
 }
 
 export function encodeSubgroupHeader(alias: number, groupId: number): Uint8Array {
   return concatBytes([
-    encodeVarint(SUBGROUP_FLAGS),
-    encodeVarint(alias),
-    encodeVarint(groupId),
+    encodeVi64(SUBGROUP_FLAGS),
+    encodeVi64(alias),
+    encodeVi64(groupId),
   ])
 }
 
@@ -129,9 +129,9 @@ export function encodeObject(opts: {
     props.push({ type: LOC_AUDIO_CONFIG, value: opts.audioConfig })
   }
   return concatBytes([
-    encodeVarint(opts.objectIdDelta),
+    encodeVi64(opts.objectIdDelta),
     encodeProperties(props),
-    encodeVarint(opts.payload.byteLength),
+    encodeVi64(opts.payload.byteLength),
     opts.payload,
   ])
 }

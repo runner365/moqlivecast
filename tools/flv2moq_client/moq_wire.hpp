@@ -53,14 +53,20 @@ constexpr uint64_t kSubgroupFlags = 0x31;
 
 using Bytes = std::vector<uint8_t>;
 
-/* ── varint（QUIC 可变长整数，与服务端 MoqReadVarint 对应）── */
-void AppendVarint(Bytes &out, uint64_t v);
+/* ── vi64（MOQT 的整数编码，与服务端 MoqAppendVi64 对应）──
+ * 【2026-09-25 起线上用这套】，此前是 QUIC 变长整数（RFC 9000 §16）。
+ * 两套只有 0~63 一致，所以服务端、本客户端、Web 端必须同时切换 ——
+ * 依据见 docs/moq-transport-gap.md 的 G1。
+ *
+ * 这里只有编码侧 —— 本客户端是纯发布端，不解 MOQT 消息。 */
+void AppendVi64(Bytes &out, uint64_t v);
+
 void AppendU16(Bytes &out, uint16_t v);
 void AppendBytes(Bytes &out, const uint8_t *p, size_t n);
 void AppendBytes(Bytes &out, const Bytes &b);
 
 /* ── LOC 属性表 ──
- * even 类型（低 bit = 0）值是 varint 数字；odd 类型值是字节串。
+ * even 类型（低 bit = 0）值是 vi64 数字；odd 类型值是字节串。
  * 编码时按 type 升序列出，每个条目的 type 用「相对前一个的 delta」表示。 */
 struct LocProps {
     uint64_t timestamp_ms = 0;        /* 解码时间戳 DTS */

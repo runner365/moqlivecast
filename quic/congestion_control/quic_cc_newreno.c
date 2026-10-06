@@ -77,7 +77,7 @@ static void nr_on_persistent_congestion(struct quic_cc *cc, uint64_t now_ms) {
     nr->ssthresh_ = 2 * QUIC_MIN_PKT_SIZE;
     nr->bytes_acked_ca_ = 0;
 
-    LOG_DEBUG("[cc-newreno] persistent congestion: cwnd reset to %llu",
+    LOG_INFO("[cc-newreno] persistent congestion: cwnd reset to %llu",
              (unsigned long long)nr->cwnd_);
 }
 

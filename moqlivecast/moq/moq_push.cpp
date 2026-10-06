@@ -67,20 +67,23 @@ const char *ClassifyFirstType(uint64_t type, const uint8_t *p, size_t len) {
     if (type == 8) return "FLV audio tag type=8";
     if (type == 9) return "FLV video tag type=9";
     if (type == 18) return "FLV script tag type=18";
-    if (type == 1612) return "2-byte varint of 'FL' (FLV header)";
+    /* 换 vi64 前这里是 1612（"FL" 两字节按 QUIC 变长整数读出来的值）。
+     * vi64 下 0x46 前导 1 的个数为 0，是【单字节】，值就是 'F' = 70。
+     * 真正的 FLV 客户端由上面 p[0..2]=="FLV" 那条先拦下，这里只作补充线索。 */
+    if (type == 70) return "vi64 单字节 'F' (FLV header?)";
     if ((type & 0x10) != 0) return "SUBGROUP/data flags";
     return "unknown";
 }
 
 void AppendKvp(std::vector<uint8_t> &o, uint64_t &prev, uint64_t type,
                const uint8_t *raw, size_t raw_len, uint64_t num) {
-    MoqAppendVarint(o, type - prev);
+    MoqAppendVi64(o, type - prev);
     prev = type;
     if ((type & 1) == 0) {
-        MoqAppendVarint(o, num);
+        MoqAppendVi64(o, num);
         return;
     }
-    MoqAppendVarint(o, raw_len);
+    MoqAppendVi64(o, raw_len);
     MoqAppendBytes(o, raw, raw_len);
 }
 
@@ -105,14 +108,14 @@ std::vector<uint8_t> EncodeProperties(
         else AppendKvp(body, prev, it.type, nullptr, 0, it.num);
     }
     std::vector<uint8_t> out;
-    MoqAppendVarint(out, body.size());
+    MoqAppendVi64(out, body.size());
     MoqAppendBytes(out, body.data(), body.size());
     return out;
 }
 
 std::vector<uint8_t> EncodeControl(uint64_t type, const std::vector<uint8_t> &body) {
     std::vector<uint8_t> out;
-    MoqAppendVarint(out, type);
+    MoqAppendVi64(out, type);
     MoqAppendU16(out, static_cast<uint16_t>(body.size()));
     MoqAppendBytes(out, body.data(), body.size());
     return out;
@@ -120,9 +123,9 @@ std::vector<uint8_t> EncodeControl(uint64_t type, const std::vector<uint8_t> &bo
 
 std::vector<uint8_t> EncodeSubgroup(uint64_t alias, uint64_t group) {
     std::vector<uint8_t> out;
-    MoqAppendVarint(out, 0x31);
-    MoqAppendVarint(out, alias);
-    MoqAppendVarint(out, group);
+    MoqAppendVi64(out, 0x31);
+    MoqAppendVi64(out, alias);
+    MoqAppendVi64(out, group);
     return out;
 }
 
@@ -146,12 +149,12 @@ std::vector<uint8_t> EncodeLocObject(uint64_t delta, int64_t ts_ms,
                        std::vector<uint8_t>(cfg, cfg + cfg_len)});
     }
     std::vector<uint8_t> out;
-    MoqAppendVarint(out, delta);
+    MoqAppendVi64(out, delta);
     const auto props = EncodeProperties(odd, even);
     MoqAppendBytes(out, props.data(), props.size());
     const size_t plen = payload && payload_len ? payload_len : 1;
     const uint8_t dummy = 0;
-    MoqAppendVarint(out, plen);
+    MoqAppendVi64(out, plen);
     if (payload && payload_len) MoqAppendBytes(out, payload, payload_len);
     else out.push_back(dummy);
     return out;
@@ -174,6 +177,7 @@ void MoqRfcHandler::OnSession(WTServerSession &sess, const std::string &path) {
         sessions_.erase(old);
     }
     sessions_[sess.SessionId()] = std::make_unique<MoqPushSession>();
+    sessions_[sess.SessionId()]->SetSession(sess);
 }
 
 void MoqRfcHandler::OnStreamData(WTServerSession &sess, WTServerStream &st,
@@ -183,6 +187,7 @@ void MoqRfcHandler::OnStreamData(WTServerSession &sess, WTServerStream &st,
     if (it == sessions_.end()) {
         sessions_[sess.SessionId()] = std::make_unique<MoqPushSession>();
         it = sessions_.find(sess.SessionId());
+        it->second->SetSession(sess);
     }
     it->second->OnData(sess, st, data, len);
 }
@@ -197,8 +202,11 @@ void MoqRfcHandler::OnSessionClose(WTServerSession &sess, const std::string &pat
         if (it->second->IsPublisher()) ev = "moq_push";
         else if (it->second->IsSubscriber()) ev = "moq_pull";
         if (it->second->IsPublisher() && it->second->HasMedia()) {
-            MediaStreamManager::RemovePublisher(
-                it->second->App() + "/" + it->second->Stream());
+            /* 被顶掉的旧 publisher 关闭时也会走到这里，但它已经不是 owner，
+             * 不能清掉新 publisher 刚建立的 cache（见 ReleasePublisher）。 */
+            MediaStreamManager::ReleasePublisher(
+                it->second->App() + "/" + it->second->Stream(),
+                it->second->SessionId());
         }
         it->second->Close();
         sessions_.erase(it);
@@ -226,6 +234,37 @@ void MoqRfcHandler::RemoveSubscriber(WTServerSession &sess) {
     if (it == sessions_.end() || !it->second) return;
     it->second->DetachPlayer();
     LOG_INFO("[moq-rfc] subscribe del id=%s", sess.SessionId().c_str());
+}
+
+bool MoqRfcHandler::KickPublisherSession(const std::string &session_id,
+                                         const std::string &stream_key) {
+    if (session_id.empty()) return false;
+    auto it = sessions_.find(session_id);
+    if (it == sessions_.end() || !it->second) {
+        /* 旧会话可能已经自己断了，只剩流记录里的 owner 没清。 */
+        LOG_WARN("[moq-rfc] kick publisher: session %s not found for %s",
+                 session_id.c_str(), stream_key.c_str());
+        return false;
+    }
+    WTServerSession *sess = it->second->Session();
+    if (!sess) {
+        LOG_WARN("[moq-rfc] kick publisher: session %s has no wt session for %s",
+                 session_id.c_str(), stream_key.c_str());
+        return false;
+    }
+    LOG_WARN("[moq-rfc] kick publisher: close old session %s stream=%s",
+             session_id.c_str(), stream_key.c_str());
+    /* 只断连，不发错误码：PUBLISH_DONE / REQUEST_ERROR 还没有实现
+     * （docs/moq-transport-gap.md G6）。Close 之后本端立刻停止收对象，
+     * 对端的 OnSessionClose 会在 QUIC 关闭定时器到期后到达。 */
+    it->second->Close();
+    sess->Close();
+    return true;
+}
+
+bool MoqPushSession::IsPublisherOwner() const {
+    if (app_.empty() || stream_.empty() || session_id_.empty()) return true;
+    return MediaStreamManager::IsPublisherOwner(app_ + "/" + stream_, session_id_);
 }
 
 void MoqPushSession::Close() {
@@ -339,7 +378,7 @@ void MoqPushSession::Pump(WTServerSession &sess, WTServerStream &st,
             if (ss.buf.empty()) return;
             size_t off = 0;
             uint64_t type = 0;
-            if (!MoqReadVarint(ss.buf.data(), ss.buf.size(), off, type)) return;
+            if (!MoqReadVi64(ss.buf.data(), ss.buf.size(), off, type)) return;
             LogFirstBytes(ss.buf.data(), ss.buf.size());
             const char *cls = ClassifyFirstType(type, ss.buf.data(), ss.buf.size());
             /* 控制流（单向）：只有 SETUP / GOAWAY。
@@ -368,7 +407,9 @@ void MoqPushSession::Pump(WTServerSession &sess, WTServerStream &st,
         }
         bool ok = false;
         if (ss.kind == StreamState::CONTROL || ss.kind == StreamState::REQUEST) {
-            /* 两类流都用同一套「varint type + u16 len + body」解析 */
+            /* 两类流都用同一套「vi64 type + u16 len + body」解析。
+             * type 是 vi64；u16 len 是本实现自定的（草案是 vi64 length），
+             * 见 moq_varint.hpp 末尾说明，属 G6/G10 范围，不随 G1 改动。 */
             ok = ParseControl(sess, st, ss);
         } else if (!ss.header_done) {
             ok = ParseSubgroupHeader(ss);
@@ -384,23 +425,52 @@ bool MoqPushSession::ParseControl(WTServerSession &sess, WTServerStream &st,
     size_t off = 0;
     uint64_t type = 0;
     uint16_t length = 0;
-    if (!MoqReadVarint(ss.buf.data(), ss.buf.size(), off, type)) return false;
+    if (!MoqReadVi64(ss.buf.data(), ss.buf.size(), off, type)) return false;
     if (!MoqReadU16(ss.buf.data(), ss.buf.size(), off, length)) return false;
     if (off + length > ss.buf.size()) return false;
     const uint8_t *body = ss.buf.data() + off;
     if (type == kMoqtPublish) {
         LOG_INFO("[moq-rfc] RX PUBLISH body=%uB", (unsigned)length);
         if (ParsePublish(body, length)) {
-            const bool first = !publisher_;
-            publisher_ = true;
-            sess.SetPublish(app_, stream_);
-            if (first) {
-                MetaLog::Instance().Event("moq_push", "opensession",
-                                          app_, stream_, sess.ExtraParams());
-                sess.StartMetaStats("moq_push_stats", "stream_push");
+            /* 认领这条流：同名流的旧 publisher 会被顶掉（一个 Full Track Name
+             * 同时只能有一个源，见 draft-ietf-moq-transport §2.4.3）。 */
+            const std::string key = app_ + "/" + stream_;
+            const PublishClaimResult claim =
+                MediaStreamManager::ClaimPublisher(key, session_id_);
+            bool claimed = true;
+            if (claim.action == PublishClaim::kTakeOver) {
+                LOG_WARN("[moq-rfc] PUBLISH take over app=%s stream=%s old=%s new=%s",
+                         app_.c_str(), stream_.c_str(),
+                         claim.previous_owner.c_str(), session_id_.c_str());
+                MoqRfcHandler::KickPublisherSession(claim.previous_owner, key);
+            } else if (claim.action == PublishClaim::kRejected) {
+                /* 顶替太频繁（可能是两端撞名互踢），保留在位的 publisher，
+                 * 断开新来的这个。断开是延迟的，不影响下面的 buf.erase。 */
+                LOG_WARN("[moq-rfc] PUBLISH rejected app=%s stream=%s keep=%s new=%s",
+                         app_.c_str(), stream_.c_str(),
+                         claim.previous_owner.c_str(), session_id_.c_str());
+                claimed = false;
+                sess.Close();
+            } else if (claim.action == PublishClaim::kReused) {
+                LOG_INFO("[moq-rfc] PUBLISH reused app=%s stream=%s owner=%s",
+                         app_.c_str(), stream_.c_str(), session_id_.c_str());
+            } else {
+                // create new publisher
+                LOG_INFO("[moq-rfc] PUBLISH create new app=%s stream=%s owner=%s",
+                         app_.c_str(), stream_.c_str(), session_id_.c_str());
             }
-            LOG_INFO("[moq-rfc] PUBLISH ok app=%s stream=%s",
-                     app_.c_str(), stream_.c_str());
+            if (claimed) {
+                const bool first = !publisher_;
+                publisher_ = true;
+                sess.SetPublish(app_, stream_);
+                if (first) {
+                    MetaLog::Instance().Event("moq_push", "opensession",
+                                              app_, stream_, sess.ExtraParams());
+                    sess.StartMetaStats("moq_push_stats", "stream_push");
+                }
+            }
+            /* 没被接受时不发 PUBLISH_OK，也不置 publisher_：本会话已经进入
+             * 关闭流程，媒体路径不会再收它的对象。 */
         } else {
             LOG_WARN("[moq-rfc] PUBLISH parse failed body=%uB", (unsigned)length);
         }
@@ -448,14 +518,14 @@ bool MoqPushSession::ParsePublish(const uint8_t *body, size_t len) {
     size_t off = 0;
     uint64_t request_id = 0;
     uint64_t ns_n = 0;
-    if (!MoqReadVarint(body, len, off, request_id)) return false;
-    if (!MoqReadVarint(body, len, off, ns_n)) return false;
+    if (!MoqReadVi64(body, len, off, request_id)) return false;
+    if (!MoqReadVi64(body, len, off, ns_n)) return false;
     std::string app;
     std::string stream;
     for (uint64_t i = 0; i < ns_n; i++) {
         uint64_t flen = 0;
         const uint8_t *f = nullptr;
-        if (!MoqReadVarint(body, len, off, flen)) return false;
+        if (!MoqReadVi64(body, len, off, flen)) return false;
         if (!ReadBytes(body, len, off, static_cast<size_t>(flen), &f)) return false;
         std::string field(reinterpret_cast<const char *>(f), static_cast<size_t>(flen));
         if (i == 0) app = field;
@@ -465,10 +535,10 @@ bool MoqPushSession::ParsePublish(const uint8_t *body, size_t len) {
     const uint8_t *namep = nullptr;
     uint64_t alias = 0;
     uint64_t nparam = 0;
-    if (!MoqReadVarint(body, len, off, nlen)) return false;
+    if (!MoqReadVi64(body, len, off, nlen)) return false;
     if (!ReadBytes(body, len, off, static_cast<size_t>(nlen), &namep)) return false;
-    if (!MoqReadVarint(body, len, off, alias)) return false;
-    if (!MoqReadVarint(body, len, off, nparam)) return false;
+    if (!MoqReadVi64(body, len, off, alias)) return false;
+    if (!MoqReadVi64(body, len, off, nparam)) return false;
     if (nparam != 0) {
         LOG_WARN("[moq-rfc] PUBLISH params=%llu not skipped fully",
                  (unsigned long long)nparam);
@@ -487,14 +557,14 @@ bool MoqPushSession::ParseSubscribe(const uint8_t *body, size_t len,
                                     std::string &name) {
     size_t off = 0;
     uint64_t ns_n = 0;
-    if (!MoqReadVarint(body, len, off, request_id)) return false;
-    if (!MoqReadVarint(body, len, off, ns_n)) return false;
+    if (!MoqReadVi64(body, len, off, request_id)) return false;
+    if (!MoqReadVi64(body, len, off, ns_n)) return false;
     std::string app;
     std::string stream;
     for (uint64_t i = 0; i < ns_n; i++) {
         uint64_t flen = 0;
         const uint8_t *f = nullptr;
-        if (!MoqReadVarint(body, len, off, flen)) return false;
+        if (!MoqReadVi64(body, len, off, flen)) return false;
         if (!ReadBytes(body, len, off, static_cast<size_t>(flen), &f)) return false;
         std::string field(reinterpret_cast<const char *>(f), static_cast<size_t>(flen));
         if (i == 0) app = field;
@@ -502,11 +572,11 @@ bool MoqPushSession::ParseSubscribe(const uint8_t *body, size_t len,
     }
     uint64_t nlen = 0;
     const uint8_t *namep = nullptr;
-    if (!MoqReadVarint(body, len, off, nlen)) return false;
+    if (!MoqReadVi64(body, len, off, nlen)) return false;
     if (!ReadBytes(body, len, off, static_cast<size_t>(nlen), &namep)) return false;
     name.assign(reinterpret_cast<const char *>(namep), static_cast<size_t>(nlen));
     alias = 0;
-    if (off < len) MoqReadVarint(body, len, off, alias);
+    if (off < len) MoqReadVi64(body, len, off, alias);
     if (alias == 0) {
         if (name == "video") alias = kAliasVideo;
         else if (name == "audio") alias = kAliasAudio;
@@ -522,9 +592,9 @@ bool MoqPushSession::ParseSubscribe(const uint8_t *body, size_t len,
 void MoqPushSession::SendSubscribeOk(WTServerStream &st, uint64_t request_id,
                                      uint64_t alias) {
     std::vector<uint8_t> body;
-    MoqAppendVarint(body, request_id);
-    MoqAppendVarint(body, alias);
-    MoqAppendVarint(body, 0); /* expires */
+    MoqAppendVi64(body, request_id);
+    MoqAppendVi64(body, alias);
+    MoqAppendVi64(body, 0); /* expires */
     const auto msg = EncodeControl(kMoqtSubscribeOk, body);
     st.Write(msg.data(), msg.size());
     LOG_INFO("[moq-rfc] TX SUBSCRIBE_OK req=%llu alias=%llu %zuB",
@@ -858,13 +928,13 @@ bool MoqPushSession::ParseSubgroupHeader(StreamState &ss) {
     uint64_t flags = 0;
     uint64_t alias = 0;
     uint64_t group = 0;
-    if (!MoqReadVarint(ss.buf.data(), ss.buf.size(), off, flags)) return false;
-    if (!MoqReadVarint(ss.buf.data(), ss.buf.size(), off, alias)) return false;
-    if (!MoqReadVarint(ss.buf.data(), ss.buf.size(), off, group)) return false;
+    if (!MoqReadVi64(ss.buf.data(), ss.buf.size(), off, flags)) return false;
+    if (!MoqReadVi64(ss.buf.data(), ss.buf.size(), off, alias)) return false;
+    if (!MoqReadVi64(ss.buf.data(), ss.buf.size(), off, group)) return false;
     const uint64_t id_mode = (flags >> 1) & 0x03;
     if (id_mode == 0x02) {
         uint64_t sg = 0;
-        if (!MoqReadVarint(ss.buf.data(), ss.buf.size(), off, sg)) return false;
+        if (!MoqReadVi64(ss.buf.data(), ss.buf.size(), off, sg)) return false;
     }
     if ((flags & 0x20) == 0) {
         if (off >= ss.buf.size()) return false;
@@ -883,7 +953,7 @@ bool MoqPushSession::ParseSubgroupHeader(StreamState &ss) {
 bool MoqPushSession::ParseObject(StreamState &ss) {
     size_t off = 0;
     uint64_t delta = 0;
-    if (!MoqReadVarint(ss.buf.data(), ss.buf.size(), off, delta)) return false;
+    if (!MoqReadVi64(ss.buf.data(), ss.buf.size(), off, delta)) return false;
 
     int64_t ts_ms = 0;
     /* pts - dts。缺省 0（等价于 pts == dts，即无 B 帧的流）。
@@ -896,25 +966,25 @@ bool MoqPushSession::ParseObject(StreamState &ss) {
 
     if (ss.has_props) {
         uint64_t plen = 0;
-        if (!MoqReadVarint(ss.buf.data(), ss.buf.size(), off, plen)) return false;
+        if (!MoqReadVi64(ss.buf.data(), ss.buf.size(), off, plen)) return false;
         if (off + plen > ss.buf.size()) return false;
         const size_t pend = off + static_cast<size_t>(plen);
         uint64_t prev = 0;
         while (off < pend) {
             uint64_t dlt = 0;
-            if (!MoqReadVarint(ss.buf.data(), ss.buf.size(), off, dlt)) return false;
+            if (!MoqReadVi64(ss.buf.data(), ss.buf.size(), off, dlt)) return false;
             const uint64_t type = prev + dlt;
             prev = type;
             if ((type & 1) == 0) {
                 uint64_t val = 0;
-                if (!MoqReadVarint(ss.buf.data(), ss.buf.size(), off, val)) return false;
+                if (!MoqReadVi64(ss.buf.data(), ss.buf.size(), off, val)) return false;
                 if (type == kLocTimestamp) ts_ms = static_cast<int64_t>(val);
                 if (type == kLocCompositionTime) cts_ms = static_cast<int64_t>(val);
                 (void)kLocTimescale;
             } else {
                 uint64_t vlen = 0;
                 const uint8_t *v = nullptr;
-                if (!MoqReadVarint(ss.buf.data(), ss.buf.size(), off, vlen)) return false;
+                if (!MoqReadVi64(ss.buf.data(), ss.buf.size(), off, vlen)) return false;
                 if (!ReadBytes(ss.buf.data(), ss.buf.size(), off, static_cast<size_t>(vlen), &v)) {
                     return false;
                 }
@@ -931,10 +1001,10 @@ bool MoqPushSession::ParseObject(StreamState &ss) {
     }
 
     uint64_t payload_len = 0;
-    if (!MoqReadVarint(ss.buf.data(), ss.buf.size(), off, payload_len)) return false;
+    if (!MoqReadVi64(ss.buf.data(), ss.buf.size(), off, payload_len)) return false;
     if (payload_len == 0) {
         uint64_t status = 0;
-        if (!MoqReadVarint(ss.buf.data(), ss.buf.size(), off, status)) return false;
+        if (!MoqReadVi64(ss.buf.data(), ss.buf.size(), off, status)) return false;
         ss.buf.erase(ss.buf.begin(), ss.buf.begin() + static_cast<long>(off));
         return true;
     }
@@ -1015,6 +1085,17 @@ void MoqPushSession::EmitFlvVideo(int64_t dts, bool seq, bool key,
     /* pts = dts + cts。NormalizeDts 之后会平移 dts 但保留两者之差，
      * 所以这个偏移能一路活到写 FLV tag 的时候。 */
     pkt->pts_ = dts + cts;
+    if (!IsPublisherOwner()) {
+        /* 本会话已被别的 publisher 顶掉：在途对象丢掉，别把两条时间线
+         * 混进同一条流。丢包日志按秒限流。 */
+        const int64_t now_s = now_millisec() / 1000;
+        if (last_owner_drop_dbg_ts_s_ != now_s) {
+            last_owner_drop_dbg_ts_s_ = now_s;
+            LOG_WARN("[moq-rfc] drop video from superseded publisher app=%s stream=%s owner=%s",
+                     app_.c_str(), stream_.c_str(), session_id_.c_str());
+        }
+        return;
+    }
     MediaStreamManager::WriterMediaPacket(pkt);
     if (cts != 0) {
         LOG_DEBUG("[moq-rfc] flv video %s dts=%lld cts=%lld pts=%lld size=%zu key=%d",
@@ -1043,6 +1124,15 @@ void MoqPushSession::EmitFlvAudio(int64_t dts, bool seq,
     };
     pkt->buffer_ptr_->AppendData(reinterpret_cast<const char *>(hdr), 2);
     pkt->buffer_ptr_->AppendData(reinterpret_cast<const char *>(data), len);
+    if (!IsPublisherOwner()) {
+        const int64_t now_s = now_millisec() / 1000;
+        if (last_owner_drop_dbg_ts_s_ != now_s) {
+            last_owner_drop_dbg_ts_s_ = now_s;
+            LOG_WARN("[moq-rfc] drop audio from superseded publisher app=%s stream=%s owner=%s",
+                     app_.c_str(), stream_.c_str(), session_id_.c_str());
+        }
+        return;
+    }
     MediaStreamManager::WriterMediaPacket(pkt);
     LOG_DEBUG("[moq-rfc] flv audio %s dts=%lld size=%zu",
              seq ? "seq" : "raw", (long long)dts, len);

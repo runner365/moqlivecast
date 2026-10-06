@@ -107,8 +107,15 @@ typedef struct {
     uint64_t     bytes_recvd;
     uint64_t     max_streams_bidi_peer;
     uint64_t     max_streams_uni_peer;
+    /* 我们对对端**声明**的 stream 额度（= 最后一次发出的 MAX_STREAMS 值）。
+     * RFC 9000 §4.6 里 MAX_STREAMS 是**累计**上限：对端每开一条流消耗一格，
+     * 流关掉也**不会自动还回来**，必须由我们主动再发一条把它抬上去。
+     * 不问就不补，对端开满 initial_max_streams_uni 之后就永久卡死。 */
     uint64_t     max_streams_bidi_local;
     uint64_t     max_streams_uni_local;
+    /* 对端累计发起过多少条流。用来判断额度是不是快用完了（见 quic_stream_grant_credit） */
+    uint64_t     peer_bidi_opened;
+    uint64_t     peer_uni_opened;
     /* 对端 TP：initial_max_stream_data_{bidi_local,bidi_remote,uni} */
     uint64_t     peer_init_max_stream_data_bidi_local;
     uint64_t     peer_init_max_stream_data_bidi_remote;
@@ -180,8 +187,11 @@ void quic_stream_on_stop_sending(QuicStreamCtx *ctx, void *conn, uint64_t stream
 void quic_stream_on_data_blocked(QuicStreamCtx *ctx, uint64_t max_data);
 void quic_stream_on_stream_data_blocked(QuicStreamCtx *ctx,
                                          uint64_t stream_id, uint64_t limit);
-void quic_stream_on_streams_blocked(QuicStreamCtx *ctx,
-                                     uint64_t max_streams, int bidi);
+/* 对端说「我的 stream 额度用完了」（STREAMS_BLOCKED）：抬额度并回一条 MAX_STREAMS。
+ * 对端不一定会发这个帧，所以真正的兜底是 quic_stream_on_recv 里那个主动补充。 */
+void quic_stream_on_streams_blocked(QuicStreamCtx *ctx, void *conn,
+                                     uint64_t max_streams, int bidi,
+                                     int (*queue_fn)(void *conn, const uint8_t *frames, size_t flen));
 
 void quic_stream_flush_pending(QuicStreamCtx *ctx, void *conn,
                                 int (*queue_fn)(void *conn, const uint8_t *frames, size_t flen),

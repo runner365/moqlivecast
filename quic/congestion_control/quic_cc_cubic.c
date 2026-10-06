@@ -148,7 +148,7 @@ static void cubic_on_persistent_congestion(struct quic_cc *cc, uint64_t now_ms) 
     c->bytes_acked_ = 0;
     c->in_slow_start_ = 1;
 
-    LOG_DEBUG("[cc-cubic] persistent congestion: cwnd reset to %llu",
+    LOG_INFO("[cc-cubic] persistent congestion: cwnd reset to %llu",
              (unsigned long long)c->cwnd_);
 }
 

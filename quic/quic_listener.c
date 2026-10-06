@@ -29,6 +29,10 @@ struct QuicListener {
     int        bound_;
     int        retry_enabled_;   /* 是否启用 Retry 地址验证 */
 
+    /* 本监听器的 ALPN 候选列表。NULL = 用 tls 层的默认列表（h3 + quic-echo）。
+     * 由 QuicListenerSetAlpn 建，比 ssl_ctx_ 活得久。 */
+    TlsAlpnPref *alpn_pref_;
+
     /* Stateless Reset (RFC 9000 §10.3): 32 字节静态密钥 */
     uint8_t    reset_key_[32];
 
@@ -118,6 +122,7 @@ void QuicListenerDestruct(QuicListener *l) {
         uv_close((uv_handle_t*)&l->udp_, on_udp_close);
     } else {
         tls_ctx_free(l->ssl_ctx_);
+        tls_alpn_pref_free(l->alpn_pref_);
         free(l->conns_);
         free(l);
     }
@@ -133,6 +138,29 @@ void* QuicListenerGetAppData(QuicListener *l) { return l->app_data_; }
 
 void QuicListenerSetRetryEnabled(QuicListener *l, int enabled) {
     l->retry_enabled_ = enabled;
+}
+
+int QuicListenerSetAlpn(QuicListener *l, const char *const *protos, int count) {
+    if (!l || !protos || count <= 0) return -1;
+    if (l->bound_) {
+        /* 握手已经开始过，再换 ALPN 只会让后续连接与既有连接不一致 */
+        LOG_ERROR("[quic-listener] SetAlpn is too late: already listening");
+        return -1;
+    }
+
+    TlsAlpnPref *pref = tls_alpn_pref_new(protos, count);
+    if (!pref) {
+        LOG_ERROR("[quic-listener] build ALPN list failed");
+        return -1;
+    }
+
+    tls_alpn_pref_free(l->alpn_pref_);
+    l->alpn_pref_ = pref;
+    tls_ctx_set_alpn_pref(l->ssl_ctx_, pref);
+
+    LOG_INFO("[quic-listener] ALPN list set: %d protocol(s), preferred=%s",
+             count, protos[0]);
+    return 0;
 }
 
 int QuicListenerListen(QuicListener *l, const char *ip, int port) {
@@ -419,7 +447,9 @@ static void on_udp_recv(uv_udp_t *h, ssize_t nread, const uv_buf_t *buf,
 
 static void on_udp_close(uv_handle_t *h) {
     QuicListener *l = (QuicListener*)h->data;
+    /* ALPN 列表要等 SSL_CTX 先释放 —— 选择回调还挂在 ctx 上 */
     tls_ctx_free(l->ssl_ctx_);
+    tls_alpn_pref_free(l->alpn_pref_);
     free(l->conns_);
     free(l);
 }

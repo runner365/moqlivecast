@@ -59,8 +59,19 @@ int quic_crypto_hp_remove_short(QuicCipherKeys *keys,
  * Key Update (RFC 9001 §6)
  * ============================================ */
 
+/* 各 suite 的 **hash 长度**（= TLS 流量密钥的字节数，SHA-256→32, SHA-384→48）。
+ * ⚠️ 这不是 AEAD key 长度 —— AES-256-GCM 用 SHA-384，是 48 字节 secret
+ * 配 32 字节 key。RFC 9001 §6：
+ *   secret_<n+1> = HKDF-Expand-Label(secret_<n>, "quic ku", "", Hash.length)
+ * 把这两个长度搞混会让密钥更新推出来的密钥永远对不上对端。 */
+#define QUIC_SECRET_MAX_LEN 48
+
+int quic_crypto_hash_len(int suite);
+
 /* 从 current_secret 派生下一代密钥。
- * new_secret_out 输出新的应用流量密钥（调用方保存用于后续更新）。
+ * current_secret 的长度必须等于 quic_crypto_hash_len(keys->suite)。
+ * new_secret_out 输出新的应用流量密钥（调用方保存用于后续更新），
+ * new_secret_cap 至少要 QUIC_SECRET_MAX_LEN，实际写入 hash 长度个字节。
  * 返回 0 成功，<0 失败。 */
 int quic_crypto_derive_key_update(QuicCipherKeys *keys,
                                    const uint8_t *current_secret, size_t secret_len,

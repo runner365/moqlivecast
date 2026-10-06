@@ -22,8 +22,22 @@ public:
     const std::string &ListenIp() const { return listen_ip_; }
     int Port() const { return port_; }
     const std::vector<SubPathItem> &SubPaths() const { return sub_paths_; }
+    /* 裸 QUIC 的 moq-lite 路由表，与上面那张**故意分开**：
+     *   subpath 的 path 是 WebTransport 的 URL 路径（配合 h3）；
+     *   这里的 path 是 moq-lite SETUP 的 Path 参数，也就是发布端的 origin
+     *   （moql://host:4433/anon 里的 anon）。
+     * 合成一张表会让两条线的路径互相污染，而浏览器那条线本轮不动。
+     * 缺省 = {"anon"}，见 config.cpp 里的理由。 */
+    const std::vector<SubPathItem> &MoqLiteSubPaths() const {
+        return moq_lite_sub_paths_;
+    }
     const std::string &CertFile() const { return cert_file_; }
     const std::string &KeyFile() const { return key_file_; }
+    /* 本端口接受的应用协议（ALPN），服务端偏好优先。
+     * 缺省 = {"h3", "quic-echo"}，与加这个配置项之前的行为一致。
+     * 裸 QUIC 的 moq-lite 就是靠在这张表里加 "moq-lite-06" 与 WebTransport
+     * 共用同一个 UDP 端口 —— 包按连接 ID 分，协议在握手时定一次。 */
+    const std::vector<std::string> &AlpnList() const { return alpn_list_; }
 
     const std::string &HttpFlvListenIp() const { return httpflv_listen_ip_; }
     int HttpFlvPort() const { return httpflv_port_; }
@@ -47,8 +61,10 @@ private:
     std::string listen_ip_ = "0.0.0.0";
     int port_ = 4433;
     std::vector<SubPathItem> sub_paths_;
+    std::vector<SubPathItem> moq_lite_sub_paths_;
     std::string cert_file_;
     std::string key_file_;
+    std::vector<std::string> alpn_list_;
 
     std::string httpflv_listen_ip_ = "0.0.0.0";
     int httpflv_port_ = 4433;

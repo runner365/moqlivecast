@@ -26,7 +26,29 @@ struct http3_server_api {
     route_entry  *routes_;
     http3_on_datagram_fn  on_datagram_;
     http3_on_wt_session_fn on_wt_session_;
+    /* 非 h3 的 ALPN 连接（同端口跑别的 QUIC 协议） */
+    http3_on_other_alpn_fn on_other_alpn_;
+    void                  *on_other_alpn_user_;
 };
+
+/* 从 h3 层转上来：直通给注册方 */
+static void api_on_other_alpn(void *user_data, QuicConnection *conn,
+                               const char *alpn,
+                               const char *remote_ip, int remote_port) {
+    http3_server_api *api = (http3_server_api*)user_data;
+    if (!api || !api->on_other_alpn_) return;
+    api->on_other_alpn_(api->on_other_alpn_user_, conn, alpn,
+                         remote_ip, remote_port);
+}
+
+void http3_server_api_set_on_other_alpn(http3_server_api *srv,
+                                         http3_on_other_alpn_fn cb,
+                                         void *user_data) {
+    if (!srv) return;
+    srv->on_other_alpn_      = cb;
+    srv->on_other_alpn_user_ = user_data;
+    http3_server_set_on_other_alpn(srv->h3_, api_on_other_alpn, srv);
+}
 
 /* ============================================
  * 辅助
@@ -364,6 +386,13 @@ static void api_on_dgram(void *user_data, void *conn,
 http3_server_api *http3_server_api_create(
     uv_loop_t *loop, const char *cert_file, const char *key_file,
     const char *ip, int port) {
+    return http3_server_api_create_alpn(loop, cert_file, key_file, ip, port,
+                                        NULL, 0);
+}
+
+http3_server_api *http3_server_api_create_alpn(
+    uv_loop_t *loop, const char *cert_file, const char *key_file,
+    const char *ip, int port, const char *const *alpn, int alpn_count) {
     http3_server_api *api = (http3_server_api*)calloc(1, sizeof(*api));
     if (!api) return NULL;
     api->loop_ = loop;
@@ -372,6 +401,15 @@ http3_server_api *http3_server_api_create(
     if (!api->h3_) { free(api); return NULL; }
     http3_server_set_user_data(api->h3_, api);
     http3_server_set_on_datagram(api->h3_, api_on_dgram);
+
+    /* 必须在 listen 之前 —— ALPN 在握手时协商 */
+    if (alpn && alpn_count > 0) {
+        if (http3_server_set_alpn(api->h3_, alpn, alpn_count) < 0) {
+            http3_server_destroy(api->h3_);
+            free(api);
+            return NULL;
+        }
+    }
 
     int ret = http3_server_listen(api->h3_, ip, port);
     if (ret < 0) { http3_server_destroy(api->h3_); free(api); return NULL; }

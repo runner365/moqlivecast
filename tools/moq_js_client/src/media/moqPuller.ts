@@ -39,11 +39,16 @@ type MediaSample = {
 }
 
 /** 单条轨道的归一化状态：lastRaw 用于跳变检测，lastOut 用于条内单调性。
- *  时间轴原点 base 是**音视频共享**的（见 wcOriginMs），不放这里。 */
+ *  时间轴原点 base 是**音视频共享**的（见 wcOriginMs），不放这里。
+ *
+ *  shiftMs 是**本条轨自己**为吸收向前跳变而累积的偏移。跳变必须记在轨内，
+ *  不能去改共享原点 —— 见 normalizeMediaTs 里那段说明。 */
 /* 时间戳归一化状态 + 连续性观测计数（诊断用） */
 type TsNorm = {
   lastRaw: number
   lastOut: number
+  /** 本条轨因向前跳变累积的偏移（ms），只作用于本条轨 */
+  shiftMs: number
   /* 以下为观测统计，不参与归一化计算 */
   statCount: number      /* 累计帧数 */
   statBack: number       /* rawMs 回退次数 */
@@ -56,6 +61,7 @@ function newTsNorm(): TsNorm {
   return {
     lastRaw: -1,
     lastOut: -1,
+    shiftMs: 0,
     statCount: 0,
     statBack: 0,
     statPinned: 0,
@@ -479,6 +485,13 @@ export class MoqPuller {
    * 服务端已用同一个 pull_ts_base_ 把两条流放在同一时间轴上，减同一个原点即可
    * 保留音画相对偏移。各减各的会把它们都压到 0 → 音画错位。
    *
+   * ⚠️ 共享原点**必须只被减去、永远不被移动**。向前跳变的补偿记在各自的
+   *    n.shiftMs 上（见下）—— 早先的写法是跳变时 `wcOriginMs += dRaw - 40`，
+   *    而原点音视频共用，于是一条轨跳变会把另一条轨整体带偏。触发条件是
+   *    序列头的时间戳被钳成 0（moq_push.cpp 的 seq header），只在**流刚开始**
+   *    时出现：推流后立刻拉流会中招，等 50s 再拉流就不会 —— 现象就是
+   *    「一开始不同步 / 重连后反而同步」。
+   *
    * 每条流另有独立的单调性保证（n.lastOut）——解码器要求同一条流的时间戳不回退。
    * 首帧允许为负（另一条流先到、本条更早的情况），此时负值正反映真实偏移。
    */
@@ -490,18 +503,23 @@ export class MoqPuller {
     let out: number
     if (n.lastRaw < 0) {
       /* 本条流第一帧：直接相对共享原点（可能为负，属正常） */
-      out = rawMs - this.wcOriginMs
+      out = rawMs - this.wcOriginMs - n.shiftMs
     } else {
       const dRaw = rawMs - n.lastRaw
       if (dRaw > 5000) {
-        /* 向前跳变：服务端重锚了时间轴。原点跟着前移，让输出从上一帧 +40ms 继续。 */
-        this.wcOriginMs += dRaw - 40
+        /* 向前跳变：服务端重锚了时间轴。偏移记在**本条轨**上，让本条输出从
+         * 上一帧 +40ms 继续 —— 绝不能去挪共享原点：那是音视频共用的，只跳
+         * 一条轨时会把另一条整体带偏，音画就此永久差一整段。
+         * 实测这个跳变只在**流刚开始**时出现（序列头的时间戳被钳成 0），
+         * 所以「推流后等 50s 再拉流」看不见它。 */
+        n.shiftMs += dRaw - 40
         log_warn(
           'moq-pull',
-          `wc ts forward jump [${tag}] ${n.lastRaw} -> ${rawMs}, origin -> ${this.wcOriginMs}`,
+          `wc ts forward jump [${tag}] ${n.lastRaw} -> ${rawMs}, ` +
+            `track shift -> ${n.shiftMs}ms (shared origin unchanged = ${this.wcOriginMs})`,
         )
       }
-      out = rawMs - this.wcOriginMs
+      out = rawMs - this.wcOriginMs - n.shiftMs
       /* 条内单调：只防回退，不回拉大跳 */
       if (out <= n.lastOut) out = n.lastOut + 1
     }
@@ -523,7 +541,7 @@ export class MoqPuller {
         'moq-pull',
         `ts[${tag}] #${n.statCount} raw=${rawMs} out=${out} ` +
           `dRaw=${dRaw} dOut=${n.lastOut >= 0 ? out - n.lastOut : 0} ` +
-          `origin=${this.wcOriginMs}${dRaw < 0 ? '  <<< 回退' : ''}`,
+          `origin=${this.wcOriginMs} shift=${n.shiftMs}${dRaw < 0 ? '  <<< 回退' : ''}`,
       )
     }
 
@@ -538,7 +556,7 @@ export class MoqPuller {
           `回退=${n.statBack} 被钉平=${n.statPinned} ` +
           `间隔 min=${n.statMinGap === Number.MAX_SAFE_INTEGER ? '-' : n.statMinGap}` +
           `/max=${n.statMaxGap}ms ` +
-          `origin=${this.wcOriginMs}` +
+          `origin=${this.wcOriginMs} 本轨shift=${n.shiftMs}` +
           (n.statBack > 0 ? '  ← 时间戳有回退' : ''),
       )
     }

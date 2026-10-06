@@ -31,6 +31,7 @@ struct wt_stream {
     void         *open_cb_user;
     int           header_sent;      /* WT 帧头是否已发送 */
     int           header_stripped;  /* WT 帧头是否已从入站数据剥离 */
+    int           raw_logged;       /* 首包原始字节是否已打过（只打一次） */
     int           peer_initiated;   /* 是否由对端初始化的流 */
     int           is_uni;           /* 1 = 单向流（对端只能发，本端不能回写） */
     wt_stream_on_writable_fn on_writable;
@@ -43,7 +44,20 @@ struct wt_server {
     struct { char path[128]; wt_path_callbacks_t cb; } paths[WT_MAX_PATHS];
     int  path_count;
     wt_path_callbacks_t default_cb;
+    /* 非 h3 的 ALPN 连接（同端口跑别的 QUIC 协议） */
+    http3_on_other_alpn_fn on_other_alpn_;
+    void                  *on_other_alpn_user_;
 };
+
+void wt_server_set_on_other_alpn(wt_server_t *srv,
+                                  http3_on_other_alpn_fn cb, void *user_data) {
+    if (!srv) return;
+    srv->on_other_alpn_      = cb;
+    srv->on_other_alpn_user_ = user_data;
+    if (srv->h3api) {
+        http3_server_api_set_on_other_alpn(srv->h3api, cb, user_data);
+    }
+}
 
 /* single-server global — accessed by WT callbacks */
 static wt_server_t *g_srv = NULL;
@@ -64,6 +78,19 @@ static size_t quic_varint_read(const uint8_t *data, size_t len,
     for (size_t i = 1; i < vl; i++)
         *value = (*value << 8) | data[i];
     return vl;
+}
+
+/* 前 16 字节的十六进制串，用于诊断「WT 帧头没剥掉」这类问题。
+ * 只打「剥了 / 没剥」是定位不了的：必须看到对端实际写下来的字节，
+ * 才能分清是「对端流类型编号不同」还是「数据错位」。 */
+static const char *wt_hex16(const uint8_t *p, size_t len,
+                            char *out, size_t out_sz) {
+    size_t n = len < 16 ? len : 16;
+    size_t o = 0;
+    out[0] = '\0';
+    for (size_t i = 0; i < n && o + 4 < out_sz; i++)
+        o += (size_t)snprintf(out + o, out_sz - o, "%02x ", p[i]);
+    return out;
 }
 
 /* ── fwd ─────────────────────────────────────── */
@@ -118,15 +145,29 @@ void wt_server_destroy(wt_server_t *srv) {
     free(srv);
 }
 
-int wt_server_listen(wt_server_t *srv,
-                      const char *cert_file, const char *key_file,
-                      const char *ip, int port) {
+int wt_server_listen_ex(wt_server_t *srv,
+                         const char *cert_file, const char *key_file,
+                         const char *ip, int port,
+                         const char *const *alpn, int alpn_count) {
     if (!srv) return -1;
-    srv->h3api = http3_server_api_create(srv->loop, cert_file, key_file, ip, port);
+    srv->h3api = http3_server_api_create_alpn(srv->loop, cert_file, key_file,
+                                              ip, port, alpn, alpn_count);
     if (!srv->h3api) return -1;
+    /* listen 之前注册的回调在这里补挂上去 */
+    if (srv->on_other_alpn_) {
+        http3_server_api_set_on_other_alpn(srv->h3api,
+                                            srv->on_other_alpn_,
+                                            srv->on_other_alpn_user_);
+    }
     http3_server_api_set_on_wt_session(srv->h3api, on_wt_session);
     LOG_DEBUG("[wt-srv] listening on %s:%d", ip, port);
     return 0;
+}
+
+int wt_server_listen(wt_server_t *srv,
+                      const char *cert_file, const char *key_file,
+                      const char *ip, int port) {
+    return wt_server_listen_ex(srv, cert_file, key_file, ip, port, NULL, 0);
 }
 
 void wt_server_add_path(wt_server_t *srv, const char *path,
@@ -406,10 +447,11 @@ static void on_internal_wt_stream(webtransport_session *ws,
     const uint8_t *payload = data;
     size_t payload_len = len;
     if (!st->header_stripped && len > 0) {
-        uint64_t frame_type;
+        uint64_t frame_type = 0;
         size_t ft_len = quic_varint_read(data, len, &frame_type);
+        int stripped = 0;
         if (ft_len > 0 && frame_type >= 0x41 && frame_type <= 0x5f) {
-            uint64_t session_id;
+            uint64_t session_id = 0;
             size_t sid_len = quic_varint_read(data + ft_len,
                                                len - ft_len, &session_id);
             if (sid_len > 0) {
@@ -417,7 +459,23 @@ static void on_internal_wt_stream(webtransport_session *ws,
                 payload     = data + header_len;
                 payload_len = len - header_len;
                 st->header_stripped = 1;
+                stripped = 1;
             }
+        }
+        /* 首包打一行原始字节（每流一次）。剥头判据「首个 varint 落在
+         * 0x41..0x5f」是本仓 client/server 互测出来的约定，第三方实现未必
+         * 同编号。判据不成立时前缀会留在载荷里，上层只看到一个莫名其妙的
+         * 「流类型」，无从区分「对端编号不同」与「数据错位」—— 所以原始
+         * 字节必须留下来。ft_len==0 表示首个 varint 还没收全，等下一片。 */
+        if (ft_len > 0 && !st->raw_logged) {
+            char hex[3 * 16 + 1];
+            st->raw_logged = 1;
+            LOG_INFO("[wt-srv] stream %llu first chunk %zuB raw=%s "
+                     "wt_header=%s first_varint=%llu",
+                     (unsigned long long)st->stream_id, len,
+                     wt_hex16(data, len, hex, sizeof(hex)),
+                     stripped ? "stripped" : "NOT-stripped",
+                     (unsigned long long)frame_type);
         }
     }
 

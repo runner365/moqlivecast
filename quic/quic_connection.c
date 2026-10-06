@@ -48,6 +48,10 @@ struct QuicConnection {
     int       handshake_done_;
     int       crypto_send_pending_;  /* crypto_send_cb 因反放大未发完，需重试 */
 
+    /* TLS 协商出的 ALPN，如 "h3" / "moq-lite-06"。空串 = 对端未提供。
+     * 按连接存而不是全局 —— 同一进程可能有多个监听器各用一套 ALPN。 */
+    char      alpn_[32];
+
     /* CRYPTO 流发送偏移 — 每个加密级别独立 */
     uint64_t  crypto_send_off_[QUIC_TLS_LEVEL_NUM];
 
@@ -81,8 +85,14 @@ struct QuicConnection {
     uint8_t   peer_key_phase_;    /* 对端当前 key phase (0 or 1) */
     uint8_t   current_key_phase_; /* 我方当前 key phase (0 or 1) */
     uint8_t   spin_bit_;          /* Spin Bit (RFC 9000 §17.3.1): 回显对端最新值 */
-    uint8_t   app_read_secret_[32];   /* 保存的 1-RTT read secret */
-    uint8_t   app_write_secret_[32];  /* 保存的 1-RTT write secret */
+    /* 保存的 1-RTT 密钥更新的 IKM。长度 = 该 suite 的 **hash 长度**，
+     * 不是 AEAD key 长度：AES-256-GCM(SHA-384) 是 48 字节。
+     * 缓冲按 QUIC_SECRET_MAX_LEN(48) 开，真实长度另存 —— 原先按 32 截断，
+     * 导致 AES-256 连接的密钥更新永远推不出对端的密钥。 */
+    uint8_t   app_read_secret_[QUIC_SECRET_MAX_LEN];
+    uint8_t   app_write_secret_[QUIC_SECRET_MAX_LEN];
+    size_t    app_read_secret_len_;    /* app_read_secret_ 的有效字节数 */
+    size_t    app_write_secret_len_;   /* app_write_secret_ 的有效字节数 */
     int       app_read_secret_saved_;  /* 已保存 read secret */
     int       app_write_secret_saved_; /* 已保存 write secret */
     uint64_t  pkts_sent_with_key_;     /* 当前 key phase 已发送包数 */
@@ -98,6 +108,11 @@ struct QuicConnection {
     uint64_t   close_ec_;
     char       close_reason_[256];
     QuicTimer  close_timer_;
+    /* RFC 9000 §10.2.2 draining：收到对端的 CONNECTION_CLOSE 之后本端进入
+     * draining，MUST NOT 再发任何包。不置这一位的话，我们每收到一个包就回
+     * 一个 ACK，而对端在 closing 状态下收到包会再发一次它的 close
+     * （§10.2.1 允许）—— 乒乓。实测 41ms 内 227 个 CONNECTION_CLOSE。 */
+    int        draining_;
 
     /* 回调 */
     QuicConnectionOnConnected on_connected_;
@@ -211,6 +226,47 @@ void quic_conn_flush_packet(void *vconn);
 int  QuicConnectionSendImmediate(void *vconn, int pkt_type,
                                   const uint8_t *data, size_t len);
 
+/* 握手完成时统一读取 TLS 协商结果：cipher suite + ALPN。
+ *
+ * ALPN 按连接存 —— 同一进程里可能有多个监听器各用一套 ALPN（WebTransport
+ * 走 h3，裸 QUIC 的 moq-lite 走 moq-lite-06），存全局会互相覆盖。
+ * 上层据此判断这条连接该按哪个绑定/版本来解释。 */
+static void conn_read_tls_negotiated(QuicConnection *conn) {
+    quic_crypto_set_cipher_suite_from_ssl(conn->ssl_);
+
+    const unsigned char *proto = NULL;
+    unsigned int plen = 0;
+    SSL_get0_alpn_selected(conn->ssl_, &proto, &plen);
+    if (proto && plen > 0 && plen < sizeof(conn->alpn_)) {
+        memcpy(conn->alpn_, proto, plen);
+        conn->alpn_[plen] = '\0';
+    } else {
+        conn->alpn_[0] = '\0';
+    }
+
+    LOG_INFO("[quic-conn] TLS negotiated: alpn=%s cipher=%s",
+             conn->alpn_[0] ? conn->alpn_ : "(none)",
+             SSL_CIPHER_get_name(SSL_get_current_cipher(conn->ssl_)));
+}
+
+/* 本连接协商出的 ALPN；对端未提供时返回空串（不是 NULL）。 */
+const char* QuicConnectionGetAlpn(QuicConnection *conn) {
+    return conn ? conn->alpn_ : "";
+}
+
+void QuicConnectionGetPeer(QuicConnection *conn, char *ip, size_t ip_len,
+                            int *port) {
+    if (!conn) {
+        if (ip && ip_len) ip[0] = '\0';
+        if (port) *port = 0;
+        return;
+    }
+    if (ip && ip_len) {
+        snprintf(ip, ip_len, "%s", conn->peer_ip_);
+    }
+    if (port) *port = conn->peer_port_;
+}
+
 static void rate_add(uint64_t *start_ms, uint64_t *bytes, uint64_t *last_kbps,
                      uint64_t now_ms, uint64_t nbytes) {
     if (!*start_ms) *start_ms = now_ms;
@@ -293,7 +349,7 @@ static void log_cwnd_block(QuicConnection *conn, const char *where) {
         conn->recovery_ctx_.cc_->ops->get_info) {
         conn->recovery_ctx_.cc_->ops->get_info(conn->recovery_ctx_.cc_, &info);
     }
-    LOG_DEBUG("[quic-conn] %s deferred by cwnd bif=%llu cwnd=%llu payload=%zu backoff=%dms, cwnd=%llu max_bw_bps=%llu, state:%d, min_rtt_us=%llu",
+    LOG_INFO("[quic-conn] %s deferred by cwnd bif=%llu cwnd=%llu payload=%zu backoff=%dms, cwnd=%llu max_bw_bps=%llu, state:%d, min_rtt_us=%llu",
              where,
              (unsigned long long)bif, (unsigned long long)cwnd,
              conn->pkt_payload_len_, conn->flush_backoff_ms_,
@@ -756,19 +812,33 @@ static int yield_secret_cb(SSL *s, uint32_t prot_level, int direction,
      * 重入 QuicConnectionFeedRaw→SSL_do_handshake 会导致 OpenSSL 崩溃。
      * 回放推迟到 QuicConnectionFeedRaw 中 SSL_do_handshake 返回后。 */
 
-    /* 保存 1-RTT application secret 用于 Key Update (RFC 9001 §6) */
+    /* 保存 1-RTT application secret 用于 Key Update (RFC 9001 §6)。
+     * 长度必须是完整的 hash 长度（AES-256 是 48）—— Key Update 的
+     * HKDF-Expand-Label 拿它当 IKM，少一个字节推出来的密钥就全错。 */
     if (prot_level == QUIC_TLS_LEVEL_APPLICATION) {
-        size_t save_len = secret_len < 32 ? secret_len : 32;
+        size_t save_len = secret_len;
+        if (save_len > QUIC_SECRET_MAX_LEN) save_len = QUIC_SECRET_MAX_LEN;
+        const int hlen = quic_crypto_hash_len(conn->keys_[prot_level][direction].suite);
+        if ((size_t)hlen != secret_len) {
+            LOG_WARN("[quic-conn] app %s secret len=%zu but suite hash len=%d"
+                     " (suite=%d) — key update will not match",
+                     direction == 0 ? "read" : "write", secret_len, hlen,
+                     conn->keys_[prot_level][direction].suite);
+        }
         if (direction == 0) {
             memcpy(conn->app_read_secret_, secret, save_len);
+            conn->app_read_secret_len_ = save_len;
             conn->app_read_secret_saved_ = 1;
             LOG_DEBUG("[quic-conn] saved app read secret[%zu] = %02x%02x..%02x%02x",
-                     save_len, secret[0], secret[1], secret[30], secret[31]);
+                     save_len, secret[0], secret[1],
+                     secret[save_len - 2], secret[save_len - 1]);
         } else {
             memcpy(conn->app_write_secret_, secret, save_len);
+            conn->app_write_secret_len_ = save_len;
             conn->app_write_secret_saved_ = 1;
             LOG_DEBUG("[quic-conn] saved app write secret[%zu] = %02x%02x..%02x%02x",
-                     save_len, secret[0], secret[1], secret[30], secret[31]);
+                     save_len, secret[0], secret[1],
+                     secret[save_len - 2], secret[save_len - 1]);
         }
     }
 
@@ -1044,6 +1114,10 @@ static void on_udp_close(uv_handle_t *h) {
  * ============================================ */
 
 static void do_udp_send(QuicConnection *conn, const uint8_t *data, size_t len) {
+    /* draining 之后一个包都不发（RFC 9000 §10.2.2）。卡在这里而不是每个
+     * 调用点：本函数是唯一的出口，关闭、ACK、恢复重传三条路都经过它。 */
+    if (conn->draining_) return;
+
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -1344,6 +1418,9 @@ static void record_rx_pn(QuicConnection *conn, int level, uint64_t pn) {
 }
 
 static int build_and_send_ack(QuicConnection *conn, int level) {
+    /* draining 后不回 ACK —— 这正是乒乓的来源：我们回 ACK，对端收到包就再发
+     * 一次它的 close（§10.2.1 允许），于是我们又会收到一个包。 */
+    if (conn->draining_) return 0;
     if (!conn->need_ack_[level]) return 0;
     conn->need_ack_[level] = 0;
 
@@ -1489,7 +1566,7 @@ feed_replay:
         }
     }
 
-    while (len > 0 && conn->state_ != QUIC_STATE_CLOSED) {
+    while (len > 0 && conn->state_ != QUIC_STATE_CLOSED && !conn->draining_) {
     int is_long = (data[0] & 0x80) != 0;
 
     if (is_long) {
@@ -1719,8 +1796,8 @@ skip_retrans:
                         /* 握手完成 → 清理 Initial + Handshake PN 空间 */
                         quic_recovery_handshake_done(&conn->recovery_ctx_, 0);
 
-                        /* 读取 TLS 协商的 cipher suite */
-                        quic_crypto_set_cipher_suite_from_ssl(conn->ssl_);
+                        /* 读取 TLS 协商结果（cipher suite + ALPN） */
+                        conn_read_tls_negotiated(conn);
 
                         /* 服务端发送 HANDSHAKE_DONE 帧 */
                         if (conn->stream_ctx_.next_local_bidi_id == 1) {
@@ -1799,7 +1876,8 @@ skip_retrans:
                                                             payload_len - pos,
                                                             &ms, &bidi);
                 if (consumed < 0) goto next_pkt;
-                quic_stream_on_streams_blocked(&conn->stream_ctx_, ms, bidi);
+                quic_stream_on_streams_blocked(&conn->stream_ctx_, conn, ms, bidi,
+                                               quic_conn_queue_frames);
                 break;
             }
             case QUIC_FRAME_RETIRE_CONNECTION_ID: {
@@ -1822,9 +1900,14 @@ skip_retrans:
                               " pos=%zu payload_len=%zu", pos, payload_len);
                     goto next_pkt;
                 }
-                LOG_INFO("[quic-conn] peer CONNECTION_CLOSE: err=0x%llx reason=%.*s",
-                       (unsigned long long)ec, (int)rlen, reason);
-                /* 延迟关闭：让后续包（如 echo STREAM）有机会被处理 */
+                if (!conn->draining_) {
+                    LOG_INFO("[quic-conn] peer CONNECTION_CLOSE: err=0x%llx reason=%.*s",
+                           (unsigned long long)ec, (int)rlen, reason);
+                }
+                /* 收到对端 close → draining（§10.2.2）：不再发包、不再解后续
+                 * 帧。跳到收尾而不是 return —— 本函数可能正跑在 goto 回放出来的
+                 * 缓冲上，直接返回会漏掉 replay_buf_to_free。 */
+                conn->draining_ = 1;
                 if (conn->state_ < QUIC_STATE_CLOSING) {
                     conn->state_ = QUIC_STATE_CLOSING;
                     conn->close_ec_ = ec;
@@ -1833,7 +1916,7 @@ skip_retrans:
                     /* 1 秒后正式关闭 */
                     quic_timer_start(&conn->close_timer_, on_close_timer, conn, 1000, 0);
                 }
-                goto next_pkt;
+                goto drain_out;
             }
             default:
                 /* 未知帧类型，跳过 1 字节继续 */
@@ -2055,25 +2138,28 @@ try_next_keys:
                 /* 保存旧密钥 */
                 QuicCipherKeys old_read  = conn->keys_[QUIC_TLS_LEVEL_APPLICATION][0];
                 QuicCipherKeys old_write = conn->keys_[QUIC_TLS_LEVEL_APPLICATION][1];
-                uint8_t old_read_sec[32], old_write_sec[32];
-                memcpy(old_read_sec,  conn->app_read_secret_,  32);
+                const size_t rs_len = conn->app_read_secret_len_;
+                const size_t ws_len = conn->app_write_secret_len_;
+                uint8_t old_read_sec[QUIC_SECRET_MAX_LEN], old_write_sec[QUIC_SECRET_MAX_LEN];
+                memcpy(old_read_sec,  conn->app_read_secret_,  rs_len);
                 if (conn->app_write_secret_saved_)
-                    memcpy(old_write_sec, conn->app_write_secret_, 32);
+                    memcpy(old_write_sec, conn->app_write_secret_, ws_len);
                 int old_phase = conn->peer_key_phase_;
 
                 /* 推导下一代 AEAD (key+iv)，但保留 HP key 不变。
-                 * quic-go 的 rollKeys() 不轮转 header protector。 */
+                 * quic-go 的 rollKeys() 不轮转 header protector。
+                 * 长度按各自的真实 hash 长度传 —— AES-256 是 48，不是 32。 */
                 QuicCipherKeys next_read  = old_read;  /* 复用 hp_key */
-                uint8_t next_rs[32];
+                uint8_t next_rs[QUIC_SECRET_MAX_LEN];
                 int ok = (quic_crypto_derive_key_update_aead(&next_read,
-                           conn->app_read_secret_, 32, next_rs, sizeof(next_rs)) == 0);
+                           conn->app_read_secret_, rs_len, next_rs, sizeof(next_rs)) == 0);
 
                 QuicCipherKeys next_write = old_write;
-                uint8_t next_ws[32];
+                uint8_t next_ws[QUIC_SECRET_MAX_LEN];
                 int wk_ok = 0;
                 if (conn->app_write_secret_saved_) {
                     wk_ok = (quic_crypto_derive_key_update_aead(&next_write,
-                                conn->app_write_secret_, 32, next_ws, sizeof(next_ws)) == 0);
+                                conn->app_write_secret_, ws_len, next_ws, sizeof(next_ws)) == 0);
                 }
 
                 if (!ok) {
@@ -2082,18 +2168,20 @@ try_next_keys:
                 }
 
                 conn->keys_[QUIC_TLS_LEVEL_APPLICATION][0] = next_read;
-                memcpy(conn->app_read_secret_, next_rs, 32);
+                memcpy(conn->app_read_secret_, next_rs, rs_len);
                 if (wk_ok) {
                     conn->keys_[QUIC_TLS_LEVEL_APPLICATION][1] = next_write;
-                    memcpy(conn->app_write_secret_, next_ws, 32);
+                    memcpy(conn->app_write_secret_, next_ws, ws_len);
                 }
                 conn->peer_key_phase_   = conn->peer_key_phase_ ^ 1;
                 conn->current_key_phase_ = conn->peer_key_phase_;
                 conn->pkts_sent_with_key_ = 0;
                 conn->aead_pkt_count_[QUIC_TLS_LEVEL_APPLICATION] = 0;
                 conn->aead_limit_warned_[QUIC_TLS_LEVEL_APPLICATION] = 0;
-                LOG_DEBUG("[quic-conn] key update: trying gen=%d (hp unchanged)",
-                         conn->peer_key_phase_);
+                LOG_DEBUG("[quic-conn] key update: trying gen=%d (hp unchanged,"
+                          " secret=%zu bytes, suite=%d)",
+                         conn->peer_key_phase_, rs_len,
+                         conn->keys_[QUIC_TLS_LEVEL_APPLICATION][0].suite);
 
                 /* retry: HP key 未变，PN/offset 复用 try 0 的结果。
                  * 但 try 0 的失败 AEAD 解密破坏了 pkt_buf 中的密文，
@@ -2135,9 +2223,9 @@ rollback:
                 /* 回滚密钥 */
                 conn->keys_[QUIC_TLS_LEVEL_APPLICATION][0] = old_read;
                 conn->keys_[QUIC_TLS_LEVEL_APPLICATION][1] = old_write;
-                memcpy(conn->app_read_secret_,  old_read_sec,  32);
+                memcpy(conn->app_read_secret_,  old_read_sec,  rs_len);
                 if (conn->app_write_secret_saved_)
-                    memcpy(conn->app_write_secret_, old_write_sec, 32);
+                    memcpy(conn->app_write_secret_, old_write_sec, ws_len);
                 conn->peer_key_phase_   = old_phase;
                 conn->current_key_phase_ = old_phase;
                 LOG_DEBUG("[quic-conn] key update: rolled back to gen=%d", old_phase);
@@ -2163,12 +2251,14 @@ rollback:
             if (conn->current_key_phase_ == conn->peer_key_phase_) {
                 if (conn->app_write_secret_saved_) {
                     QuicCipherKeys next_wk = conn->keys_[QUIC_TLS_LEVEL_APPLICATION][1];
-                    uint8_t next_ws[32];
+                    uint8_t next_ws[QUIC_SECRET_MAX_LEN];
                     if (quic_crypto_derive_key_update_aead(&next_wk,
-                                                       conn->app_write_secret_, 32,
+                                                       conn->app_write_secret_,
+                                                       conn->app_write_secret_len_,
                                                        next_ws, sizeof(next_ws)) == 0) {
                         conn->keys_[QUIC_TLS_LEVEL_APPLICATION][1] = next_wk;
-                        memcpy(conn->app_write_secret_, next_ws, 32);
+                        memcpy(conn->app_write_secret_, next_ws,
+                               conn->app_write_secret_len_);
                     }
                 }
             }
@@ -2277,10 +2367,14 @@ rollback:
                                   " pos=%zu payload_len=%zu", pos, payload_len);
                         goto done_short;
                     }
-                    LOG_INFO("[quic-conn] peer CONNECTION_CLOSE: err=0x%llx reason=%.*s",
-                           (unsigned long long)ec,
-                           (int)rlen, reason ? reason : "");
-                    /* 延迟关闭：让后续包（如 echo STREAM）有机会被处理 */
+                    if (!conn->draining_) {
+                        LOG_INFO("[quic-conn] peer CONNECTION_CLOSE: err=0x%llx reason=%.*s",
+                               (unsigned long long)ec,
+                               (int)rlen, reason ? reason : "");
+                    }
+                    /* 同长头分支：draining 后一包不发（§10.2.2）。注意 done_short
+                     * 会走 quic_conn_queue_ack，所以置位必须在这里，不能留在分支末尾。 */
+                    conn->draining_ = 1;
                     if (conn->state_ < QUIC_STATE_CLOSING) {
                         conn->state_ = QUIC_STATE_CLOSING;
                         conn->close_ec_ = ec;
@@ -2414,7 +2508,8 @@ rollback:
                                                                 payload_len - pos,
                                                                 &ms, &bidi);
                     if (consumed < 0) break;
-                    quic_stream_on_streams_blocked(&conn->stream_ctx_, ms, bidi);
+                    quic_stream_on_streams_blocked(&conn->stream_ctx_, conn, ms, bidi,
+                                                   quic_conn_queue_frames);
                     break;
                 }
                 case QUIC_FRAME_NEW_CONNECTION_ID: {
@@ -2513,6 +2608,10 @@ done_short:
     }
     } /* while (len > 0) */
 
+    /* draining：回放缓存包已无意义（发了也没人收），直接收尾。
+     * 顺带避开两个回放块各自覆写 replay_buf_to_free 造成的泄漏。 */
+    if (conn->draining_) goto drain_out;
+
     /* 握手读密钥刚就绪 + 有待回放缓存的 Handshake 包 →
      * 通过 goto 在同一栈帧内线性回放，完全避免递归/定时器重入。 */
     if (!conn->handshake_done_ && conn->pending_hs_len_ > 0 &&
@@ -2546,6 +2645,7 @@ done_short:
         goto feed_replay;
     }
 
+drain_out:
     if (replay_buf_to_free)
         free(replay_buf_to_free);
 }
@@ -3049,7 +3149,7 @@ int QuicConnectionConnect(QuicConnection *conn, const char *ip, int port) {
         /* 0-RTT 握手（极不可能在当前配置下） */
         conn->handshake_done_ = 1;
         conn->state_ = QUIC_STATE_ESTABLISHED;
-        quic_crypto_set_cipher_suite_from_ssl(conn->ssl_);
+        conn_read_tls_negotiated(conn);
         if (conn->on_connected_) conn->on_connected_(conn);
     } else {
         int err = SSL_get_error(conn->ssl_, ret);
@@ -3216,6 +3316,9 @@ int QuicConnectionAccept(QuicConnection *conn,
         /* initial_max_streams_bidi (0x08) — 允许客户端打开 100 个 bidi stream */
         {
             uint64_t val = 100;
+            /* 账本起步值：后续 quic_stream_grant_credit 抬的是同一个字段，
+             * 从声明值起算才不会出现「抬完反而比声明值小」的倒退。 */
+            conn->stream_ctx_.max_streams_bidi_local = val;
             size_t vlen = quic_varint_len(val);
             tp_pos += quic_varint_encode(tp_buf + tp_pos,
                                           sizeof(conn->local_tp_) - tp_pos, 0x08);
@@ -3225,9 +3328,13 @@ int QuicConnectionAccept(QuicConnection *conn,
                                           sizeof(conn->local_tp_) - tp_pos, val);
         }
 
-        /* initial_max_streams_uni (0x09) — 允许客户端打开 100 个 uni stream */
+        /* initial_max_streams_uni (0x09) — 允许客户端打开 100 个 uni stream。
+         * ⚠️ 这是个**累计**上限且我们从不自动补 —— 现在由 quic_stream_grant_credit
+         * 在对端开满时按 256 一档往上抬（moq-lite 一个 group 一条 uni stream，
+         * 音频约 47 条/秒，不补的话十几秒就永久卡死）。 */
         {
             uint64_t val = 100;
+            conn->stream_ctx_.max_streams_uni_local = val;
             size_t vlen = quic_varint_len(val);
             tp_pos += quic_varint_encode(tp_buf + tp_pos,
                                           sizeof(conn->local_tp_) - tp_pos, 0x09);
@@ -3352,7 +3459,7 @@ int QuicConnectionAccept(QuicConnection *conn,
         if (ret == 1) {
             conn->handshake_done_ = 1;
             conn->state_ = QUIC_STATE_ESTABLISHED;
-            quic_crypto_set_cipher_suite_from_ssl(conn->ssl_);
+            conn_read_tls_negotiated(conn);
             LOG_DEBUG("[quic-conn] accept: handshake done");
             if (conn->on_connected_) conn->on_connected_(conn);
         } else {
@@ -3572,7 +3679,7 @@ void QuicConnectionCryptoFlushHandshake(QuicConnection *conn) {
     if (ret == 1) {
         conn->handshake_done_ = 1;
         conn->state_ = QUIC_STATE_ESTABLISHED;
-        quic_crypto_set_cipher_suite_from_ssl(conn->ssl_);
+        conn_read_tls_negotiated(conn);
         /* 服务端握手完成 → 清理 Initial 空间（Handshake 空间保留到
          * 首个 1-RTT 包，见 FeedRaw 短头分支） */
         quic_recovery_handshake_done(&conn->recovery_ctx_, 1);

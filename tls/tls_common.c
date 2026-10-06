@@ -103,12 +103,20 @@ SSL_CTX* tls_ctx_server_new_cipher(const char *cert_file, const char *key_file,
         }
         X509_free(certs[0]);
 
-        /* 中间 CA（第 2 到倒数第 2 个）加入发送链 */
-        /* 最后一个（根 CA）只加 cert_store */
+        /* 除自签名根以外的都加入发送链。
+         * 判据是「自签名」而不是「是不是最后一个」：bundle 最后一张常常是
+         * **交叉签名**的根（本机这份是 TrustAsia TLS RSA Root CA，由 Certum
+         * Trusted Network CA 签发），它不是信任锚，而是通向信任锚的那一级 ——
+         * 必须发出去，否则对端建不出到信任锚的路径。
+         * 浏览器能靠 AIA 回调补链，把这条差异盖住了；rustls（libmoq 客户端）
+         * 不做 AIA，直接以 TLS alert unknown_ca（0x130）拒掉。
+         * 只有真正的自签名根才不发：它已在对端本地信任库里。 */
         X509_STORE *store = SSL_CTX_get_cert_store(ctx);
         for (int i = 1; i < cert_count; i++) {
-            int is_root = (i == cert_count - 1);
-            if (!is_root) {
+            int self_signed =
+                X509_NAME_cmp(X509_get_subject_name(certs[i]),
+                              X509_get_issuer_name(certs[i])) == 0;
+            if (!self_signed) {
                 if (SSL_CTX_add1_chain_cert(ctx, certs[i]) != 1) {
                     tls_print_error("SSL_CTX_add1_chain_cert");
                     for (int j = i; j < cert_count; j++) X509_free(certs[j]);
@@ -154,42 +162,109 @@ SSL_CTX* tls_ctx_server_new_cipher(const char *cert_file, const char *key_file,
     return ctx;
 }
 
+struct TlsAlpnPref {
+    const char **protos;
+    int          count;
+    /* 0 = 指向静态存储（默认列表），free 时不要动 */
+    int          owned;
+};
+
+TlsAlpnPref* tls_alpn_pref_new(const char *const *protos, int count) {
+    if (!protos || count <= 0) return NULL;
+
+    TlsAlpnPref *p = (TlsAlpnPref*)calloc(1, sizeof(*p));
+    if (!p) return NULL;
+    p->protos = (const char**)calloc((size_t)count, sizeof(char*));
+    if (!p->protos) { free(p); return NULL; }
+
+    /* owned 先置位 —— 下面失败时要靠它让 free 真的释放已 strdup 的那几项 */
+    p->owned = 1;
+    for (int i = 0; i < count; i++) {
+        p->protos[i] = strdup(protos[i]);
+        if (!p->protos[i]) { p->count = i; tls_alpn_pref_free(p); return NULL; }
+    }
+    p->count = count;
+    return p;
+}
+
+void tls_alpn_pref_free(TlsAlpnPref *pref) {
+    if (!pref || !pref->owned) return;
+    for (int i = 0; i < pref->count; i++) free((void*)pref->protos[i]);
+    free((void*)pref->protos);
+    free(pref);
+}
+
 static int alpn_select_cb(SSL *ssl, const unsigned char **out,
                           unsigned char *outlen, const unsigned char *in,
                           unsigned int inlen, void *arg) {
-    (void)ssl; (void)arg;
-    /* 遍历客户端提供的协议列表（length-prefixed），选择 "quic-echo" */
+    (void)ssl;
+    const TlsAlpnPref *pref = (const TlsAlpnPref*)arg;
+
+    /* 客户端 offer 是 length-prefixed 列表。整表按 INFO 打一行 —— 服务端偏好
+     * 优先的选择器会掩盖「对端其实没提供我们想要的」这类问题：只看到
+     * "selected h3" 无法判断对端到底有没有 offer 过 moq-lite-06。 */
+    char offer[256];
+    size_t opos = 0;
+    offer[0] = '\0';
     unsigned int pos = 0;
-    while (pos < inlen) {
+    while (pos < inlen && opos + 1 < sizeof(offer)) {
         unsigned char proto_len = in[pos];
         if (pos + 1 + proto_len > inlen) break;
-        LOG_DEBUG("[tls] ALPN offer[%u]: %.*s (plen=%u, in+%u=%.8s)",
-                  pos, proto_len, in + pos + 1, proto_len, pos + 1, in + pos + 1);
-        /* 优先选择 "h3"（标准 HTTP/3），其次 "quic-echo"（传统 echo） */
-        if (proto_len == 2 && memcmp(in + pos + 1, "h3", 2) == 0) {
-            *out = in + pos + 1;
-            *outlen = proto_len;
-            LOG_DEBUG("[tls] ALPN: selected h3");
-            return SSL_TLSEXT_ERR_OK;
-        }
-        if (proto_len == 9 && memcmp(in + pos + 1, "quic-echo", 9) == 0) {
-            *out = in + pos + 1;
-            *outlen = proto_len;
-            LOG_DEBUG("[tls] ALPN: selected quic-echo");
-            return SSL_TLSEXT_ERR_OK;
-        }
+        int n = snprintf(offer + opos, sizeof(offer) - opos, "%s%.*s",
+                         opos ? "," : "", proto_len, in + pos + 1);
+        if (n < 0) break;
+        if ((size_t)n >= sizeof(offer) - opos) { opos = sizeof(offer) - 1; break; }
+        opos += (size_t)n;
         pos += 1 + proto_len;
     }
-    LOG_WARN("[tls] ALPN: client did not offer quic-echo (inlen=%u)", inlen);
+    LOG_INFO("[tls] ALPN offer: [%s]", offer);
+
+    if (!pref || pref->count <= 0) {
+        LOG_WARN("[tls] ALPN: no candidate list configured (inlen=%u)", inlen);
+        return SSL_TLSEXT_ERR_ALERT_FATAL;
+    }
+
+    /* 服务端偏好优先：按候选表顺序挑，第一个客户端也提供的胜出 */
+    for (int i = 0; i < pref->count; i++) {
+        const char *want = pref->protos[i];
+        size_t wlen = strlen(want);
+        if (wlen == 0 || wlen > 255) continue;
+
+        pos = 0;
+        while (pos < inlen) {
+            unsigned char proto_len = in[pos];
+            if (pos + 1 + proto_len > inlen) break;
+            if ((size_t)proto_len == wlen &&
+                memcmp(in + pos + 1, want, wlen) == 0) {
+                *out = in + pos + 1;
+                *outlen = proto_len;
+                LOG_INFO("[tls] ALPN: selected %s", want);
+                return SSL_TLSEXT_ERR_OK;
+            }
+            pos += 1 + proto_len;
+        }
+    }
+
+    LOG_WARN("[tls] ALPN: no overlap between client offer and server list"
+             " (inlen=%u)", inlen);
     return SSL_TLSEXT_ERR_ALERT_FATAL;
 }
+
+/* 默认候选表。静态存储，进程生命周期内一直有效 —— 多个监听器共用。 */
+static const char *kDefaultAlpnProtos[] = { "h3", "quic-echo" };
+static TlsAlpnPref kDefaultAlpnPref = { kDefaultAlpnProtos, 2, 0 };
 
 void tls_ctx_set_alpn(SSL_CTX *ctx) {
     unsigned char protos[] = TLS_ALPN_PROTO;
     if (SSL_CTX_set_alpn_protos(ctx, protos, TLS_ALPN_PROTO_LEN) != 0) {
         LOG_WARN("[tls] SSL_CTX_set_alpn_protos failed");
     }
-    SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, NULL);
+    SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, &kDefaultAlpnPref);
+}
+
+void tls_ctx_set_alpn_pref(SSL_CTX *ctx, TlsAlpnPref *pref) {
+    if (!ctx || !pref) return;
+    SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, pref);
 }
 
 int tls_ctx_set_ciphersuite(SSL_CTX *ctx, const char *name) {

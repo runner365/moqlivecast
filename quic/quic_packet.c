@@ -1390,7 +1390,7 @@ int quic_packet_build_retry(uint8_t *out, size_t *out_len,
     memcpy(out + pos, tag, 16); pos += 16;
 
     *out_len = pos;
-    LOG_DEBUG("[quic-packet] built Retry: odcid=%u scid=%u token=%zu total=%zu",
+    LOG_INFO("[quic-packet] built Retry: odcid=%u scid=%u token=%zu total=%zu",
              original_dcid->len, scid->len, token_len, pos);
     return 0;
 }

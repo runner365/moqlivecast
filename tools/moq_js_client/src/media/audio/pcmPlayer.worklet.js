@@ -88,9 +88,18 @@ class PcmPlayerProcessor extends AudioWorkletProcessor {
     super()
     const opts = (options && options.processorOptions) || {}
     this.channels = opts.channels || 2
-    /* 环形缓冲时长：直播延迟 vs 抗欠载的权衡。
-     * 500ms → 300ms：降约 200ms 延迟；RTT 低的链路够稳，欠载主要看网络抖动。 */
-    this.ring = new PcmRing(Math.round(sampleRate * 0.3), this.channels)
+    /* 环形缓冲时长：直播延迟 vs 抗欠载的权衡。默认 500ms。
+     *
+     * 这个值还有第二层含义，比"抗欠载"重要得多：**它就是追直播的落点**。
+     * 服务端 1x 推、这里 1x 播，积压不会自己消 —— 缓冲满了就丢最旧，
+     * 播放位置被顶到 (最新 - ringSeconds)，稳态延迟就等于这个值。
+     * 加入订阅时服务端会一次性回放一整个 GOP（实测 3.8s），环装不下的部分
+     * 会被整段丢掉（丢的是音频内容，不是"迟到的旧包"）。
+     * 所以它由主线程按延迟目标传进来（见 audioPlayer.ts 的 AUDIO_RING_SECONDS），
+     * 不要在这里写死成一个只考虑欠载的小值。 */
+    const ringSeconds = opts.ringSeconds > 0 ? opts.ringSeconds : 0.5
+    this.ring = new PcmRing(Math.round(sampleRate * ringSeconds), this.channels)
+    this.ringSeconds = ringSeconds
     this.quantumCount = 0
     this.consumedFrames = 0 /* 累计真实消费帧数（不含补的静音） */
     this.underrunFrames = 0 /* 累计欠载补的静音帧数 */
@@ -143,6 +152,9 @@ class PcmPlayerProcessor extends AudioWorkletProcessor {
         droppedFrames: this.ring.droppedOldest,
         droppedOldest: this.ring.droppedOldest,
         ringFrames: this.ring.count,
+        /* 环容量（帧）：主线程用它把 droppedOldest 换算成"丢了几秒" */
+        ringCapFrames: this.ring.cap,
+        ringSeconds: this.ringSeconds,
       })
     }
     return true /* 保持存活 */

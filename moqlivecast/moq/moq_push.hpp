@@ -26,6 +26,14 @@ public:
     bool IsSubscriber() const { return subscriber_; }
     bool HasMedia() const { return !app_.empty() && !stream_.empty(); }
 
+    /* 会话归属：PUBLISH 到达时用 session id 去 MediaStreamManager 认领流。 */
+    WTServerSession *Session() const { return sess_; }
+    void SetSession(WTServerSession &sess) { sess_ = &sess; session_id_ = sess.SessionId(); }
+    const std::string &SessionId() const { return session_id_; }
+    /* 本会话是否仍是该流的 publisher。被后来者顶掉后返回 false，
+     * 媒体路径据此丢弃在途对象（见 draft-ietf-moq-transport §2.4.3）。 */
+    bool IsPublisherOwner() const;
+
     void AttachPlayer(const std::string &writer_id);
     void DetachPlayer();
 
@@ -100,6 +108,9 @@ private:
     std::string app_;
     std::string stream_;
     std::string writer_id_;
+    /* 本会话（PUBLISH 来源）。被顶替时要断开的就是它。 */
+    WTServerSession *sess_ = nullptr;
+    std::string session_id_;
     bool publisher_ = false;
     bool subscriber_ = false;
     bool player_added_ = false;
@@ -115,6 +126,8 @@ private:
     Downlink audio_dl_;
     int64_t pull_ts_base_ = -1;
     int64_t last_pull_ts_ = -1;
+    /* 被顶掉之后的丢包日志限流（秒），见 EmitFlvVideo / EmitFlvAudio。 */
+    int64_t last_owner_drop_dbg_ts_s_ = 0;
     std::unordered_map<WTServerStream *, StreamState> streams_;
 };
 
@@ -128,6 +141,11 @@ public:
     static bool IsMoqPath(const std::string &path);
     static void AddSubscriber(WTServerSession &sess, MoqPushSession &ms);
     static void RemoveSubscriber(WTServerSession &sess);
+    /* 同名流「新顶旧」：断开被顶掉的旧 publisher 会话。只做日志 + 断连，
+     * 不带错误码 —— 带码通知要等 PUBLISH_DONE / REQUEST_ERROR（见
+     * docs/moq-transport-gap.md G6），当前版本先保证一条流只有一个源。 */
+    static bool KickPublisherSession(const std::string &session_id,
+                                     const std::string &stream_key);
 
 private:
     static std::unordered_map<std::string, std::unique_ptr<MoqPushSession>> sessions_;

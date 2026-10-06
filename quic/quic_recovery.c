@@ -75,7 +75,7 @@ static void print_unack_packet(QuicRecoveryCtx *ctx, const char *tag) {
                 int used = quic_frame_parse_stream(fp, flen, &sid, &off, &fin, &sd, &sl);
                 if (used <= 0) break;
                 if (printed < 40) {
-                    LOG_DEBUG("[ack-audit]%s pn=%llu stream=%llu off=%llu len=%zu end=%llu lost=%d chunk=%llu",
+                    LOG_WARN("[ack-audit]%s pn=%llu stream=%llu off=%llu len=%zu end=%llu lost=%d chunk=%llu",
                              tag ? tag : "",
                              (unsigned long long)p->pn,
                              (unsigned long long)sid,
@@ -94,7 +94,7 @@ static void print_unack_packet(QuicRecoveryCtx *ctx, const char *tag) {
             }
         }
     }
-    LOG_DEBUG("[ack-audit]%s summary: unacked_pkts=%d printed=%d", tag ? tag : "", unacked_total, printed);
+    LOG_WARN("[ack-audit]%s summary: unacked_pkts=%d printed=%d", tag ? tag : "", unacked_total, printed);
 }
 
 /* inflight 扣减 — 带 underflow 检测 + 饱和保护（防 unsigned 翻转）。
@@ -278,7 +278,7 @@ static void mark_pn_acked(QuicRecoveryCtx *ctx, uint64_t pn, int level,
          * 只确认属于同一 level 的包，避免跨空间误匹配 */
         if (pkt_type_to_level(p->pkt_type) != level) continue;
         if (p->pn == pn && p->ack_eliciting && p->lost) {
-            LOG_DEBUG("[quic-recovery] pn=%llu acked BUT lost (retransmitted?) chunk=%llu",
+            LOG_WARN("[quic-recovery] pn=%llu acked BUT lost (retransmitted?) chunk=%llu",
                      (unsigned long long)pn,
                      (unsigned long long)p->chunk_id);
         }
@@ -430,7 +430,7 @@ static void detect_losses(QuicRecoveryCtx *ctx, uint64_t now_ms) {
         loss_detected = 1;
         if ((now_ms/1000) != ctx->last_loss_log_s_) {
             ctx->last_loss_log_s_ = now_ms/1000;
-            LOG_DEBUG("[quic-recovery] LOSS pn=%llu chunk=%llu bif=%llu retrans=%zuB",
+            LOG_WARN("[quic-recovery] LOSS pn=%llu chunk=%llu bif=%llu retrans=%zuB",
                     (unsigned long long)p->pn, (unsigned long long)p->chunk_id,
                     (unsigned long long)ctx->bytes_in_flight_,
                     p->frames_len);
@@ -508,7 +508,7 @@ static void on_pto_timer(void *user) {
 
     /* 自愈：sent_packets 空但 inflight 残留 → 清零 + 发送 keepalive 触 ACK */
     if (ctx->sent_count_ == 0 && ctx->bytes_in_flight_ > 0) {
-        LOG_DEBUG("[quic-recovery] inflight leak %llu→0 + keepalive",
+        LOG_WARN("[quic-recovery] inflight leak %llu→0 + keepalive",
                  (unsigned long long)ctx->bytes_in_flight_);
         ctx->bytes_in_flight_ = 0;
         if (ctx->on_pto_keepalive) ctx->on_pto_keepalive(ctx->conn_);
@@ -591,7 +591,7 @@ static void on_pto_timer(void *user) {
                  c->state, c->retrans_count);
         if (ctx->send_imm_fn) {
             ctx->current_retrans_chunk_id_ = c->chunk_id;
-            LOG_DEBUG("[quic-recovery] PTO retrans chunk=%llu %zuB retrans=%d pto=%llu",
+            LOG_WARN("[quic-recovery] PTO retrans chunk=%llu %zuB retrans=%d pto=%llu",
                      (unsigned long long)c->chunk_id, c->frames_len,
                      c->retrans_count, (unsigned long long)ctx->pto_count_);
             ctx->send_imm_fn(ctx->conn_, c->pkt_type, c->frames, c->frames_len);
@@ -761,7 +761,7 @@ void quic_recovery_on_packet_sent(QuicRecoveryCtx *ctx, uint64_t pn,
                 LOG_ERROR("[quic-recovery] parse_stream failed, used=%d", used);
                 break;
             }
-            LOG_DEBUG("[retrans-audit] new_pn=%llu chunk=%llu stream=%llu off=%llu len=%zu",
+            LOG_WARN("[retrans-audit] new_pn=%llu chunk=%llu stream=%llu off=%llu len=%zu",
                      (unsigned long long)pn, (unsigned long long)c->chunk_id,
                      (unsigned long long)sid, (unsigned long long)off, sl);
             fp += used; flen -= (size_t)used;

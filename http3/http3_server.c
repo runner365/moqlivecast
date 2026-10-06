@@ -25,7 +25,18 @@ struct http3_server {
     void             *app_data_;
     void             *user_data_;
     http3_server_on_dgram_fn on_dgram_;
+    /* ALPN 不是 h3 的连接交给它（同端口跑别的 QUIC 协议，如裸 moq-lite）。
+     * 未注册时这类连接直接关掉。 */
+    http3_on_other_alpn_fn   on_other_alpn_;
+    void                    *on_other_alpn_user_;
 };
+
+void http3_server_set_on_other_alpn(http3_server *srv,
+                                     http3_on_other_alpn_fn cb, void *user_data) {
+    if (!srv) return;
+    srv->on_other_alpn_      = cb;
+    srv->on_other_alpn_user_ = user_data;
+}
 
 /* ── 连接管理 ─────────────────────────────── */
 
@@ -229,6 +240,39 @@ static void on_handshake_done(QuicConnection *conn) {
     http3_server *srv = (http3_server*)QuicConnectionGetAppData(conn);
     if (!srv) return;
 
+    /* ALPN 到握手完成才定得下来，这里是唯一能分派多协议端口的时刻。
+     * 不是 h3 的连接不能按 H3 初始化（否则会给对方开控制流发 SETTINGS）。 */
+    const char *alpn = QuicConnectionGetAlpn(conn);
+    if (strcmp(alpn, "h3") != 0) {
+        char ip[64] = {0};
+        int  port = 0;
+        QuicConnectionGetPeer(conn, ip, sizeof(ip), &port);
+
+        /* on_connection 早于握手，那时还不知道 ALPN，已经按 H3 挂好了
+         * stream/datagram/close 三件套并把自己记进了 conns_。这里要逐项摘掉：
+         *  - h3_remove_conn：否则 H3 连接表留下悬垂项
+         *  - on_datagram 清空：H3 的 datagram 处理会把 moq 的数据当 H3 解
+         *  - on_connected 清空：本函数就是它，不清的话 crypto_flush 那条
+         *    握手完成路径可能再进来一次，重复交接
+         *  - on_close 由注册方覆盖 —— 因此 listener 记账（QuicListenerRemoveConn）
+         *    也一并转交给注册方，见 http3_server.h 的说明 */
+        h3_remove_conn(srv, conn);
+        QuicConnectionSetOnDatagram(conn, NULL);
+        QuicConnectionSetOnConnected(conn, NULL);
+
+        if (srv->on_other_alpn_) {
+            LOG_INFO("[h3-server] %s:%d alpn=%s — handing off", ip, port,
+                     alpn[0] ? alpn : "(none)");
+            srv->on_other_alpn_(srv->on_other_alpn_user_, conn,
+                                 alpn, ip, port);
+        } else {
+            LOG_WARN("[h3-server] %s:%d alpn=%s has no handler, closing",
+                     ip, port, alpn[0] ? alpn : "(none)");
+            QuicConnectionClose(conn, 0x0, "unsupported alpn");
+        }
+        return;
+    }
+
     LOG_DEBUG("[h3-server] HANDSHAKE_DONE callback fired — sending SETTINGS");
 
     /* HTTP/3 §6.2.1: 控制流必须是服务端第一个单向流。
@@ -342,6 +386,13 @@ void http3_server_destroy(http3_server *srv) {
 
 int http3_server_listen(http3_server *srv, const char *ip, int port) {
     return QuicListenerListen(srv->listener_, ip, port);
+}
+
+int http3_server_set_alpn(http3_server *srv,
+                          const char *const *protos, int count) {
+    if (!srv || !srv->listener_) return -1;
+    if (!protos || count <= 0) return 0;  /* 保持默认列表 */
+    return QuicListenerSetAlpn(srv->listener_, protos, count);
 }
 
 void  http3_server_set_user_data(http3_server *srv, void *data) { srv->user_data_ = data; }

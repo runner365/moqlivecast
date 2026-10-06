@@ -251,6 +251,11 @@ export class VideoRenderer {
   private renderTick() {
     if (!this.hasFrame && this.queue.length === 0) return
     let nowUs = this.clock()
+    /* 外部时钟这次到底给没给值（-1 = 不可用）。下面判"是否回退到锚定时钟"、
+     * 以及诊断日志里的时钟来源，都必须用这个实测值 —— 不能只看回调装没装：
+     * 音频解码器每重建一次就 flush 一次，basePtsUs 归 -1，外部时钟会**间歇性**
+     * 失效，此时实际在走锚定时钟。 */
+    const extUs = this.externalClock ? this.externalClock() : -1
 
     /* 每秒一条状态：直接看 clock 与队列头尾的关系，判断"为什么没渲染" */
     const wall = performance.now()
@@ -263,7 +268,9 @@ export class VideoRenderer {
         `tick now=${Math.round(nowUs / 1000)}ms head=${Math.round(head / 1000)}ms ` +
           `tail=${Math.round(tail / 1000)}ms queued=${this.queue.length} ` +
           `rendered=${this.stats.rendered} dropped=${this.stats.dropped} ` +
-          `got=${this.stats.received} ext=${this.externalClock ? 'audio' : 'anchor'}`,
+          `got=${this.stats.received} ` +
+          `extUs=${extUs < 0 ? '-1' : `${Math.round(extUs / 1000)}ms`} ` +
+          `clockSrc=${extUs >= 0 ? 'audio' : 'anchor'}`,
       )
     }
     /* 时钟未就绪（还没锚定、也没外部时钟）：保留帧，先不渲染 */
@@ -275,7 +282,7 @@ export class VideoRenderer {
     /* 追直播：数据超前时钟太多 → 重锚时钟到直播边缘。
      * 音频时钟可用时以音频为准（不重锚，否则会撕裂音画同步）；
      * 回退到锚定时钟时才重锚。 */
-    const usingAnchorClock = !this.externalClock || this.externalClock() < 0
+    const usingAnchorClock = extUs < 0
     if (usingAnchorClock && this.queue.length > 0) {
       const newest = this.queue[this.queue.length - 1]
       if (newest.tsUs - nowUs > MAX_AHEAD_US) {
@@ -295,11 +302,25 @@ export class VideoRenderer {
      * 不要按「最新帧」裁剪 —— 数据超前时钟是正常的（服务端快发/GOP 回放），
      * 那时该做的是"等时钟走过来"，而不是把时钟正要用的帧丢掉。
      * 保留至少 1 帧，避免队列清空后无内容可画。 */
+    const firstHeadUs = this.queue.length ? this.queue[0].tsUs : -1
+    let lagDropped = 0
     while (this.queue.length > 1 && nowUs - this.queue[0].tsUs > MAX_LAG_US) {
       const f = this.queue.shift()
       if (!f) break
       closeFrame(f.frame)
       this.stats.dropped++
+      lagDropped++
+    }
+    /* 一次 tick 丢掉一大串 = 时钟发生了跳变（多半是音频环顶掉了一批，
+     * 播放位置被顶到最新），不是正常抖动。上一轮那次"整个回放 GOP 被清空"
+     * 就只体现在 dropped 计数里，得从每秒汇总里反推 —— 单独报一条。 */
+    if (lagDropped >= 5) {
+      log_warn(
+        'wc-render',
+        `clock ${Math.round(nowUs / 1000)}ms passed ${lagDropped} queued frames at once ` +
+          `(head was ${Math.round(firstHeadUs / 1000)}ms, src=${extUs >= 0 ? 'audio' : 'anchor'}) ` +
+          `→ clock jumped`,
+      )
     }
 
     /* 弹出所有到点的帧，只渲染最后一个 */

@@ -26,7 +26,7 @@ export type LocObject = {
 
 export function tryReadControl(r: ByteReader): ControlMsg | null {
   const snap = r.snapshot()
-  const type = r.readVarint()
+  const type = r.readVi64()
   const len = r.readU16()
   if (type === null || len === null) {
     r.restore(snap)
@@ -43,8 +43,8 @@ export function tryReadControl(r: ByteReader): ControlMsg | null {
 export function parseSubscribeOk(body: Uint8Array): { requestId: number; alias: number } | null {
   const r = new ByteReader()
   r.push(body)
-  const requestId = r.readVarint()
-  const alias = r.readVarint()
+  const requestId = r.readVi64()
+  const alias = r.readVi64()
   if (requestId === null || alias === null) return null
   return { requestId, alias }
 }
@@ -55,16 +55,16 @@ export function isSubscribeOk(msg: ControlMsg): boolean {
 
 export function tryReadSubgroup(r: ByteReader): { alias: number; hasProps: boolean } | null {
   const snap = r.snapshot()
-  const flags = r.readVarint()
-  const alias = r.readVarint()
-  const group = r.readVarint()
+  const flags = r.readVi64()
+  const alias = r.readVi64()
+  const group = r.readVi64()
   if (flags === null || alias === null || group === null) {
     r.restore(snap)
     return null
   }
   const idMode = (flags >> 1) & 0x03
   if (idMode === 0x02) {
-    const sg = r.readVarint()
+    const sg = r.readVi64()
     if (sg === null) {
       r.restore(snap)
       return null
@@ -82,7 +82,7 @@ export function tryReadSubgroup(r: ByteReader): { alias: number; hasProps: boole
 
 export function tryReadObject(r: ByteReader, hasProps: boolean): LocObject | null {
   const snap = r.snapshot()
-  const delta = r.readVarint()
+  const delta = r.readVi64()
   if (delta === null) {
     r.restore(snap)
     return null
@@ -93,7 +93,7 @@ export function tryReadObject(r: ByteReader, hasProps: boolean): LocObject | nul
   let videoConfig: Uint8Array | undefined
   let audioConfig: Uint8Array | undefined
   if (hasProps) {
-    const plen = r.readVarint()
+    const plen = r.readVi64()
     if (plen === null) {
       r.restore(snap)
       return null
@@ -107,17 +107,17 @@ export function tryReadObject(r: ByteReader, hasProps: boolean): LocObject | nul
     pr.push(props)
     let prev = 0
     while (pr.length > 0) {
-      const dlt = pr.readVarint()
+      const dlt = pr.readVi64()
       if (dlt === null) break
       const type = prev + dlt
       prev = type
       if ((type & 1) === 0) {
-        const val = pr.readVarint()
+        const val = pr.readVi64()
         if (val === null) break
         if (type === LOC_TIMESTAMP) timestampMs = val
         if (type === LOC_COMPOSITION_TIME) ctsMs = val
       } else {
-        const vlen = pr.readVarint()
+        const vlen = pr.readVi64()
         if (vlen === null) break
         const raw = pr.readBytes(vlen)
         if (!raw) break
@@ -127,13 +127,13 @@ export function tryReadObject(r: ByteReader, hasProps: boolean): LocObject | nul
       }
     }
   }
-  const payloadLen = r.readVarint()
+  const payloadLen = r.readVi64()
   if (payloadLen === null) {
     r.restore(snap)
     return null
   }
   if (payloadLen === 0) {
-    const status = r.readVarint()
+    const status = r.readVi64()
     if (status === null) {
       r.restore(snap)
       return null

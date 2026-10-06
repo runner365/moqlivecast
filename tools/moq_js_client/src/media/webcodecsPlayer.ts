@@ -18,8 +18,23 @@ export type WebCodecsPlayerOptions = {
   stats: MediaStats
 }
 
-/** decodeQueueSize 超过它就开始丢非关键帧 */
+/** 送进解码器的在途上限：解码队列低于它才继续喂下一帧。
+ *  它同时是"解码输出在途帧数"的上限 —— 所以是**内存**的约束（1080p 一帧
+ *  NV12 约 3MB，12 帧 ≈ 36MB），不是延迟的约束。 */
 const MAX_DECODE_QUEUE = 12
+/** 待解码积压上限（已入队、还没送进解码器的编码块）。
+ *  编码块很小（几 KB），可以放得比 MAX_DECODE_QUEUE 宽得多。
+ *  它只用来判"解码器真的长期跟不上"（约 16 秒视频），不是用来削突发的。 */
+const MAX_PENDING_VIDEO = 400
+
+/* ── 音频丢帧（pts 空洞）的检测/填补 ──
+ * 服务端实测丢 3.4% 音频帧（源文件本身一帧不缺、视频一帧不丢），
+ * 表现为编码块 pts 上的 ~21ms 空洞。不处理的话音频内容会比媒体时间轴跑得快，
+ * 而视频 slave 在音频时钟上 → 音画差距每秒长 ~4%，单调增大。 */
+/** 判定为"丢帧"的最小空洞（微秒）：小于它当网络抖动。一帧 AAC ≈ 21.3ms。 */
+const AUDIO_GAP_MIN_US = 5_000
+/** 单次补静音上限（微秒）：超过它说明是时间轴断点（服务端重锚/重启），不是丢帧 */
+const AUDIO_GAP_MAX_US = 200_000
 /** 视频解码参数变化的兜底重建阈值 */
 const MAX_HW_FAILS = 3
 
@@ -46,6 +61,19 @@ export class WebCodecsPlayer {
   private queueDrops = 0
   private firstFrameLogged = false
 
+  /* ── 视频解码削峰 ──
+   * 加入订阅时服务端会一次性回放一整个 GOP（实测 96 帧），这些对象是在
+   * **同一个 tick 里**读完并交给 pushVideo 的。若在这里直接 decode()，
+   * decodeQueueSize 会瞬间冲过 MAX_DECODE_QUEUE，触发"丢非关键帧 + 等关键帧"
+   * 的兜底 —— 而下一个关键帧在一整个 GOP 之后（≈3.8s），于是画面冻住约 4 秒
+   * （实测 rendered 从 2 卡到 03.091→06.108 才恢复）。
+   * 改成先把编码块排进 pendingVideo，按解码器剩余容量逐帧喂：
+   * 在途帧数始终 ≤ MAX_DECODE_QUEUE，突发被摊成一段时间的解码；
+   * 解出来但已经过时的帧由 VideoRenderer 按媒体时钟丢弃（它本来就有这条逻辑）。 */
+  private pendingVideo: { payload: Uint8Array; ptsUs: number; key: boolean }[] = []
+  /** 已送进解码器的块数，只用于日志节奏 */
+  private fedVideo = 0
+
   /* ── 音频 ── */
   private audioPlayer: AudioPlayer | null = null
   private audioDecoder: AudioDecoder | null = null
@@ -55,6 +83,14 @@ export class WebCodecsPlayer {
   private decodedAudioFrames = 0
   private audioDecodeErrors = 0
   private audioClockReady = false
+  /** 每个已提交、还没拿到 PCM 的编码块各自要在前面补的静音时长（微秒）。
+   *  AAC 一 chunk 出一块 PCM、次序一致，所以用下标对齐即可（长度 = 解码队列深度）。 */
+  private audioPadQueue: number[] = []
+  /** 上一个已提交编码块的媒体时间终点（微秒）；-1 = 未建立连续性（首块/刚 flush） */
+  private audioChunkEndUs = -1
+  /** 实测每 chunk 解出的帧数（AAC-LC = 1024），首个 PCM 之后按实测校准 */
+  private audioFramesPerChunk = 1024
+  private audioGapCount = 0
 
   constructor(opts: WebCodecsPlayerOptions) {
     this.canvas = opts.canvas
@@ -160,6 +196,11 @@ export class WebCodecsPlayer {
     }
     this.videoDecoder = dec
     this.needKey = true /* 新 decoder 必须从关键帧起 */
+    /* 解码队列变浅就继续喂 pendingVideo —— 突发靠这个自己消化，不需要外部推动。
+     * 另外 onVideoFrame 里也补一次：ondequeue 不是所有实现都可靠。 */
+    dec.ondequeue = () => this.drainVideo()
+    /* 旧配置的编码块作废（同软件回退那处） */
+    this.pendingVideo.length = 0
     log_info(
       'wc-player',
       `VideoDecoder configured codec=${this.videoCodec} avcC=${avcC.byteLength}B hex=${hex(avcC, 6)}`,
@@ -191,6 +232,9 @@ export class WebCodecsPlayer {
     }
     this.lastPtsUs = Math.max(this.lastPtsUs, frame.timestamp)
     this.renderer.push(frame.timestamp, frame)
+    /* 吐出一帧 → 解码队列浅了一格 → 继续喂。突发靠这里推进，
+     * 不依赖 ondequeue（两者都调是幂等的：容量满了就直接返回）。 */
+    this.drainVideo()
   }
 
   private onVideoError(e: DOMException) {
@@ -220,8 +264,11 @@ export class WebCodecsPlayer {
           },
         })
         dec.configure(soft)
+        dec.ondequeue = () => this.drainVideo()
         this.videoDecoder = dec
         this.needKey = true
+        /* 旧配置的编码块作废：新 decoder 要从关键帧起，排队中的那些不能直接续上 */
+        this.pendingVideo.length = 0
         log_warn('wc-player', 'VideoDecoder rebuilt as prefer-software')
       } catch (e2) {
         log_error('wc-player', `software fallback failed: ${errMsg(e2)}`)
@@ -245,7 +292,7 @@ export class WebCodecsPlayer {
       return
     }
 
-    /* 丢帧策略：队列过深时丢非关键帧，并进入"等关键帧"状态 */
+    /* 丢帧策略：丢过帧之后必须从关键帧才能继续（否则解码器会花屏） */
     if (this.needKey && !key) {
       this.needKeyDrops++
       if (this.needKeyDrops <= 3 || this.needKeyDrops % 60 === 0) {
@@ -253,47 +300,69 @@ export class WebCodecsPlayer {
       }
       return
     }
-    if (dec.decodeQueueSize > MAX_DECODE_QUEUE) {
+
+    /* 积压过深 = 解码器长期跟不上（不是回放突发 —— 突发由 pending 队列自然消化）。
+     * 非关键帧丢掉并等下一个关键帧；关键帧来了就整队清掉，从它重新开始。 */
+    if (this.pendingVideo.length > MAX_PENDING_VIDEO) {
       if (!key) {
         this.needKey = true
         this.queueDrops++
         if (this.queueDrops <= 3 || this.queueDrops % 60 === 0) {
           log_warn(
             'wc-player',
-            `backpressure: decodeQueueSize=${dec.decodeQueueSize} > ${MAX_DECODE_QUEUE}, drop delta (#${this.queueDrops})`,
+            `backpressure: pending=${this.pendingVideo.length} > ${MAX_PENDING_VIDEO}, drop delta (#${this.queueDrops})`,
           )
         }
         return
       }
-      /* 关键帧来了：重建 decoder 清掉积压（reset 会清配置） */
       log_warn(
         'wc-player',
-        `backpressure: decodeQueueSize=${dec.decodeQueueSize}, rebuild decoder on key`,
+        `backpressure: pending=${this.pendingVideo.length} > ${MAX_PENDING_VIDEO}, drop backlog on key (#${this.queueDrops})`,
       )
-      this.buildDecoder()
-      if (!this.videoDecoder) return
+      this.pendingVideo.length = 0
     }
     if (key) this.needKey = false
 
-    const target = this.videoDecoder
-    if (!target || target.state === 'closed') return
-    try {
-      target.decode(
-        new EncodedVideoChunk({
-          type: key ? 'key' : 'delta',
-          timestamp: ptsUs,
-          data: payload,
-        }),
-      )
-      if (this.videoCount <= 3 || this.videoCount % 120 === 0) {
-        log_info(
+    this.pendingVideo.push({ payload, ptsUs, key })
+    this.drainVideo()
+  }
+
+  /**
+   * 按解码器剩余容量把 pendingVideo 喂进去。**每次解码器吐出一帧、或队列变浅时都会被调用**
+   * （onVideoFrame / ondequeue），所以突发不会卡在队列里等人推。
+   */
+  private drainVideo() {
+    const dec = this.videoDecoder
+    if (this.closed || !dec || dec.state === 'closed') {
+      this.pendingVideo.length = 0
+      return
+    }
+    while (this.pendingVideo.length > 0 && dec.decodeQueueSize < MAX_DECODE_QUEUE) {
+      const item = this.pendingVideo.shift()
+      if (!item) break
+      try {
+        dec.decode(
+          new EncodedVideoChunk({
+            type: item.key ? 'key' : 'delta',
+            timestamp: item.ptsUs,
+            data: item.payload,
+          }),
+        )
+        this.fedVideo++
+        if (this.fedVideo <= 3 || this.fedVideo % 120 === 0) {
+          log_info(
+            'wc-player',
+            `pushVideo #${this.videoCount} #fed${this.fedVideo} ${item.payload.byteLength}B ` +
+              `ptsUs=${item.ptsUs} key=${item.key ? 1 : 0} ` +
+              `q=${dec.decodeQueueSize} pend=${this.pendingVideo.length} frames=${this.decodedFrames}`,
+          )
+        }
+      } catch (e) {
+        log_error(
           'wc-player',
-          `pushVideo #${this.videoCount} ${payload.byteLength}B ptsUs=${ptsUs} key=${key ? 1 : 0} ` +
-            `q=${target.decodeQueueSize} frames=${this.decodedFrames}`,
+          `decode() threw: ${errMsg(e)} ptsUs=${item.ptsUs} key=${item.key ? 1 : 0}`,
         )
       }
-    } catch (e) {
-      log_error('wc-player', `decode() threw: ${errMsg(e)} ptsUs=${ptsUs} key=${key ? 1 : 0}`)
     }
   }
 
@@ -352,6 +421,10 @@ export class WebCodecsPlayer {
     this.audioDecoder = dec
     /* 新 decoder 会重置输出 → 清掉环形缓冲，避免旧数据造成错位 */
     this.audioPlayer?.flush()
+    /* 时间轴连续性锚点与待补空洞都要清掉：新 decoder 的输出是另一条序列，
+     * 旧队列里的 pad 会对不上，而残留的 chunk 终点会被误判成一个巨大空洞。 */
+    this.audioPadQueue.length = 0
+    this.audioChunkEndUs = -1
     log_info('wc-player', `AudioDecoder configured codec=${this.audioCodec}`)
   }
 
@@ -369,6 +442,13 @@ export class WebCodecsPlayer {
           `ts=${data.timestamp}us`,
       )
     }
+    /* 按实测校准"每 chunk 多少帧"（用于推算 chunk 的媒体时长） */
+    if (data.numberOfFrames > 0) this.audioFramesPerChunk = data.numberOfFrames
+    /* 这个 chunk 提交时检测到的 pts 空洞，在这里把静音补在它前面 ——
+     * 必须在这里（而不是 pushAudio 那一刻），否则解码队列里积压的
+     * 前几块 PCM 会被排到静音后面，静音就落错了位置。 */
+    const padUs = this.audioPadQueue.shift() ?? 0
+    if (padUs > 0) ap.padSilenceUs(padUs)
     try {
       /* f32-planar → 交错 Float32，喂给 worklet */
       const ch = data.numberOfChannels
@@ -407,6 +487,29 @@ export class WebCodecsPlayer {
       log_error('wc-player', `pushAudio dropped: decoder=${dec ? dec.state : 'null'}`)
       return
     }
+    /* 音频丢帧**唯一可见的地方**就是这里：编码块 pts 上的空洞。
+     * 解码后的 AudioData.timestamp 实测是连续的（audioPlayer 的 decGapMax 恒为 0），
+     * 所以在那一层做空洞检测永远不会命中 —— 这是上一版补静音没生效的原因。
+     * 检测到的空洞排队，等对应的 PCM 出来时在它前面注入等长静音，
+     * 让写入序列与媒体时间轴对齐（见 AudioPlayer.padSilenceUs）。 */
+    const nominalUs = (this.audioFramesPerChunk / this.audioSampleRate) * 1e6
+    let padUs = 0
+    if (this.audioChunkEndUs >= 0) {
+      const g = ptsUs - this.audioChunkEndUs
+      if (g > AUDIO_GAP_MIN_US) {
+        padUs = Math.min(g, AUDIO_GAP_MAX_US)
+        this.audioGapCount++
+        if (this.audioGapCount <= 3 || this.audioGapCount % 200 === 0) {
+          log_warn(
+            'wc-player',
+            `audio chunk pts gap ${(g / 1000).toFixed(1)}ms at ptsUs=${ptsUs} ` +
+              `(#${this.audioGapCount}) -> will pad silence`,
+          )
+        }
+      }
+    }
+    this.audioChunkEndUs = ptsUs + nominalUs
+    this.audioPadQueue.push(padUs)
     try {
       dec.decode(
         new EncodedAudioChunk({

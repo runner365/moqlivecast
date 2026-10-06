@@ -131,6 +131,14 @@ void QuicConnectionCryptoFlushHandshake(QuicConnection *conn);
 void QuicConnectionSetListener(QuicConnection *conn, void *listener);
 void* QuicConnectionGetListener(QuicConnection *conn);
 
+/* 本连接 TLS 握手协商出的 ALPN（如 "moq-lite-06"、"h3"）。
+ * 握手完成前、或对端未提供 ALPN 时返回空串（不是 NULL）。 */
+const char* QuicConnectionGetAlpn(QuicConnection *conn);
+
+/* 对端地址。握手完成回调里也能用（on_connection 之外还需要它的场合）。 */
+void QuicConnectionGetPeer(QuicConnection *conn, char *ip, size_t ip_len,
+                            int *port);
+
 /* 应用层数据指针（HTTP/3 server 用此获取 server 上下文） */
 void QuicConnectionSetAppData(QuicConnection *conn, void *data);
 void* QuicConnectionGetAppData(QuicConnection *conn);

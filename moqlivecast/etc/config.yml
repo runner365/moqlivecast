@@ -1,11 +1,37 @@
 moq_server:
   listenip: 0.0.0.0
   port: 4433
+  # 这一个 UDP 端口同时承载两种 moq-lite binding，靠握手时的 ALPN 分流：
+  #   h3          → binding 2，浏览器 WebTransport（版本走 CONNECT 头）
+  #   moq-lite-06 → binding 1，moq-cli / libmoq 的裸 QUIC（版本就是 ALPN 本身）
+  #
+  # ⚠️ 顺序就是服务端偏好（tls_common.c 的 alpn_select_cb 外层遍历本表），
+  # 必须 moq-lite-06 在前。libmoq 的 "Automatic (offer all)" 会把 h3 也一起
+  # offer 出去，h3 排前面的话它就被判成 WebTransport 客户端了。浏览器只
+  # offer h3，所以把 moq-lite-06 提前不影响浏览器。
+  #
+  # 不写这一项时默认是 [h3, quic-echo]。想留 quic-echo 的回环测试就把
+  # quic-echo 加回来 —— 但那样 moq-cli 也能协商上它，得自己确认不会误连。
+  # 注意：ALPN 在握手时协商，只能在 listen 之前一次给定，改完要重启。
+  alpn:
+    - moq-lite-06
+    - h3
+  # WebTransport（h3）的 URL 路径表。
   subpath:
     - desc: media format is flv
       path: flv
     - desc: media format is moq
       path: moq
+  # 裸 QUIC 的 moq-lite 路由表 —— 与上面那张**故意分开**。
+  # 这里的 path 是 moq-lite SETUP 的 Path 参数，即发布端的 origin：
+  #   moq --connect "moql://host:4433/anon" --broadcast "ford_100.hang"
+  # 里 origin 就是 anon，broadcast 名是该 origin 下的相对路径。
+  # 不写这一项时默认 [anon]，所以目标命令零配置可跑；写上是为了让这台
+  # 机器到底认哪几个入口在配置里一眼可见。第一条是「服务端默认路径」，
+  # 对端不带 Path 参数时用它。
+  moq_lite_subpath:
+    - desc: moq-lite anonymous entry
+      path: anon
   certfile: ""
   keyfile: ""
 
@@ -14,6 +40,11 @@ httpflv:
   port: 4433
 
 log:
+  # info 就够验 moq-lite 的落地链路了：流 key、catalog 各轨、首帧形状、
+  # "delivery started"、每 100 帧一条 delivered=N、以及会话关闭时的收尾摘要
+  # 全是 INFO。切到 debug 会多出 quic_crypto.c / quic_connection.c 的**逐包
+  # hex dump** —— 那部分是日志量的绝对大头（实测 3 MB / 80 秒），对验落地
+  # 没用。真要查组结构（GROUP 头那类只在 DEBUG）再临时切回来。
   level: info
   filename: /tmp/moqlivecast.log
   console: false

@@ -20,6 +20,54 @@ static uint64_t peer_send_credit(QuicStreamCtx *ctx, uint64_t sid) {
     return ctx->peer_init_max_stream_data_bidi_local;
 }
 
+/* ============================================
+ * MAX_STREAMS —— 给对端补 stream 额度
+ *
+ * RFC 9000 §4.6：MAX_STREAMS 给的是**累计**上限。对端每开一条流消耗一格，
+ * 流关掉也**不会**自动还回来 —— 只能我们主动再发一条更大的把它抬上去。
+ * 不问就不补的后果：对端开满 initial_max_streams_uni 之后**永久**开不出新流。
+ * moq-lite 恰好是「一个 group 一条 uni stream」（音频一帧一个 group，约 47 条/秒，
+ * 七分钟两万条），所以这个洞在它身上是致命的：播十几秒之后两个轨一起断，
+ * 而推流端还在正常推。
+ * ============================================ */
+
+/* 每次补的粒度。一条 MAX_STREAMS 才几个字节，但也没必要每开一条流补一次。 */
+#define QUIC_STREAM_CREDIT_CHUNK    256
+/* 剩余额度少于这个数就提前补，不等对端开口 */
+#define QUIC_STREAM_CREDIT_RESERVE   16
+
+/* 把对端的额度抬到「已开数 + CHUNK」。§4.6 要求单调，所以只涨不跌。 */
+static void quic_stream_grant_credit(QuicStreamCtx *ctx, void *conn, int bidi,
+                                     int (*queue_fn)(void *conn, const uint8_t *frames, size_t flen)) {
+    if (!queue_fn) return;
+    const uint64_t opened = bidi ? ctx->peer_bidi_opened : ctx->peer_uni_opened;
+    uint64_t *limit = bidi ? &ctx->max_streams_bidi_local : &ctx->max_streams_uni_local;
+    const uint64_t want = opened + QUIC_STREAM_CREDIT_CHUNK;
+    if (want <= *limit) return;      /* 只能涨 */
+    *limit = want;
+
+    uint8_t frm[16];
+    int flen = quic_frame_write_max_streams(frm, sizeof(frm), want, bidi);
+    if (flen > 0) queue_fn(conn, frm, (size_t)flen);
+    LOG_INFO("[quic-stream] grant %s streams: MAX_STREAMS=%llu (peer opened=%llu)",
+             bidi ? "bidi" : "uni", (unsigned long long)want,
+             (unsigned long long)opened);
+}
+
+/* 对端刚开了一条流：记账，额度快见底就补。
+ * 发起方判别沿用上面 peer_send_credit 的写法（本端是 server，对端是 client）。 */
+static void quic_stream_note_peer_stream(QuicStreamCtx *ctx, void *conn,
+                                         uint64_t stream_id,
+                                         int (*queue_fn)(void *conn, const uint8_t *frames, size_t flen)) {
+    if ((stream_id & 1ULL) == (ctx->next_local_bidi_id & 1ULL)) return;  /* 是本端发起的 */
+    const int bidi = (stream_id & 2ULL) == 0;
+    const uint64_t opened = bidi ? ++ctx->peer_bidi_opened : ++ctx->peer_uni_opened;
+    const uint64_t limit = bidi ? ctx->max_streams_bidi_local : ctx->max_streams_uni_local;
+    if (limit > 0 && opened + QUIC_STREAM_CREDIT_RESERVE > limit) {
+        quic_stream_grant_credit(ctx, conn, bidi, queue_fn);
+    }
+}
+
 static QuicStream* stream_find(QuicStreamCtx *ctx, uint64_t stream_id) {
     for (size_t i = 0; i < ctx->stream_cnt; i++) {
         if (ctx->streams[i] && ctx->streams[i]->stream_id == stream_id)
@@ -210,7 +258,7 @@ static int consume_send_buf(QuicStreamCtx *ctx, void *conn, QuicStream *s,
             uint64_t now_s = uv_now(uv_default_loop()) / 1000;
             if (now_s != dbg_last_s) {
                 dbg_last_s = now_s;
-                LOG_DEBUG("[quic-stream] consume stream=%llu pending=%zu "
+                LOG_WARN("[quic-stream] consume stream=%llu pending=%zu "
                          "stream_room=%llu (off=%llu max=%llu) "
                          "conn_room=%llu (sent=%llu peer_max=%llu)",
                          (unsigned long long)s->stream_id, s->send_buf_len,
@@ -225,10 +273,10 @@ static int consume_send_buf(QuicStreamCtx *ctx, void *conn, QuicStream *s,
         if (stream_room == 0) {
             const int already = s->send_blocked;
             s->send_blocked = 1;
-            LOG_DEBUG("[quic-stream] consume blocked: STREAM FC id=%llu off=%llu max=%llu",
+            LOG_WARN("[quic-stream] consume blocked: STREAM FC id=%llu off=%llu max=%llu",
                      (unsigned long long)s->stream_id, (unsigned long long)s->send_offset, (unsigned long long)s->send_max_data);
             if (!already) {
-                LOG_DEBUG("[quic-stream] stream FC blocked id=%llu off=%llu max=%llu pending=%zu",
+                LOG_WARN("[quic-stream] stream FC blocked id=%llu off=%llu max=%llu pending=%zu",
                          (unsigned long long)s->stream_id,
                          (unsigned long long)s->send_offset,
                          (unsigned long long)s->send_max_data,
@@ -245,13 +293,13 @@ static int consume_send_buf(QuicStreamCtx *ctx, void *conn, QuicStream *s,
         if (conn_room == 0) {
             const int already = s->send_blocked;
             s->send_blocked = 1;
-            LOG_DEBUG("[quic-stream] CONN FC BLOCKED stream=%llu sent=%llu peer_max=%llu pending=%zu",
+            LOG_WARN("[quic-stream] CONN FC BLOCKED stream=%llu sent=%llu peer_max=%llu pending=%zu",
                      (unsigned long long)s->stream_id,
                      (unsigned long long)ctx->bytes_sent,
                      (unsigned long long)ctx->max_data_peer,
                      s->send_buf_len);
             if (!already) {
-                LOG_DEBUG("[quic-stream] conn FC blocked stream=%llu "
+                LOG_WARN("[quic-stream] conn FC blocked stream=%llu "
                          "sent=%llu max_data_peer=%llu pending=%zu",
                          (unsigned long long)s->stream_id,
                          (unsigned long long)ctx->bytes_sent,
@@ -343,7 +391,7 @@ int quic_stream_write(QuicStreamCtx *ctx, void *conn, uint64_t stream_id,
     /* 水位背压：本次整段不接受，由上层队列保留 */
     if (len > 0 && s->send_buf_len + len > QUIC_STREAM_SEND_HIGH_WATER) {
         s->want_writable = 1;
-        LOG_DEBUG("[quic-stream] write congested stream=%llu pending=%zu +%zu high=%u, stream_id:%llu",
+        LOG_INFO("[quic-stream] write congested stream=%llu pending=%zu +%zu high=%u, stream_id:%llu",
                   (unsigned long long)stream_id, s->send_buf_len, len,
                   (unsigned)QUIC_STREAM_SEND_HIGH_WATER, (unsigned long long)s->stream_id);
         return 1;
@@ -385,7 +433,7 @@ int quic_stream_write(QuicStreamCtx *ctx, void *conn, uint64_t stream_id,
 
     if (ctx->last_quic_stream_dbg_ts_s != now_ms / 1000) {
         ctx->last_quic_stream_dbg_ts_s = now_ms / 1000;
-        LOG_DEBUG("[quic-stream] write stream %llu: %zu buffered offset=%llu, stream_id:%llu",
+        LOG_INFO("[quic-stream] write stream %llu: %zu buffered offset=%llu, stream_id:%llu",
                   (unsigned long long)stream_id,
                   s->send_buf_len, (unsigned long long)s->send_offset, (unsigned long long)s->stream_id);
     }
@@ -594,8 +642,13 @@ int quic_stream_on_recv(QuicStreamCtx *ctx, void *conn,
                          const uint8_t *data, size_t len,
                          int (*queue_fn)(void *conn, const uint8_t *frames, size_t flen),
                          void (*flush_fn)(void *conn)) {
+    const int is_new = (stream_find(ctx, stream_id) == NULL);
     QuicStream *s = stream_find_or_create(ctx, stream_id);
     if (!s) return -1;
+
+    /* 对端每开一条流，累计额度就少一格。这里记账并适时补 MAX_STREAMS ——
+     * 这是真正的兜底：不能指望对端一定发 STREAMS_BLOCKED 来提醒我们。 */
+    if (is_new) quic_stream_note_peer_stream(ctx, conn, stream_id, queue_fn);
 
     if (offset + len > s->recv_max_data) {
         LOG_ERROR("[quic-stream] recv flow control exceeded on stream %llu",
@@ -682,7 +735,7 @@ void quic_stream_on_max_stream_data(QuicStreamCtx *ctx,
     QuicStream *s = stream_find(ctx, stream_id);
     if (!s) { s = stream_find_or_create(ctx, stream_id); if (!s) return; }
     if (max_data > s->send_max_data) {
-        LOG_DEBUG("[quic-stream] MAX_STREAM_DATA id=%llu %llu -> %llu (off=%llu pending=%zu)",
+        LOG_INFO("[quic-stream] MAX_STREAM_DATA id=%llu %llu -> %llu (off=%llu pending=%zu)",
                  (unsigned long long)stream_id,
                  (unsigned long long)s->send_max_data,
                  (unsigned long long)max_data,
@@ -724,9 +777,17 @@ void quic_stream_on_stream_data_blocked(QuicStreamCtx *ctx,
                                          uint64_t stream_id, uint64_t limit) {
     (void)ctx; (void)stream_id; (void)limit;
 }
-void quic_stream_on_streams_blocked(QuicStreamCtx *ctx,
-                                     uint64_t max_streams, int bidi) {
-    (void)ctx; (void)max_streams; (void)bidi;
+void quic_stream_on_streams_blocked(QuicStreamCtx *ctx, void *conn,
+                                     uint64_t max_streams, int bidi,
+                                     int (*queue_fn)(void *conn, const uint8_t *frames, size_t flen)) {
+    const uint64_t limit = bidi ? ctx->max_streams_bidi_local : ctx->max_streams_uni_local;
+    const uint64_t opened = bidi ? ctx->peer_bidi_opened : ctx->peer_uni_opened;
+    LOG_INFO("[quic-stream] peer STREAMS_BLOCKED %s max=%llu (our limit=%llu, opened=%llu)",
+             bidi ? "bidi" : "uni", (unsigned long long)max_streams,
+             (unsigned long long)limit, (unsigned long long)opened);
+    /* 对端明说开不动了，照抬。我们的账本可能比对端撞墙时的值旧，
+     * 所以不拿 max_streams 去和 limit 比对 —— 无条件抬一次，反正只能涨。 */
+    quic_stream_grant_credit(ctx, conn, bidi, queue_fn);
 }
 
 /* ============================================
