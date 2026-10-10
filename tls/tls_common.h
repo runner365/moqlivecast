@@ -54,6 +54,31 @@ void tls_ctx_set_alpn(SSL_CTX *ctx);
  * 客户端 offer 那份不设 —— 服务端不用它。 */
 void tls_ctx_set_alpn_pref(SSL_CTX *ctx, TlsAlpnPref *pref);
 
+/* 把 C 字符串数组打包成 OpenSSL 要的 length-prefixed 拼接格式
+ * （即 TLS_ALPN_PROTO 那种 "\x02h3\x09quic-echo"）。
+ *
+ * 抽出来是因为有**两个**使用点，且不能共用 ctx：
+ *   SSL_CTX_set_alpn_protos(ctx, …) — 建连之前设，整条 ctx 生效；
+ *   SSL_set_alpn_protos(ssl, …)    — SSL 已由 SSL_new 建好时只能设它
+ *                                    （ctx 改了不会回灌已建的 SSL）。
+ * 返回写出的字节数；<=0 表示入参非法或无可用项。超长会告警并截断。 */
+int tls_alpn_pack(const char *const *protos, int count,
+                  unsigned char *out, size_t cap);
+
+/* 替换**客户端** offer 的 ALPN 列表。protos 是 C 字符串数组。
+ *
+ * 为什么需要它：tls_ctx_set_alpn() 给客户端装的是写死的 (h3 + quic-echo)
+ * （见 TLS_ALPN_PROTO）。裸 QUIC 的 moq-lite 客户端要 offer `moq-lite-06`，
+ * 而两边都 offer h3 时协商会落到 h3 —— 服务端于是按 WebTransport 处理，
+ * 等一个永远不来的 CONNECT。**症状是"看起来连上了但没有任何下文"**，
+ * 与当初 OBS 拨号那次（§12.7）同一种形态，所以必须能改。
+ *
+ * 顺序即 offer 顺序（SSL_CTX_set_alpn_protos 语义：客户端偏好从前往后）。
+ * 单个协议名最长 255；列表总长超过内部缓冲会**截断并告警**（不是静默丢）。
+ *
+ * ⚠️ 必须在 SSL 握手**发起之前**调用（客户端即 QuicConnectionConnect 之前）。 */
+void tls_ctx_set_alpn_list(SSL_CTX *ctx, const char *const *protos, int count);
+
 /* 限制 TLS 1.3 cipher suite（仅用于测试 cipher negotiation 路径）。
  * name 如 "TLS_AES_256_GCM_SHA384"、NULL 恢复默认。
  * 返回 0 成功，<0 失败。 */

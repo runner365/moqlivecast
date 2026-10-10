@@ -254,6 +254,47 @@ const char* QuicConnectionGetAlpn(QuicConnection *conn) {
     return conn ? conn->alpn_ : "";
 }
 
+int QuicConnectionSetAlpnList(QuicConnection *conn,
+                               const char *const *protos, int count) {
+    if (!conn || !conn->ssl_) return -1;
+
+    /* 已握手完成再改就没意义了（offer 早发出去了），明确拒绝而不是静默无效。 */
+    if (conn->handshake_done_) {
+        LOG_WARN("[quic-conn] SetAlpnList ignored: handshake already done (alpn=%s)",
+                 conn->alpn_[0] ? conn->alpn_ : "(none)");
+        return -1;
+    }
+
+    unsigned char buf[1024];
+    int off = tls_alpn_pack(protos, count, buf, sizeof(buf));
+    if (off <= 0) {
+        LOG_WARN("[quic-conn] SetAlpnList: no usable protocol names");
+        return -1;
+    }
+
+    /* 设 SSL 而不是 SSL_CTX：Create 里 SSL_new 已经发生，之后改 ctx 不会回灌。
+     * 用 SSL_set_alpn_protos 才能保证这条连接实际 offer 的是我们给的列表。 */
+    if (SSL_set_alpn_protos(conn->ssl_, buf, (unsigned int)off) != 0) {
+        LOG_ERROR("[quic-conn] SSL_set_alpn_protos failed");
+        return -1;
+    }
+
+    {
+        char joined[256];
+        size_t jp = 0;
+        joined[0] = '\0';
+        for (int i = 0; i < count && jp < sizeof(joined) - 2; i++) {
+            if (!protos[i] || !protos[i][0]) continue;
+            int w = snprintf(joined + jp, sizeof(joined) - jp, "%s%s",
+                             jp ? "," : "", protos[i]);
+            if (w < 0) break;
+            jp += (size_t)w;
+        }
+        LOG_INFO("[quic-conn] client ALPN offer: [%s]", joined);
+    }
+    return 0;
+}
+
 void QuicConnectionGetPeer(QuicConnection *conn, char *ip, size_t ip_len,
                             int *port) {
     if (!conn) {
@@ -2458,7 +2499,7 @@ rollback:
                                                               payload_len - pos,
                                                               &sid, &ec, &fs);
                     if (consumed < 0) break;
-                    quic_stream_on_reset(&conn->stream_ctx_, sid, fs);
+                    quic_stream_on_reset(&conn->stream_ctx_, sid, fs, ec);
                     break;
                 }
                 case QUIC_FRAME_STOP_SENDING: {
@@ -2716,6 +2757,12 @@ int QuicConnectionStreamStopSending(QuicConnection *conn, uint64_t stream_id,
 void QuicConnectionSetOnStreamData(QuicConnection *conn,
                                    QuicConnectionOnStreamData cb) {
     conn->stream_ctx_.on_stream_data = cb;
+}
+
+void QuicConnectionSetOnStreamReset(QuicConnection *conn,
+                                    QuicConnectionOnStreamReset cb) {
+    conn->stream_ctx_.on_stream_reset      = cb;
+    conn->stream_ctx_.on_stream_reset_conn = cb ? conn : NULL;
 }
 
 /* ============================================

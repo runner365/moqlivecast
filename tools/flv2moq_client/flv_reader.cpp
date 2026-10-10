@@ -60,7 +60,8 @@ struct FlvReader::Sink : public cpp_streamer::CppStreamerInterface {
         if (cts < 0) {
             owner->neg_cts_++;
             if (owner->neg_cts_ <= 3) {
-                LOG_WARN("[flv2moq] 异常：CTS 为负 (dts=%lld pts=%lld cts=%lld)，已钳为 0",
+                LOG_WARN("[flv2moq] abnormal CTS: negative (dts=%lld pts=%lld "
+                         "cts=%lld), clamped to 0",
                         static_cast<long long>(pkt->dts_),
                         static_cast<long long>(pkt->pts_),
                         static_cast<long long>(cts));
@@ -80,8 +81,9 @@ struct FlvReader::Sink : public cpp_streamer::CppStreamerInterface {
                 owner->dropped_codec_++;
                 if (!owner->warned_codec_) {
                     owner->warned_codec_ = true;
-                    LOG_WARN("[flv2moq] 仅支持 H.264 视频，当前 codec_type=%d，"
-                             "后续非 H.264 视频帧将被丢弃",
+                    LOG_WARN("[flv2moq] only H.264 video is supported "
+                             "(codec_type=%d); further non-H.264 video frames "
+                             "will be dropped",
                             static_cast<int>(pkt->codec_type_));
                 }
                 return 0;
@@ -115,19 +117,19 @@ struct FlvReader::Sink : public cpp_streamer::CppStreamerInterface {
 bool CheckFlvMagic(const std::string &path, std::string &err) {
     FILE *fp = fopen(path.c_str(), "rb");
     if (!fp) {
-        err = "无法打开文件";
+        err = "cannot open file";
         return false;
     }
     uint8_t head[9];
     size_t n = fread(head, 1, sizeof(head), fp);
     fclose(fp);
     if (n < 9) {
-        err = "文件小于 9 字节，不是 FLV";
+        err = "file is smaller than 9 bytes, not an FLV";
         return false;
     }
     if (head[0] != 'F' || head[1] != 'L' || head[2] != 'V') {
         char buf[64];
-        snprintf(buf, sizeof(buf), "文件头不是 \"FLV\" (读到 %02x %02x %02x)",
+        snprintf(buf, sizeof(buf), "file header is not \"FLV\" (read %02x %02x %02x)",
                  head[0], head[1], head[2]);
         err = buf;
         return false;
@@ -146,7 +148,7 @@ int FlvReader::Open(const std::string &path) {
     path_ = path;
     fp_ = fopen(path.c_str(), "rb");
     if (!fp_) {
-        LOG_ERROR("[flv2moq] 无法打开文件: %s", path.c_str());
+        LOG_ERROR("[flv2moq] cannot open file: %s", path.c_str());
         return -1;
     }
     /* 这里刻意不解析 —— 连接建立后才由 publisher 驱动 Fill()。
@@ -175,7 +177,7 @@ bool FlvReader::Fill() {
                 reinterpret_cast<const char *>(buf.data()), n);
             int ret = demux_->SourceData(pkt);
             if (ret < 0) {
-                LOG_ERROR("[flv2moq] FLV 解析失败 (ret=%d)", ret);
+                LOG_ERROR("[flv2moq] FLV parse failed (ret=%d)", ret);
                 eof_ = true;
                 return false;
             }
@@ -184,7 +186,7 @@ bool FlvReader::Fill() {
         }
         if (n < buf.size()) {
             if (ferror(fp_)) {
-                LOG_ERROR("[flv2moq] 读取错误: %s", path_.c_str());
+                LOG_ERROR("[flv2moq] read error: %s", path_.c_str());
             }
             eof_ = true;
             return !queue_.empty();

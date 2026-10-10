@@ -89,6 +89,15 @@ int      QuicConnectionStreamStopSending(QuicConnection *conn, uint64_t stream_i
 void     QuicConnectionSetOnStreamData(QuicConnection *conn,
                                        QuicConnectionOnStreamData cb);
 
+/* 对端 **RESET_STREAM** 某条流时回调（error_code = 对端的应用错误码）。
+ *
+ * 为什么需要：RESET_STREAM 是 QUIC 的流级「这个请求作废了」信号，应用协议
+ * 常拿它当拒绝用 —— moq-lite-06 拒绝订阅就是 reset 那条 bidi 流，**不发任何
+ * 消息**。没有这个通知，上层只能靠超时，而且分不清「被拒」与「对端卡住」。
+ * 只在对端主动 reset 时触发；我们自己的 StreamReset/StreamCloseSend 不触发。 */
+void     QuicConnectionSetOnStreamReset(QuicConnection *conn,
+                                        QuicConnectionOnStreamReset cb);
+
 /* 访问器 */
 uv_loop_t*          QuicConnectionGetLoop(QuicConnection *conn);
 QuicState           QuicConnectionGetState(QuicConnection *conn);
@@ -134,6 +143,19 @@ void* QuicConnectionGetListener(QuicConnection *conn);
 /* 本连接 TLS 握手协商出的 ALPN（如 "moq-lite-06"、"h3"）。
  * 握手完成前、或对端未提供 ALPN 时返回空串（不是 NULL）。 */
 const char* QuicConnectionGetAlpn(QuicConnection *conn);
+
+/* 设置**客户端** offer 的 ALPN 列表（protos 为 C 字符串数组）。
+ *
+ * 不设时用 tls_ctx_set_alpn() 的写死默认（h3 + quic-echo）。裸 QUIC 客户端
+ * 必须显式设成 moq-lite-06：对端只 offer 一个协议时协商不上会直接 alert 120；
+ * 而两边都 offer h3 时又会协商到 h3（服务端按 WebTransport 处理 → 等一个
+ * 永远不来的 CONNECT，症状是"连上了但没下文"，很难查）。
+ *
+ * ⚠️ 必须在 QuicConnectionConnect() / 握手发起**之前**调用 —— 内部设的是
+ * 已由 SSL_new 建好的 SSL 对象（改 SSL_CTX 不会回灌已建的 SSL）。
+ * 返回 0 成功，<0 失败（入参非法或无可用项）。 */
+int QuicConnectionSetAlpnList(QuicConnection *conn,
+                               const char *const *protos, int count);
 
 /* 对端地址。握手完成回调里也能用（on_connection 之外还需要它的场合）。 */
 void QuicConnectionGetPeer(QuicConnection *conn, char *ip, size_t ip_len,

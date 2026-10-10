@@ -751,8 +751,16 @@ void quic_stream_on_max_streams(QuicStreamCtx *ctx, uint64_t max_streams, int bi
 }
 
 void quic_stream_on_reset(QuicStreamCtx *ctx, uint64_t stream_id,
-                           uint64_t final_size) {
+                           uint64_t final_size, uint64_t error_code) {
     QuicStream *s = stream_find(ctx, stream_id);
+    /* ⚠️ 通知**在 s 的判空之前**：对端可以 reset 一条我们还没建过记录的流
+     * （比如它拒掉一个请求时那条流只在我们这边发过、没收到过数据 ——
+     * stream_find_or_create 只在收到 STREAM 帧时才建）。那样 s 是 NULL，
+     * 但上层仍然需要知道「它拒了」这个事实，否则就卡在原地等一个永不到来的
+     * 应答。 */
+    if (ctx->on_stream_reset)
+        ctx->on_stream_reset(ctx->on_stream_reset_conn, stream_id, error_code);
+
     if (!s) return;
     s->recv_state = QUIC_STREAM_RECV_RESET_RECVD;
     s->recv_offset = final_size;

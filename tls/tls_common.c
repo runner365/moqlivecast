@@ -267,6 +267,70 @@ void tls_ctx_set_alpn_pref(SSL_CTX *ctx, TlsAlpnPref *pref) {
     SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, pref);
 }
 
+int tls_alpn_pack(const char *const *protos, int count,
+                  unsigned char *out, size_t cap) {
+    if (!protos || count <= 0 || !out || cap == 0) return 0;
+
+    size_t off = 0;
+    int used = 0;
+
+    for (int i = 0; i < count; i++) {
+        const char *p = protos[i];
+        if (!p) continue;
+        size_t n = strlen(p);
+        if (n == 0) continue;
+        if (n > 255) {
+            LOG_WARN("[tls] ALPN entry too long (%zu bytes), skipped: %.32s...", n, p);
+            continue;
+        }
+        if (off + 1 + n > cap) {
+            /* 截断要出声：静默丢弃会让对端"看起来 offer 过"其实没有，
+             * 与 §12.1 那个歧义同类，排查时极贵。 */
+            LOG_WARN("[tls] ALPN list truncated: kept %d of %d (>%zu bytes)",
+                     used, count, cap);
+            break;
+        }
+        out[off++] = (unsigned char)n;
+        memcpy(out + off, p, n);
+        off += n;
+        used++;
+    }
+
+    return used > 0 ? (int)off : 0;
+}
+
+void tls_ctx_set_alpn_list(SSL_CTX *ctx, const char *const *protos, int count) {
+    if (!ctx || !protos || count <= 0) return;
+
+    /* 缓冲开大一点：moq-cli 那种 "Automatic (offer all)" 一次要 offer
+     * 十几个版本号（实测 14 个、约 100 字节）。 */
+    unsigned char buf[1024];
+    int off = tls_alpn_pack(protos, count, buf, sizeof(buf));
+    if (off <= 0) {
+        LOG_WARN("[tls] ALPN list is empty, keeping the default offer");
+        return;
+    }
+
+    if (SSL_CTX_set_alpn_protos(ctx, buf, (unsigned int)off) != 0) {
+        LOG_WARN("[tls] SSL_CTX_set_alpn_protos failed");
+        return;
+    }
+
+    {
+        char joined[256];
+        size_t jp = 0;
+        joined[0] = '\0';
+        for (int i = 0; i < count && jp < sizeof(joined) - 2; i++) {
+            if (!protos[i] || !protos[i][0]) continue;
+            int w = snprintf(joined + jp, sizeof(joined) - jp, "%s%s",
+                             jp ? "," : "", protos[i]);
+            if (w < 0) break;
+            jp += (size_t)w;
+        }
+        LOG_INFO("[tls] client ALPN offer set: [%s]", joined);
+    }
+}
+
 int tls_ctx_set_ciphersuite(SSL_CTX *ctx, const char *name) {
     if (!name) return 0;  /* NULL = 恢复默认 */
 

@@ -165,10 +165,12 @@ static void TrackInfo() {
 
     /* 非零 priority 也是 1 字节（u8 而非 varint）—— 这是那个「多一个字节」的
      * 错误最可能藏身的地方：priority=7 在 u8 下还是 `07`，在 varint 下也是
-     * `07`，但 priority=200 在 u8 下是 `C8`、在 varint 下是 `40 C8`。 */
+     * `07`，但 priority=200 在 u8 下是 `C8`、在 varint 下是 `40 C8`。
+     * ⚠️ 长度字段只数 body：priority(1) + max_age=0(1) + timescale=1000(2)
+     * = 4，不是 5。（max_age/timescale 的字节数不含在长度里，别把它自己算进去。） */
     std::vector<uint8_t> big;
     ok(MlBuildTrackInfo(big, 200, 0, 1000), "build TRACK_INFO priority=200");
-    BytesEq(big, Bytes({0x05, 0xC8, 0x00, 0x43, 0xE8}),
+    BytesEq(big, Bytes({0x04, 0xC8, 0x00, 0x43, 0xE8}),
             "TRACK_INFO priority is u8, not varint (200 -> C8)");
 }
 
@@ -196,7 +198,7 @@ static void Announce() {
     /* 带 suffix 的一形（前缀不完全匹配时才有），顺带验证 (s) 的长度前缀。 */
     { std::vector<uint8_t> out;
       ok(MlAppendAnnounceStart(out, "hang", 0, 0), "build ANNOUNCE_START suffix=hang");
-      BytesEq(out, Bytes({0x00, 0x09, 0x04, 'h', 'a', 'n', 'g',
+      BytesEq(out, Bytes({0x00, 0x08, 0x04, 'h', 'a', 'n', 'g',
                           0x00, 0x00, 0x00}),
               "ANNOUNCE_START suffix=\"hang\""); }
 
@@ -216,13 +218,15 @@ static void Subscribe() {
       ok(MlBuildSubscribeStart(out, 0), "build SUBSCRIBE_START");
       BytesEq(out, Bytes({0x00, 0x01, 0x00}), "SUBSCRIBE_START group=0"); }
 
+    /* ⚠️ group=1000 是 **2** 字节 varint（43 E8），所以长度字段是 02。
+     * 手写向量时最容易把它写成 03（把长度字段自己也数进去）。 */
     { std::vector<uint8_t> out;
       ok(MlBuildSubscribeStart(out, 1000), "build SUBSCRIBE_START group=1000");
-      BytesEq(out, Bytes({0x00, 0x03, 0x43, 0xE8}), "SUBSCRIBE_START group=1000"); }
+      BytesEq(out, Bytes({0x00, 0x02, 0x43, 0xE8}), "SUBSCRIBE_START group=1000"); }
 
     { std::vector<uint8_t> out;
       ok(MlBuildSubscribeEnd(out, 1000), "build SUBSCRIBE_END");
-      BytesEq(out, Bytes({0x01, 0x03, 0x43, 0xE8}), "SUBSCRIBE_END group=1000"); }
+      BytesEq(out, Bytes({0x01, 0x02, 0x43, 0xE8}), "SUBSCRIBE_END group=1000"); }
 }
 
 static void GroupAndFrame() {
@@ -239,7 +243,7 @@ static void GroupAndFrame() {
      * 第一个 FRAME 的时间戳差整体错位。用非零值断言它确实在。 */
     { std::vector<uint8_t> out;
       ok(MlBuildGroupHeader(out, 1, 1000, 7), "build GROUP header seq=1000 fs=7");
-      BytesEq(out, Bytes({0x05, 0x01, 0x43, 0xE8, 0x07}),
+      BytesEq(out, Bytes({0x04, 0x01, 0x43, 0xE8, 0x07}),
               "GROUP sub=1 seq=1000 frame_start=7"); }
 
     /* FRAME：差 + 长度 + 载荷，背靠背，没有类型字节。 */
@@ -271,7 +275,10 @@ static void GroupAndFrame() {
         const uint8_t f2[2] = {0x05, 0x06};
         MlAppendFrame(out, 40, f2, sizeof(f2));
 
-        ok(out.size() == 1 + 4 + 6 + 4, "group stream total length");
+        /* ⚠️ 第二帧的差是 40 → zigzag 80 → **2** 字节（>63 换档），
+         * 所以那一帧是 2+1+2 = 5 而不是 4。手算时按「差总是 1 字节」就会
+         * 少算这一格 —— 这正是这条断言要盯的。 */
+        ok(out.size() == 1 + 4 + 6 + 5, "group stream total length");
 
         size_t pos = 0;
         uint64_t st = 0;

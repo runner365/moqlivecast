@@ -18,16 +18,19 @@
 ## 架构
 
 ```
-浏览器  --WebTransport / HTTPS-->  moqlivecast
-                                      |
-                                      v
-                              MediaStreamManager
-                                      |
-                         +------------+------------+
-                         |            |            |
-                      MoQ 推流     WT FLV       HTTP-FLV
-                      MoQ 拉流     WT FLV 拉流     拉流
+   推流端                                    服务端                       拉流端
+
+   浏览器                          ┌──────────────────────┐      浏览器
+   WebTransport / HTTPS ──────────>│      moqlivecast     │─────> WebTransport / HTTPS
+                                   │          │           │
+   ffmpeg ──FLV──> moq ───────────>│          v           │─────> moq ──> ffmpeg
+   (libmoq, moq-lite-06)           │ MediaStreamManager   │      (libmoq, moq-lite-06)
+                                   │      + GOP 缓存      │
+                                   └──────────────────────┘─────> HTTP-FLV 拉流
 ```
+
+浏览器那条路与 `ffmpeg + moq` 那条路**共用同一个 UDP 端口**：服务端在握手时按
+ALPN 分流（`h3` → WebTransport，`moq-lite-06` → 裸 QUIC）。两条路都既能推流也能拉流。
 
 协议栈（QUIC / HTTP/3 / WebTransport）位于 `quic/` 和 `http3/`，
 **直接构建在 libuv 与 OpenSSL 之上**——没有依赖任何现成的 QUIC 库。
@@ -163,7 +166,9 @@ Vite 默认监听 `http://127.0.0.1:5174`。
 |---|---|
 | `quic/` `http3/` | C 协议栈（QUIC、HTTP/3、WebTransport），直接构建在 libuv + OpenSSL 之上 |
 | `moqlivecast/` | C++ 直播服务端 |
+| `moqlite/` | moq-lite-06 客户端 C 库（裸 QUIC）—— **[推流客户端开发指南](moqlite/how_to_use_moq_lite_c_api_CN.md)** · [English](moqlite/how_to_use_moq_lite_c_api.md) |
 | `tools/moq_js_client/` | 浏览器推流 / 拉流 Demo |
+| `tools/flv2moqlite_client/` | FLV 文件 → moq-lite 推流（C++，用的就是 `moqlite/` 的 C API）|
 | `http3/wt_chat_js_client/` | WebTransport 信令 Demo（配套 `wt_chat_server`） |
 | `udp/` `tls/` | 独立的 UDP / TLS echo 示例（不在服务端主路径上） |
 | `3rdparty/` | libuv、OpenSSL、yaml-cpp |

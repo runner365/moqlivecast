@@ -14,16 +14,20 @@ A live media stack built on a from-scratch C implementation of QUIC, HTTP/3, and
 ## Architecture
 
 ```
-Browser  --WebTransport / HTTPS-->  moqlivecast
-                                      |
-                                      v
-                              MediaStreamManager
-                                      |
-                         +------------+------------+
-                         |            |            |
-                      MoQ Push    WT FLV      HTTP-FLV
-                      MoQ Pull    WT FLV Pull    Pull
+   Ingest                                        Server                     Playback
+
+   Browser                          ┌──────────────────────┐      Browser
+   WebTransport / HTTPS ───────────>│     moqlivecast      │─────> WebTransport / HTTPS
+                                    │          │           │
+   ffmpeg ──FLV──> moq ────────────>│          v           │─────> moq ──> ffmpeg
+   (libmoq, moq-lite-06)            │ MediaStreamManager   │      (libmoq, moq-lite-06)
+                                    │      + GOP cache     │
+                                    └──────────────────────┘─────> HTTP-FLV pull
 ```
+
+The browser path and the `ffmpeg + moq` path **share one UDP port**: the server
+splits them by handshake ALPN (`h3` → WebTransport, `moq-lite-06` → raw QUIC).
+Both carry push and pull.
 
 The protocol stack (QUIC, HTTP/3, WebTransport) lives under `quic/` and `http3/`, built directly on libuv and OpenSSL — no third-party QUIC library is used. Live ingest, GOP cache, and per-protocol writers live under `moqlivecast/`.
 
@@ -160,7 +164,9 @@ draft specifies and it will not interoperate.
 |---|---|
 | `quic/` `http3/` | C protocol stack (QUIC, HTTP/3, WebTransport), built on libuv + OpenSSL |
 | `moqlivecast/` | C++ live server |
+| `moqlite/` | moq-lite-06 C client library (bare QUIC) — **[guide: writing a push client](moqlite/how_to_use_moq_lite_c_api.md)** · [中文](moqlite/how_to_use_moq_lite_c_api_CN.md) |
 | `tools/moq_js_client/` | Browser publish / play demo |
+| `tools/flv2moqlite_client/` | FLV file → moq-lite push (C++, uses the `moqlite/` C API) |
 | `http3/wt_chat_js_client/` | WebTransport signaling demo (with `wt_chat_server`) |
 | `udp/` `tls/` | Standalone UDP / TLS echo samples (not on the server's main path) |
 | `3rdparty/` | libuv, OpenSSL, yaml-cpp |

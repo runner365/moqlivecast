@@ -168,6 +168,10 @@ typedef void (*QuicListenerOnConnection)(QuicListener *listener,
 typedef void (*QuicConnectionOnStreamData)(QuicConnection *conn,
     uint64_t stream_id, const uint8_t *data, size_t len, int fin);
 
+/* 对端 RESET_STREAM 某条流（见 quic_connection.h 的说明）。 */
+typedef void (*QuicConnectionOnStreamReset)(QuicConnection *conn,
+    uint64_t stream_id, uint64_t error_code);
+
 typedef void (*QuicConnectionOnDatagram)(QuicConnection *conn,
     const uint8_t *data, size_t len);
 

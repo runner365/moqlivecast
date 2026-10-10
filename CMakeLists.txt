@@ -336,6 +336,68 @@ target_link_libraries(webtransport_client PUBLIC uv_a ssl crypto)
 add_dependencies(webtransport_client ssl crypto)
 
 # ============================================
+# 裸 QUIC 客户端的 ALPN 回归验证
+#
+# 服务端一个端口靠 ALPN 分流（moq-lite-06 → 裸 QUIC，h3 → WebTransport）。
+# 客户端 ALPN 曾是写死的 h3+quic-echo，导致裸 QUIC 客户端被当成 WebTransport
+# （症状：连上了但没下文）。这个程序握手后读回协商结果并与期望比对。
+#
+#   ./quic_alpn_client                        # 期望 moq-lite-06
+#   ./quic_alpn_client 127.0.0.1 4433 h3      # 反例，期望 h3
+# ============================================
+add_executable(quic_alpn_client
+    quic/quic_alpn_client.c
+    ${UDP_COMMON_SOURCES} ${TLS_COMMON_SOURCES}
+    ${QUIC_COMMON_SOURCES} ${LOGGER_SOURCES})
+target_link_libraries(quic_alpn_client PRIVATE uv_a ssl crypto)
+target_include_directories(quic_alpn_client PRIVATE
+    3rdparty/libuv/include
+    ${OPENSSL_INSTALL_DIR}/include
+    udp
+    tls
+    quic
+    quic/congestion_control
+    logger
+)
+add_dependencies(quic_alpn_client ssl crypto)
+
+# ============================================
+# moq-lite-06 客户端 C API（moqlite/）
+#
+# 形态参考 libmoq 的 C API（整数句柄、回调驱动、无裸指针可解引用）。承载是
+# **裸 QUIC**（ALPN moq-lite-06），建在 quic/quic_client_api 之上 —— 所以
+# QUIC_COMMON_SOURCES 里必须包含 quic_client_api.c。
+#
+# 头文件：moqlite/moq_lite_client.h（调用方只需要这一个）。
+# 自测：build/bin/moq_lite_wire_test（不依赖 libuv/OpenSSL，可独立编译）。
+# 使用者 / 端到端验证：tools/flv2moqlite_client（C++，FLV 文件 → moq-lite 推流）
+# ============================================
+add_library(moqlite_client_core STATIC
+    moqlite/moq_lite_wire.c
+    moqlite/moq_lite_client.c
+    ${UDP_COMMON_SOURCES} ${TLS_COMMON_SOURCES}
+    ${QUIC_COMMON_SOURCES} ${LOGGER_SOURCES})
+target_link_libraries(moqlite_client_core PUBLIC uv_a ssl crypto)
+target_include_directories(moqlite_client_core PUBLIC
+    3rdparty/libuv/include
+    ${OPENSSL_INSTALL_DIR}/include
+    moqlite
+    udp
+    tls
+    quic
+    quic/congestion_control
+    logger
+)
+add_dependencies(moqlite_client_core ssl crypto)
+
+# 线编码自测 —— 只编 moq_lite_wire.c，**不链接** libuv/OpenSSL。
+add_executable(moq_lite_wire_test
+    moqlite/moq_lite_wire_test.c
+    moqlite/moq_lite_wire.c)
+target_include_directories(moq_lite_wire_test PRIVATE moqlite)
+
+
+# ============================================
 # WebTransport Client API echo 测试
 # ============================================
 add_executable(wt_client_echo
@@ -437,6 +499,12 @@ target_include_directories(udp_jitter_proxy PRIVATE
 # 依赖上面的 webtransport_client 静态库
 # ============================================
 add_subdirectory(tools/flv2moq_client)
+
+# ============================================
+# flv2moqlite_client（FLV 文件 → moq-lite-06 推流）
+# 依赖上面的 moqlite_client_core 静态库；FLV 解封装复用服务端的 FlvDemuxer。
+# ============================================
+add_subdirectory(tools/flv2moqlite_client)
 
 # ============================================
 # Media over WebTransport（C++ 服务端）

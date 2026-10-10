@@ -121,6 +121,19 @@ typedef struct {
     uint64_t     peer_init_max_stream_data_bidi_remote;
     uint64_t     peer_init_max_stream_data_uni;
     QuicConnectionOnStreamData on_stream_data;
+    /* 对端 reset 某条接收流时通知（RFC 9000 §19.4 RESET_STREAM）。
+     * 参数 error_code 是对端的应用错误码。**只在收到对端的 RESET_STREAM
+     * 时触发**，我们自己 reset 不触发（那个方向调用方本来就知道）。
+     *
+     * 为什么必须有：RESET_STREAM 是 QUIC 层的流级信号，很多应用协议拿它当
+     * 「这个请求被拒了 / 我放弃这条流了」用 —— moq-lite-06 就是（拒绝订阅
+     * **不是**一条消息，是直接 reset 那条 bidi 流，见 §5.2）。没有这个通知，
+     * 上层只能靠超时猜，而且分不清「被拒」和「对端卡住」。 */
+    QuicConnectionOnStreamReset on_stream_reset;
+    /* 传给 on_stream_reset 的第一个参数。quic_stream_on_reset 只有 ctx 和
+     * stream_id 两个抓手，拿不到 conn，所以这里单独存一份（在设置
+     * on_stream_data 的地方一并设置）。 */
+    void *on_stream_reset_conn;
     int flushing_;  /* flush_pending 防重入 */
     int64_t last_quic_stream_dbg_ts_s;
 } QuicStreamCtx;
@@ -179,7 +192,8 @@ void quic_stream_on_max_stream_data(QuicStreamCtx *ctx, uint64_t stream_id, uint
 void quic_stream_apply_init_send_credit(QuicStreamCtx *ctx);
 void quic_stream_on_max_streams(QuicStreamCtx *ctx, uint64_t max_streams, int bidi);
 
-void quic_stream_on_reset(QuicStreamCtx *ctx, uint64_t stream_id, uint64_t final_size);
+void quic_stream_on_reset(QuicStreamCtx *ctx, uint64_t stream_id,
+                           uint64_t final_size, uint64_t error_code);
 void quic_stream_on_stop_sending(QuicStreamCtx *ctx, void *conn, uint64_t stream_id,
                                   int (*queue_fn)(void *conn, const uint8_t *frames, size_t flen),
                                   void (*flush_fn)(void *conn));
