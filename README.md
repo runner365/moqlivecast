@@ -9,6 +9,8 @@ A live media stack built on a from-scratch C implementation of QUIC, HTTP/3, and
 - **MoQ Push / Pull** over WebTransport
 - **WebTransport FLV** Push / Pull
 - **HTTP-FLV Pull** on the same port as WebTransport (UDP + TCP)
+- **Android push client** — Camera2 + mic → H.264/AAC → moq-lite over raw QUIC
+  (see the [Android guide](tools/android/how_to_use_android_moqlit_push.md))
 - Shared `MediaStreamManager` with per-stream GOP cache, so a late subscriber can start from the last keyframe
 
 ## Architecture
@@ -106,6 +108,29 @@ Vite listens on `http://127.0.0.1:5174`.
 
 After changing C++ code, rebuild and restart `moqlivecast`. The browser demo does not pick up a new server by itself.
 
+### Android push demo
+
+`tools/android/` is a complete push client: Camera2 + microphone → MediaCodec
+H.264/AAC → the `moqlite/` C API → raw QUIC (`moq-lite-06`) → `moqlivecast`.
+It is also the reference for the Android JNI/lifecycle plumbing.
+
+```bash
+bash tools/android/build_openssl_android.sh        # once per clean tree
+cd tools/android && ./gradlew :app:assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+In the app, enter the server's **LAN IP** (e.g. `moql://192.168.1.143:4433/anon`)
+and a broadcast name (default `android.hang`), grant camera + microphone, and
+press **Start**. Pull it in the browser demo at `/moq-pull` with:
+
+```
+https://<server-host>:4433/moq?app=anon&stream=android.hang
+```
+
+Full build options, source map, invariants and troubleshooting:
+**[tools/android/how_to_use_android_moqlit_push.md](tools/android/how_to_use_android_moqlit_push.md)**.
+
 ## Wire protocol: how our streams map to the spec
 
 We follow the stream taxonomy of **[draft-ietf-moq-transport](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/)
@@ -166,6 +191,7 @@ draft specifies and it will not interoperate.
 | `moqlivecast/` | C++ live server |
 | `moqlite/` | moq-lite-06 C client library (bare QUIC) — **[guide: writing a push client](moqlite/how_to_use_moq_lite_c_api.md)** · [中文](moqlite/how_to_use_moq_lite_c_api_CN.md) |
 | `tools/moq_js_client/` | Browser publish / play demo |
+| `tools/android/` | Android push client (Camera2 + mic → moq-lite) — **[guide](tools/android/how_to_use_android_moqlit_push.md)** |
 | `tools/flv2moqlite_client/` | FLV file → moq-lite push (C++, uses the `moqlite/` C API) |
 | `http3/wt_chat_js_client/` | WebTransport signaling demo (with `wt_chat_server`) |
 | `udp/` `tls/` | Standalone UDP / TLS echo samples (not on the server's main path) |

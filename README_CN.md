@@ -12,6 +12,8 @@
 - **MoQ 推流 / 拉流**（基于 WebTransport）
 - **WebTransport FLV** 推流 / 拉流
 - **HTTP-FLV 拉流**，与 WebTransport 共用同一端口（UDP + TCP）
+- **Android 推流客户端** —— Camera2 + 麦克风 → H.264/AAC → moq-lite（裸 QUIC）
+  （见 [Android 使用指南](tools/android/how_to_use_android_moqlit_push.md)）
 - 共享 `MediaStreamManager` + 每路流的 **GOP 缓存**：
   新订阅者可以从最近的关键帧开始播放，不用干等下一个关键帧
 
@@ -118,6 +120,29 @@ Vite 默认监听 `http://127.0.0.1:5174`。
 > 修改 C++ 代码后需要重新编译并重启 `moqlivecast`；
 > 浏览器 Demo 不会自动连接新启动的服务端。
 
+### Android 推流 Demo
+
+`tools/android/` 是一个完整的 Android 推流客户端：Camera2 + 麦克风 → MediaCodec
+H.264/AAC → `moqlite/` 的 C API → 裸 QUIC（`moq-lite-06`）→ `moqlivecast`。
+它同时也是 Android 侧 JNI / 生命周期的参考实现。
+
+```bash
+bash tools/android/build_openssl_android.sh        # 每次干净构建前跑一次
+cd tools/android && ./gradlew :app:assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+在 App 里填服务端的**局域网 IP**（例如 `moql://192.168.1.143:4433/anon`）和广播名
+（默认 `android.hang`），授予摄像头 + 麦克风权限，点 **Start**。然后在浏览器
+Demo 的 `/moq-pull` 里拉：
+
+```
+https://<server-host>:4433/moq?app=anon&stream=android.hang
+```
+
+完整构建选项、源码地图、必须遵守的不变量和排错表：
+**[tools/android/how_to_use_android_moqlit_push.md](tools/android/how_to_use_android_moqlit_push.md)**。
+
 ## 线格式：我们的流与规范的对应关系
 
 我们跟随 **[draft-ietf-moq-transport](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/)
@@ -168,6 +193,7 @@ Vite 默认监听 `http://127.0.0.1:5174`。
 | `moqlivecast/` | C++ 直播服务端 |
 | `moqlite/` | moq-lite-06 客户端 C 库（裸 QUIC）—— **[推流客户端开发指南](moqlite/how_to_use_moq_lite_c_api_CN.md)** · [English](moqlite/how_to_use_moq_lite_c_api.md) |
 | `tools/moq_js_client/` | 浏览器推流 / 拉流 Demo |
+| `tools/android/` | Android 推流客户端（Camera2 + 麦克风 → moq-lite）—— **[使用指南](tools/android/how_to_use_android_moqlit_push.md)** |
 | `tools/flv2moqlite_client/` | FLV 文件 → moq-lite 推流（C++，用的就是 `moqlite/` 的 C API）|
 | `http3/wt_chat_js_client/` | WebTransport 信令 Demo（配套 `wt_chat_server`） |
 | `udp/` `tls/` | 独立的 UDP / TLS echo 示例（不在服务端主路径上） |

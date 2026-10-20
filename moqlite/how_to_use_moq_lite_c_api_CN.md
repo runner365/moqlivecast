@@ -364,6 +364,5 @@ cmake --build build --target moqlite_client_core
 
 | 想了解 | 看 |
 |---|---|
-| 协议细节与实测记录 | `docs/moq-transport-gap.md` §13 / §14 |
 | 完整的推流实现（FLV → moq-lite） | `tools/flv2moqlite_client/` |
 | 线编码与字节级自测 | `moqlite/moq_lite_wire.h`、`moqlite/moq_lite_wire_test.c` |

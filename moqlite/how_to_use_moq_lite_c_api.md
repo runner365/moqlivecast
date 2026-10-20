@@ -398,6 +398,5 @@ document does.
 
 | To learn about | See |
 |---|---|
-| Protocol details and measurement records | `docs/moq-transport-gap.md` §13 / §14 |
 | The complete push implementation (FLV → moq-lite) | `tools/flv2moqlite_client/` |
 | Wire encoding and byte-level self-tests | `moqlite/moq_lite_wire.h`, `moqlite/moq_lite_wire_test.c` |
