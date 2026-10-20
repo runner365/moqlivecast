@@ -14,6 +14,22 @@ extern "C" {
 #define QUIC_RECOVERY_MAX_CHUNKS       512
 #define QUIC_RECOVERY_MAX_PTO          20
 
+/* 判定「路真的死了」还要**连续无进展**这么久（毫秒）。
+ *
+ * ⚠️ 光看 `retrans_count >= QUIC_RECOVERY_MAX_PTO` 会**误杀**：只要有一个包
+ * 因为 ACK 丢了 / ACK 没能匹配上而始终没被标记确认，它就会一直重传下去，
+ * 而此时**整条路其实还在正常跑**。实测（Android 推流 → moqlite 服务端）：
+ * 触发 on_connection_dead 的那一刻，服务端 98% 的媒体都收到了、新的 group 流
+ * 还在开 —— 路好得很，是一条 chunk 卡住把整条会话带走了。
+ * 所以再加一道闸：只有**连续这么久一个包都没被新确认**，才认路死。
+ * 取值远大于若干个 PTO 退避周期（pto_base_ 几十~几百 ms），又远小于 5 分钟的
+ * idle timeout，弱网抖动不会误触发。
+ *
+ * ⚠️ 15s 是**实测**调上来的：Android 推流 → 本机服务端这条 Wi-Fi 链路出现过
+ * 约 9~13 秒的停顿（服务端 delivered= 计数和 group 流都停了那么久，随后自己恢复）。
+ * 原来写 5s 时，判死正好发生在**恢复前 3 秒** —— 差一点就能自己缓过来。 */
+#define QUIC_RECOVERY_NO_PROGRESS_MS   15000
+
 /* PTO 定时（RFC 9002 §6.2） */
 #define QUIC_INITIAL_PTO_MS   200   /* 握手前固定初始 PTO（无 RTT 样本时） */
 #define QUIC_MIN_PTO_MS        10   /* PTO 下限，防 0 */
@@ -78,6 +94,10 @@ typedef struct {
     #define QUIC_PERSISTENT_CONGESTION_THRESHOLD 3
     uint64_t loss_epoch_start_ms_;
     int      persistent_congestion_detected_;
+
+    /* 最近一次「有新包被确认」的时刻（uv_now 毫秒）。0 = 从没进展过。
+     * on_connection_dead 的闸门 —— 见 QUIC_RECOVERY_NO_PROGRESS_MS。 */
+    uint64_t last_progress_ms_;
 
     struct quic_cc *cc_;
     uint64_t bytes_in_flight_;

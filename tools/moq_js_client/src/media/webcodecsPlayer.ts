@@ -31,8 +31,16 @@ const MAX_PENDING_VIDEO = 400
  * 服务端实测丢 3.4% 音频帧（源文件本身一帧不缺、视频一帧不丢），
  * 表现为编码块 pts 上的 ~21ms 空洞。不处理的话音频内容会比媒体时间轴跑得快，
  * 而视频 slave 在音频时钟上 → 音画差距每秒长 ~4%，单调增大。 */
-/** 判定为"丢帧"的最小空洞（微秒）：小于它当网络抖动。一帧 AAC ≈ 21.3ms。 */
-const AUDIO_GAP_MIN_US = 5_000
+/** 判定为"丢帧"的最小空洞（微秒）：小于它当抖动/量化误差，不补静音。
+ *
+ * ⚠️ 原来是 5000（半帧不到）。一帧 AAC 是 21.3ms，于是**任何亚帧级的间隔抖动**
+ * 都被当成丢帧、补一段静音；补的静音和真实音频挤同一个环，反而把真实语音顶掉
+ * ——听感就是「丢包、断断续续」。实测补了 3345 次 / 208 秒、丢掉 232 秒真实音频，
+ * 而服务端那边音频是 47 帧/秒**一帧不少**地收到的。
+ *
+ * 15000 ≈ 0.7 帧：真的缺一帧（≈21.3ms）仍然会被补上，正常抖动则被忽略。
+ * 调这个值只影响「补不补静音」，不影响解码。 */
+const AUDIO_GAP_MIN_US = 15_000
 /** 单次补静音上限（微秒）：超过它说明是时间轴断点（服务端重锚/重启），不是丢帧 */
 const AUDIO_GAP_MAX_US = 200_000
 /** 视频解码参数变化的兜底重建阈值 */
@@ -60,6 +68,8 @@ export class WebCodecsPlayer {
   private needKeyDrops = 0
   private queueDrops = 0
   private firstFrameLogged = false
+  /** 上一帧的几何串，用来只在变化时打日志（逐帧打会淹掉其它信息）。 */
+  private lastGeom = ''
 
   /* ── 视频解码削峰 ──
    * 加入订阅时服务端会一次性回放一整个 GOP（实测 96 帧），这些对象是在
@@ -91,6 +101,8 @@ export class WebCodecsPlayer {
   /** 实测每 chunk 解出的帧数（AAC-LC = 1024），首个 PCM 之后按实测校准 */
   private audioFramesPerChunk = 1024
   private audioGapCount = 0
+  /** 解码 PCM 形状与 worklet sink 不一致只报一次，避免每帧刷屏 */
+  private pcmShapeWarned = false
 
   constructor(opts: WebCodecsPlayerOptions) {
     this.canvas = opts.canvas
@@ -214,12 +226,16 @@ export class WebCodecsPlayer {
       return
     }
     this.decodedFrames++
-    if (!this.firstFrameLogged) {
+    /* 几何信息：解码出来的帧到底多大、以及有没有旋转/镜像标记。
+     * ⚠️ displayWidth 和 codedWidth 可能**不一样**（H.264 有 crop 时如此），
+     * 而 canvas 用的是 displayWidth；rotation/flip 是 WebCodecs 暴露的
+     * 「这帧该怎么摆」的元数据。画面被转过 90° 时，第一件要分清的就是
+     * 「是码流本身转了」还是「有人告诉我们转了」—— 这四个数能直接分开。 */
+    const geom = frameGeometry(frame)
+    if (!this.firstFrameLogged || geom !== this.lastGeom) {
       this.firstFrameLogged = true
-      log_info(
-        'wc-player',
-        `first frame decoded ts=${frame.timestamp}us ${frame.displayWidth}x${frame.displayHeight}`,
-      )
+      this.lastGeom = geom
+      log_info('wc-player', `frame geometry: ${geom} (ts=${frame.timestamp}us)`)
     }
     if (frame.timestamp <= this.lastPtsUs) {
       this.outOfOrder++
@@ -450,19 +466,43 @@ export class WebCodecsPlayer {
     const padUs = this.audioPadQueue.shift() ?? 0
     if (padUs > 0) ap.padSilenceUs(padUs)
     try {
-      /* f32-planar → 交错 Float32，喂给 worklet */
-      const ch = data.numberOfChannels
+      /* f32-planar → 交错 Float32，喂给 worklet。
+       *
+       * ⚠️ **不能按解码出来的声道数直接交错**：worklet 的环是按固定的
+       * sinkChannels（2）分配的，push() 里 frames = interleaved.length / 2。
+       * 如果编码端实际给的是**单声道**（afps 看不出来 —— 单/双声道在 48k 下
+       * 都是 46.9 包/秒），N 个采样会被当成 N/2 个立体声帧 ⇒ 时长减半、2 倍速、
+       * 环被抽干 ⇒ 听感就是「不清楚、像丢包」。MSE 那条路没有这个问题，因为
+       * MSE 自己按 ASC 处理声道。所以这里统一**换成 sink 的声道布局**：
+       * 单声道复制到每个声道；源声道多于 sink 时按 sink 截取。
+       */
+      const srcCh = data.numberOfChannels
+      const srcRate = data.sampleRate
       const frames = data.numberOfFrames
+      const dstCh = ap.sinkChannels
+      const dstRate = ap.sinkSampleRate
+      if ((srcCh !== dstCh || srcRate !== dstRate) && !this.pcmShapeWarned) {
+        this.pcmShapeWarned = true
+        log_warn(
+          'wc-audio',
+          `decoded PCM is ${srcCh}ch@${srcRate} but the worklet sink is ${dstCh}ch@${dstRate}: ` +
+            (srcRate !== dstRate
+              ? 'RATE MISMATCH — playback speed/pitch will be wrong (no resampler here)'
+              : `mapping to ${dstCh}ch`),
+        )
+      }
       const planes: Float32Array[] = []
-      for (let c = 0; c < ch; c++) {
+      for (let c = 0; c < srcCh; c++) {
         const p = new Float32Array(frames)
         data.copyTo(p, { planeIndex: c, format: 'f32-planar' })
         planes.push(p)
       }
-      const interleaved = new Float32Array(frames * ch)
+      const interleaved = new Float32Array(frames * dstCh)
       for (let i = 0; i < frames; i++) {
-        for (let c = 0; c < ch; c++) {
-          interleaved[i * ch + c] = planes[c][i]
+        for (let c = 0; c < dstCh; c++) {
+          /* 单声道 → 每个声道都用 0；多声道 → 超出部分循环回绕（少见） */
+          const s = srcCh === 1 ? 0 : c % srcCh
+          interleaved[i * dstCh + c] = planes[s][i]
         }
       }
       ap.push(interleaved, data.timestamp)
@@ -607,6 +647,30 @@ function parseAsc(
   }
   if (channels <= 0) channels = 2
   return { objectType, sampleRate, channels }
+}
+
+/**
+ * 一帧的几何摘要：coded（码流里编的）／display（该显示的）／visibleRect（可见区域）
+ * 三者都可能不同，外加 WebCodecs 给的 rotation/flip。
+ *
+ * ⚠️ 三者的分工容易混：
+ *   - **coded** 是 SPS 里编的尺寸（解码器的缓冲就这么大）
+ *   - **visibleRect** 是 crop 之后真正有画面的区域
+ *   - **display** 才是「该显示成多大」，渲染时 canvas 用的就是它
+ * H.264 没有 crop 时三者相等；不等时说明码流里带了裁剪，画面会**错位**而不是
+ * 被旋转。所以「转了 90°」要看 rotation/flip —— 那两个是 0 的话，转动就是**编进去
+ * 的像素本身**（相机传感器方向没补偿，见 Android 端 CameraEncoder.logOrientation）。
+ */
+function frameGeometry(f: VideoFrame): string {
+  const anyF = f as unknown as { rotation?: number; flip?: boolean }
+  const r = f.visibleRect
+  const vis = r ? `${r.width}x${r.height}@${r.x},${r.y}` : 'n/a'
+  const rot = typeof anyF.rotation === 'number' ? anyF.rotation : 'n/a'
+  const flip = typeof anyF.flip === 'boolean' ? anyF.flip : 'n/a'
+  return (
+    `coded=${f.codedWidth}x${f.codedHeight} display=${f.displayWidth}x${f.displayHeight} ` +
+    `visible=${vis} rotation=${rot} flip=${flip}`
+  )
 }
 
 function errMsg(e: unknown): string {

@@ -173,6 +173,9 @@ export class HttpFlvPuller {
     }
     this.onStats({
       videoFps: fps != null && Number.isFinite(fps) ? fps : null,
+      /* flv.js 的 STATISTICS_INFO 不区分音视频包数，audioFps 只能留空；
+       * 这条路径要看音频是否丢包得看 demux 侧的计数（见 moqPuller）。 */
+      audioFps: null,
       videoKbps: typeof s.speed === 'number' ? s.speed * 8 : null,
       audioKbps: null,
       gopSec: null,

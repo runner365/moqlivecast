@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- 推流要联网。QUIC 走 UDP，不涉及 cleartext HTTP，所以不需要
+         usesCleartextTraffic。 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- 采集：这两个是**运行时**权限，MainActivity 里会请求。 -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!-- 前台服务：采集在后台会被系统掐掉，必须挂前台服务。
+         ⚠️ Android 14(API 34) 起还要**按类型**申请 —— 少了 CAMERA/MICROPHONE
+         这两条，startForeground 会抛 SecurityException（targetSdk 37 必然触发）。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
+    <!-- 前台服务的通知（API 33+ 是运行时权限）。不给也能采集 —— 通知会被藏起来。 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- 摄像头是可选硬件：required=false 让没摄像头的设备也能装（只是录不了）。 -->
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <application
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Moqlitepush">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:theme="@style/Theme.Moqlitepush"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- ⚠️ foregroundServiceType 必须与 PushService.startForegroundCompat() 里
+             startForeground 传的类型**一致**，否则 API 34+ 直接抛
+             MissingForegroundServiceTypeException / SecurityException。
+             exported=false：只有本应用能拉起它。 -->
+        <service
+            android:name=".PushService"
+            android:exported="false"
+            android:foregroundServiceType="camera|microphone" />
+    </application>
+
+</manifest>

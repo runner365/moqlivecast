@@ -49,9 +49,9 @@ static void quic_stream_grant_credit(QuicStreamCtx *ctx, void *conn, int bidi,
     uint8_t frm[16];
     int flen = quic_frame_write_max_streams(frm, sizeof(frm), want, bidi);
     if (flen > 0) queue_fn(conn, frm, (size_t)flen);
-    LOG_INFO("[quic-stream] grant %s streams: MAX_STREAMS=%llu (peer opened=%llu)",
-             bidi ? "bidi" : "uni", (unsigned long long)want,
-             (unsigned long long)opened);
+    LOG_DEBUG("[quic-stream] grant %s streams: MAX_STREAMS=%llu (peer opened=%llu)",
+              bidi ? "bidi" : "uni", (unsigned long long)want,
+              (unsigned long long)opened);
 }
 
 /* 对端刚开了一条流：记账，额度快见底就补。
@@ -258,9 +258,9 @@ static int consume_send_buf(QuicStreamCtx *ctx, void *conn, QuicStream *s,
             uint64_t now_s = uv_now(uv_default_loop()) / 1000;
             if (now_s != dbg_last_s) {
                 dbg_last_s = now_s;
-                LOG_WARN("[quic-stream] consume stream=%llu pending=%zu "
-                         "stream_room=%llu (off=%llu max=%llu) "
-                         "conn_room=%llu (sent=%llu peer_max=%llu)",
+                LOG_DEBUG("[quic-stream] consume stream=%llu pending=%zu "
+                          "stream_room=%llu (off=%llu max=%llu) "
+                          "conn_room=%llu (sent=%llu peer_max=%llu)",
                          (unsigned long long)s->stream_id, s->send_buf_len,
                          (unsigned long long)stream_room,
                          (unsigned long long)s->send_offset,
@@ -273,14 +273,14 @@ static int consume_send_buf(QuicStreamCtx *ctx, void *conn, QuicStream *s,
         if (stream_room == 0) {
             const int already = s->send_blocked;
             s->send_blocked = 1;
-            LOG_WARN("[quic-stream] consume blocked: STREAM FC id=%llu off=%llu max=%llu",
-                     (unsigned long long)s->stream_id, (unsigned long long)s->send_offset, (unsigned long long)s->send_max_data);
+            LOG_DEBUG("[quic-stream] consume blocked: STREAM FC id=%llu off=%llu max=%llu",
+                      (unsigned long long)s->stream_id, (unsigned long long)s->send_offset, (unsigned long long)s->send_max_data);
             if (!already) {
-                LOG_WARN("[quic-stream] stream FC blocked id=%llu off=%llu max=%llu pending=%zu",
-                         (unsigned long long)s->stream_id,
-                         (unsigned long long)s->send_offset,
-                         (unsigned long long)s->send_max_data,
-                         s->send_buf_len);
+                LOG_DEBUG("[quic-stream] stream FC blocked id=%llu off=%llu max=%llu pending=%zu",
+                          (unsigned long long)s->stream_id,
+                          (unsigned long long)s->send_offset,
+                          (unsigned long long)s->send_max_data,
+                          s->send_buf_len);
                 uint8_t frm[32];
                 int flen = quic_frame_write_stream_data_blocked(frm, sizeof(frm),
                                                                 s->stream_id,
@@ -391,9 +391,9 @@ int quic_stream_write(QuicStreamCtx *ctx, void *conn, uint64_t stream_id,
     /* 水位背压：本次整段不接受，由上层队列保留 */
     if (len > 0 && s->send_buf_len + len > QUIC_STREAM_SEND_HIGH_WATER) {
         s->want_writable = 1;
-        LOG_INFO("[quic-stream] write congested stream=%llu pending=%zu +%zu high=%u, stream_id:%llu",
-                  (unsigned long long)stream_id, s->send_buf_len, len,
-                  (unsigned)QUIC_STREAM_SEND_HIGH_WATER, (unsigned long long)s->stream_id);
+        LOG_DEBUG("[quic-stream] write congested stream=%llu pending=%zu +%zu high=%u, stream_id:%llu",
+                   (unsigned long long)stream_id, s->send_buf_len, len,
+                   (unsigned)QUIC_STREAM_SEND_HIGH_WATER, (unsigned long long)s->stream_id);
         return 1;
     }
 
@@ -433,9 +433,9 @@ int quic_stream_write(QuicStreamCtx *ctx, void *conn, uint64_t stream_id,
 
     if (ctx->last_quic_stream_dbg_ts_s != now_ms / 1000) {
         ctx->last_quic_stream_dbg_ts_s = now_ms / 1000;
-        LOG_INFO("[quic-stream] write stream %llu: %zu buffered offset=%llu, stream_id:%llu",
-                  (unsigned long long)stream_id,
-                  s->send_buf_len, (unsigned long long)s->send_offset, (unsigned long long)s->stream_id);
+        LOG_DEBUG("[quic-stream] write stream %llu: %zu buffered offset=%llu, stream_id:%llu",
+                   (unsigned long long)stream_id,
+                   s->send_buf_len, (unsigned long long)s->send_offset, (unsigned long long)s->stream_id);
     }
     LOG_DEBUG("[quic-stream] write %zu bytes stream %llu: %zu buffered offset=%llu",
               len, (unsigned long long)stream_id,
@@ -735,12 +735,12 @@ void quic_stream_on_max_stream_data(QuicStreamCtx *ctx,
     QuicStream *s = stream_find(ctx, stream_id);
     if (!s) { s = stream_find_or_create(ctx, stream_id); if (!s) return; }
     if (max_data > s->send_max_data) {
-        LOG_INFO("[quic-stream] MAX_STREAM_DATA id=%llu %llu -> %llu (off=%llu pending=%zu)",
-                 (unsigned long long)stream_id,
-                 (unsigned long long)s->send_max_data,
-                 (unsigned long long)max_data,
-                 (unsigned long long)s->send_offset,
-                 s->send_buf_len);
+        LOG_DEBUG("[quic-stream] MAX_STREAM_DATA id=%llu %llu -> %llu (off=%llu pending=%zu)",
+                  (unsigned long long)stream_id,
+                  (unsigned long long)s->send_max_data,
+                  (unsigned long long)max_data,
+                  (unsigned long long)s->send_offset,
+                  s->send_buf_len);
         s->send_max_data = max_data;
     }
 }

@@ -117,7 +117,9 @@ int main(void) {
     moq_lite_session_cb_t cb = {0};
     cb.on_connected = on_connected;
     cb.on_close     = on_close;
-    moq_lite_session_connect(s, "moql://www.webrtcserver.com.cn:4433/anon", &cb);
+    /* host accepts a domain or an IP (resolution is IPv4-only) — see the API
+     * reference. */
+    moq_lite_session_connect(s, "moql://relay.example.com:4433/anon", &cb);
 
     uv_run(g_loop, UV_RUN_DEFAULT);   /* the loop is yours */
     return 0;
@@ -214,9 +216,16 @@ Returns 0 if queued, <0 for an immediate failure.
 - **The path decides the server's routing**: the `anon` in `moql://host:4433/anon` is
   the server's entry path (`moqlivecast`'s `moq_lite_subpath`). Omitting it uses the
   server's default path.
-- ⚠️ **Use the domain for `host`, not an IP.** `moqlivecast`'s certificate has no IP
-  SAN, so any implementation that validates certificates rejects it with
-  `NotValidForName` (and the wire goes completely silent).
+- `host` accepts **both a domain name and an IP literal** — resolution goes through
+  `uv_getaddrinfo`, and a numeric literal just returns immediately without touching
+  the network. So `moql://relay.example.com:4433/anon` and
+  `moql://192.168.1.221:4433/anon` both work.
+  ⚠️ Resolution is **IPv4-only**: the QUIC send path here is hardcoded IPv4
+  (`sockaddr_in` + `uv_ip4_addr`), so an IPv6-only domain won't connect (an AAAA
+  answer would fail to parse and packets would go to `0.0.0.0`, silently).
+  Certificates are a separate matter: TLS here is `SSL_VERIFY_NONE`, so a cert with
+  no IP SAN still connects and an IP is fine. Clients that *do* verify (`moq-cli` /
+  libmoq) need the domain instead.
 - `cb` is **deep-copied**; you needn't keep it alive.
 
 ```c

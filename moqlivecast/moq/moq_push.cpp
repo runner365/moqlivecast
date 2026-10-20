@@ -910,13 +910,15 @@ void MoqPushSession::EmitLoc(Downlink &dl, uint64_t alias, Media_Packet_Ptr pkt)
 
     dl.obj += 1;
     int64_t now_ms = now_millisec();
+    /* 每秒每轨一条 —— 有 `tx rate` / `delivered=` 两条汇总就够判断活着，
+     * 这条只有排查单帧时间戳/大小时才需要。 */
     if (dl.last_send_dbg_ts_s != now_ms / 1000) {
         dl.last_send_dbg_ts_s = now_ms / 1000;
-        LOG_INFO("[moq-rfc] TX LOC alias=%llu n=%llu ts=%lld dts=%lld size=%zu key=%d q=%zu/%zu congested=%d",
-                 (unsigned long long)alias, (unsigned long long)dl.obj,
-                 (long long)ts, (long long)(pkt->dts_ < 0 ? 0 : pkt->dts_),
-                 payload_len, key ? 1 : 0,
-                 dl.send_q.size(), dl.send_q_bytes, dl.congested ? 1 : 0);
+        LOG_DEBUG("[moq-rfc] TX LOC alias=%llu n=%llu ts=%lld dts=%lld size=%zu key=%d q=%zu/%zu congested=%d",
+                  (unsigned long long)alias, (unsigned long long)dl.obj,
+                  (long long)ts, (long long)(pkt->dts_ < 0 ? 0 : pkt->dts_),
+                  payload_len, key ? 1 : 0,
+                  dl.send_q.size(), dl.send_q_bytes, dl.congested ? 1 : 0);
     }
     LOG_DEBUG("[moq-rfc] TX LOC alias=%llu ts=%lld size=%zu seq=%d key=%d",
               (unsigned long long)alias, (long long)ts, payload_len,

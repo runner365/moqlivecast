@@ -210,6 +210,12 @@ typedef struct MoqPub {
     MoqPubTrack *tracks[MOQ_MAX_PUB_TRACKS];
     int      track_cnt;
     MoqBuf   catalog;       /* 拼好的 catalog.json（轨声明后惰性重建）*/
+
+    /* 这条广播有没有**主动补发过** ANNOUNCE_START。
+     * 对端在会话一开始就问过 ANNOUNCE，而那时我们可能一条轨都还没有（编解码
+     * 参数要等编码器起来），答的是 active=0 空集合 —— **对端不会问第二遍**，
+     * 所以后来才有东西可公告时必须我们主动补一条（见 serve_reannounce）。 */
+    int      announced;
 } MoqPub;
 
 /* 对端订阅了我们某条轨。
@@ -243,8 +249,11 @@ typedef struct MoqServeSub {
 
     /* catalog.json 这条订阅专用：载荷是**裸 JSON**（没有容器时间戳前缀），
      * 借用所属 MoqPub 的 catalog 缓冲（它的寿命比订阅长）。 */
-    const uint8_t *catalog_json;
-    size_t         catalog_len;
+    /* catalog.json 这条订阅专用：存**所属广播**而不是它的字节指针。
+     * ⚠️ 原来存的是 `pub->catalog.buf`，而 pub_build_catalog() 每次重建都会
+     * `free` 掉旧缓冲 —— 只要 catalog 变过一次，这个指针就是**悬垂**的，
+     * 再读就是 use-after-free。存 pub 指针、发送时现取，两个问题一起解决。 */
+    MoqPub        *cat_pub;
 } MoqServeSub;
 
 /* 对端开的一条**请求**流（announce / track）。应答写回**同一条**流，所以流 id
@@ -346,7 +355,24 @@ const char *moq_lite_strerror(int err) {
     case MOQ_LITE_ERR_NOMEM:   return "out of memory";
     case MOQ_LITE_ERR_STATE:   return "session not in a state that allows this";
     case MOQ_LITE_ERR_INTERNAL:return "internal error";
-    default:                   return g_err[0] ? g_err : "unknown error";
+    default:
+        /* 走到这里说明 err 不是本库的错误码 —— on_close 回调传进来的是
+         * **QUIC 传输错误码**。
+         *
+         * ⚠️ **不能**回 g_err。它是线程局部的「上一次 err_set 的内容」，
+         * 此刻多半陈旧且与本错误无关：实测把 err=0x10(NO_VIABLE_PATH)
+         * 显示成了 "ok" —— 把「路不通」说成「没事」，白让人查半天。
+         * 认得的给名字，认不得的至少把码原样报出来。 */
+        switch (err) {
+        case 0x10: return "quic: no viable path";
+        case 0x19: return "quic: idle timeout";
+        default:
+            if (err > 0) {
+                snprintf(g_err, sizeof(g_err), "quic error 0x%x", (unsigned)err);
+                return g_err;
+            }
+            return "unknown error";
+        }
     }
 }
 
@@ -1321,9 +1347,85 @@ static int serve_announce_write(MoqSession *s, quic_stream_t *st,
     return 1;
 }
 
+/* catalog.json 变了：给**每条已经订过它**的订阅补发一个新组。
+ *
+ * moq-lite 里 catalog 的更新就是「再发一组」——对端按组号去重，重发组 0 会被丢掉，
+ * 所以这里用 ss->group_seq 递增。
+ *
+ * ⚠️ 为什么必须有：Android 上两条轨的编解码参数（csd）是**分别**到的，先后能差几十
+ * 毫秒。第一条到的时候我们就把广播公告出去了，对端立刻订走 catalog；等第二条的 csd
+ * 到、catalog 重建时，如果不再发一组，**对端永远不知道有第二条轨** ——
+ * 症状是「只有画面没有声音」（或者反过来），而两边日志都看不出哪里错了。
+ * （服务端侧是会处理的：它重解 catalog，对 `subscribe_id == 0` 的轨补订阅。） */
+static void serve_catalog_update(MoqSession *s, MoqPub *p) {
+    if (!s || s->dead || !p) return;
+    for (size_t i = 0; i < s->serve_cnt; i++) {
+        MoqServeSub *ss = s->serve_subs[i];
+        if (!ss || !ss->used || ss->dead) continue;
+        if (ss->cat_pub != p) continue;
+        LOG_INFO("[moq-lite-cli] sub %llu: catalog.json changed -> sending group %llu",
+                 (unsigned long long)ss->sid, (unsigned long long)ss->group_seq);
+        pending_push_box(kOpenTrackGroup, ss);
+        quic_client_open_uni_stream(s->cli);
+    }
+}
+
+/* 对端在会话刚开始时问过 ANNOUNCE，那时我们可能**一条轨都还没有**（编解码参数
+ * 要等编码器起来才拿得到），于是答的是 active=0 的空集合。**对端不会问第二遍。**
+ * 所以后来才有东西可公告时，必须由我们主动往那条**还开着**的 announce 流上补一条
+ * ANNOUNCE_START —— -06 的 ANNOUNCE_START 不带 ID 字段，序号是收侧按出现顺序自己
+ * 数的，所以「追加」就够了，不需要额外记账。
+ *
+ * ⚠️ 不做这件事的症状极具迷惑性：服务端日志里 `ANNOUNCE_OK … active=0`、然后
+ * **整条链路安静下来** —— 推流端一切正常（帧也发出去了），可服务端从没听说过这条
+ * 广播，于是没人来订阅，浏览器自然也没得播。
+ * （tools/flv2moqlite_client 没暴露这个问题，因为它在 on_connected 里**同步**把两条
+ * 轨都声明完了，对端发问时已经有东西可公告。） */
+static void serve_reannounce(MoqSession *s) {
+    if (!s || s->dead) return;
+
+    for (size_t i = 0; i < s->pub_cnt; i++) {
+        MoqPub *p = s->pubs[i];
+        if (!p || !p->used || p->dead) continue;
+        if (p->announced) continue;
+        if (p->track_cnt == 0) continue;   /* 还没有轨 = 还不可公告 */
+
+        int sent = 0;
+        for (size_t j = 0; j < s->stream_cnt; j++) {
+            MoqStream *r = s->streams[j];
+            /* 只找**对端开的** announce 流 —— 本端开的那些是我们在做发现，
+             * 上面带的 req_prefix 是「我们请求的前缀」，语义不同别混。 */
+            if (!r || r->done || r->dead || r->local || !r->s) continue;
+            if (r->kind != kStreamAnnounce) continue;
+
+            const char *prefix = r->req_prefix ? r->req_prefix : "";
+            char *suffix = NULL;
+            if (!pub_suffix_for(s, prefix, p->path, &suffix)) continue;
+
+            MoqBuf out; moq_buf_init(&out);
+            if (moq_wire_announce_start(&out, suffix, 0, 0) == 0) {
+                quic_client_stream_write(r->s, out.buf, out.len, 0, NULL, NULL, 0);
+                sent = 1;
+                LOG_INFO("[moq-lite-cli] ANNOUNCE_START (late) broadcast=\"%s\" "
+                         "prefix=\"%s\" suffix=\"%s\"",
+                         p->path, prefix[0] ? prefix : "(all)", suffix);
+            }
+            moq_buf_free(&out);
+            free(suffix);
+        }
+        /* 只在这条广播**至少发出去过一条**时才置位；否则留着，等一条 scope 匹配
+         * 的 announce 流出现时再补。 */
+        if (sent) p->announced = 1;
+    }
+}
+
 /* 发布侧的 Track 请求应答：找到轨就发 TRACK_INFO 并 FIN；找不到 reset。
  * ps->reply 里已经存好了编码结果（在解析时算的），这里只负责写。 */
 static void serve_replay_hold(MoqServeSub *ss, MoqPubTrack *t);
+
+/* 广播变得可公告时，主动向对端还开着的那条 announce 流补发 ANNOUNCE_START。
+ * 定义在 serve_announce_write 之后（要用到 pub_suffix_for）。 */
+static void serve_reannounce(MoqSession *s);
 
 static void serve_track_info_write(MoqPeerStream *ps, quic_stream_t *st) {
     if (ps->reply.len == 0) {
@@ -1460,23 +1562,26 @@ static void serve_group_open_on_stream(MoqServeSub *ss, quic_stream_t *st) {
  * ⚠️ 组号恒 0：这条订阅的 catalog 只有这一组。将来 catalog 变了要发**下一组**
  * （seq=1），不是重发组 0 —— 对端按组号去重，重发会被丢掉。 */
 static void serve_catalog_on_stream(MoqServeSub *ss, quic_stream_t *st) {
-    if (!ss->catalog_json || ss->catalog_len == 0) {
+    MoqPub *p = ss->cat_pub;
+    if (!p || p->catalog.len == 0) {
         quic_client_stream_reset(st, kStreamInternalError);
         return;
     }
     MoqBuf out; moq_buf_init(&out);
     int ok = moq_put_stream_type(&out, 0x0) == 0 &&
-             moq_wire_group_header(&out, ss->sid, 0, 0) == 0 &&
-             moq_wire_frame(&out, 0, ss->catalog_json, ss->catalog_len) == 0;
+             moq_wire_group_header(&out, ss->sid, ss->group_seq, 0) == 0 &&
+             moq_wire_frame(&out, 0, p->catalog.buf, p->catalog.len) == 0;
     if (ok) {
         quic_client_stream_write(st, out.buf, out.len, 1, NULL, NULL, 0);
-        LOG_INFO("[moq-lite-cli] catalog.json sent: %zu bytes, one group, FIN",
-                 ss->catalog_len);
+        LOG_INFO("[moq-lite-cli] catalog.json sent: %zu bytes, group=%llu, FIN",
+                 p->catalog.len, (unsigned long long)ss->group_seq);
+        ss->group_seq++;
     } else {
         quic_client_stream_reset(st, kStreamInternalError);
     }
     moq_buf_free(&out);
-    ss->dead = 1;   /* catalog 一次性的，之后这个订阅记录不再有用 */
+    /* ⚠️ **不标 dead**：catalog 变了要接着发**下一组**（见 serve_catalog_update）。
+     * 对端按组号去重，所以更新只能发新组（seq=1、2…），不能重发组 0。 */
 }
 
 /* 关掉当前组：写一个**结束哨兵**并让 FIN 搭在它上面。
@@ -1571,7 +1676,10 @@ static void serve_parse_announce(MoqStream *r) {
      * 不需要再开流。 */
     if (!serve_announce_write(r->sess, r->s, pfx ? pfx : ""))
         quic_client_stream_reset(r->s, kStreamInternalError);
-    free(pfx);
+    /* ⚠️ prefix 要**留在流上**，别 free：这条流会一直开着，将来有广播才可用时
+     * 要靠它算 suffix 补发 ANNOUNCE_START（见 serve_reannounce）。 */
+    free(r->req_prefix);
+    r->req_prefix = pfx;
     /* 不置 done：这条流要一直开着（后续更新还走它）。 */
 }
 
@@ -1718,8 +1826,8 @@ static void serve_parse_subscribe(MoqStream *r) {
                                            ss, sizeof(MoqServeSub*));
                 if (slot != (size_t)-1) {
                     ss->slot = (uint32_t)slot;
-                    ss->catalog_json = pub->catalog.buf;
-                    ss->catalog_len = pub->catalog.len;
+                    ss->cat_pub = pub;
+                    ss->group_seq = 0;
                     /* ⚠️ 别忘了开那条组流 —— 只发 SUBSCRIBE_START 不开流的话，
                      * 对端收到「接受」却永远等不到 catalog 那一帧，于是也
                      * 不会去订阅任何媒体轨（实测就是这样停住的：订阅进来了、
@@ -1916,7 +2024,7 @@ static void on_session_uni_open(quic_client_t *c, quic_stream_t *st, void *user)
     if (pending_pop(&po) && po.kind == kOpenTrackGroup) {
         MoqServeSub *ss = (MoqServeSub*)po.box;
         if (!ss || ss->dead) { quic_client_stream_reset(st, kStreamInternalError); return; }
-        if (ss->catalog_json) serve_catalog_on_stream(ss, st);
+        if (ss->cat_pub) serve_catalog_on_stream(ss, st);
         else                  serve_group_open_on_stream(ss, st);
         return;
     }
@@ -1970,7 +2078,7 @@ static void on_session_bidi_open(quic_client_t *c, quic_stream_t *st, void *user
          * 即 FIN，不走组写入器。 */
         MoqServeSub *ss = (MoqServeSub*)po.box;
         if (!ss) { quic_client_stream_reset(st, kStreamInternalError); break; }
-        if (ss->catalog_json) serve_catalog_on_stream(ss, st);
+        if (ss->cat_pub) serve_catalog_on_stream(ss, st);
         else                  serve_group_open_on_stream(ss, st);
         break;
     }
@@ -2494,6 +2602,13 @@ moq_lite_track_t moq_lite_publish_track(moq_lite_broadcast_t bh, int is_video,
     }
     LOG_INFO("[moq-lite-cli] publish track \"%s\" (%s) codec=%s config=%zu bytes",
              t->name, is_video ? "video" : "audio", t->codec, t->config_len);
+
+    /* 第一条轨一落地，这条广播就**可公告**了 —— 如果对端早就问过 ANNOUNCE
+     * （多半问的时候我们还没轨），现在补一条给它。 */
+    serve_reannounce(pub->sess);
+    /* 已经有订阅方订过 catalog 的话，把新的一组带上（后到的轨只有这样才被知道）。 */
+    serve_catalog_update(pub->sess, pub);
+
     return (moq_lite_track_t)slot;
 }
 

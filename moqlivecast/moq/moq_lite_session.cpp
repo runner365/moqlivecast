@@ -89,8 +89,10 @@ constexpr int64_t kUsPerMs = 1000;
 constexpr uint64_t kDeliverLogLimit = 3;
 
 /* 落地计数的 INFO 间隔（帧）。见 OnMediaFrame 尾部：这条是 INFO 级别验收
- * 「帧进了 MediaStreamManager」的唯一凭据，不受 kDeliverLogLimit 的封顶影响。 */
-constexpr uint64_t kDeliverLogEvery = 100;
+ * 「帧进了 MediaStreamManager」的唯一凭据，不受 kDeliverLogLimit 的封顶影响。
+ * 100 → 500：音频 47 帧/秒时原来是 ~2 行/秒，太吵；500 帧 ≈ 10.6 秒一行，
+ * 仍然是可读的存活心跳（视频 30fps 时 ≈ 16.7 秒一行）。 */
+constexpr uint64_t kDeliverLogEvery = 500;
 
 /* 落地的流 key 的 app 段为空时的兜底。只有路由路径为空（理论上不该发生）
  * 才会走到，日志里会带 WARN。 */
@@ -489,10 +491,12 @@ void MoqLiteSession::OnStreamTypeSeen(uint64_t sid, RecvStream &st) {
         saw_peer_setup_ = true;
     }
 
-    LOG_INFO("[moq-lite] %s:%d peer opened %s stream %llu type=0x%llx",
-             remote_ip_.c_str(), remote_port_, name,
-             static_cast<unsigned long long>(sid),
-             static_cast<unsigned long long>(st.type));
+    /* 每条组流都会走这里：音频 1 组/秒、视频 1 组/关键帧 —— INFO 下就是稳定的
+     * 每秒一两行噪声。组结构真正要看时切 debug。 */
+    LOG_DEBUG("[moq-lite] %s:%d peer opened %s stream %llu type=0x%llx",
+              remote_ip_.c_str(), remote_port_, name,
+              static_cast<unsigned long long>(sid),
+              static_cast<unsigned long long>(st.type));
 }
 
 void MoqLiteSession::ResetStream(uint64_t sid, uint64_t error_code,

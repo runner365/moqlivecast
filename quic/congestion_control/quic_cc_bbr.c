@@ -385,8 +385,8 @@ static void bbr_get_info(const struct quic_cc *cc, struct quic_cc_info *out) {
                 const uint64_t now_ms = bbr_now_us() / 1000;
                 if (now_ms - last_floor_log_ms >= 1000) {
                     last_floor_log_ms = now_ms;
-                    LOG_INFO("[cc-bbr] pacing floor applied: rate=%.0f -> %.0f B/s "
-                             "(max_bw=%llu pacing_gain=%.2f min_rtt=%lluus state=%d)",
+                    LOG_DEBUG("[cc-bbr] pacing floor applied: rate=%.0f -> %.0f B/s "
+                              "(max_bw=%llu pacing_gain=%.2f min_rtt=%lluus state=%d)",
                              rate, floor_rate,
                              (unsigned long long)bbr->max_bw, pg,
                              (unsigned long long)bbr->min_rtt_us, bbr->state);

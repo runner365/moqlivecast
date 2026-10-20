@@ -37,9 +37,21 @@ namespace cpp_streamer
         /* 顶替防抖：窗口起点(ms) + 窗口内已被顶的次数，见 ClaimPublisher。 */
         int64_t claim_window_ms_ = 0;
         int claim_takeovers_ = 0;
+        /* 时钟回退检测**按轨**各自记基线。
+         * ⚠️ 曾经是音视频共用一份 `last_in_dts_`：只要两条轨的时钟 epoch 差
+         * 超过 1 秒（实测 Android 相机用 CLOCK_BOOTTIME、麦克风用
+         * CLOCK_MONOTONIC，差的就是深睡时间），**每次音视频交替都会被判成
+         * 一次「时钟回退」**并被重新打上 +40ms —— 音频时间轴跑到实时 ~2.7 倍，
+         * 播放端按空洞补静音，把真实音频挤出环形缓冲，听感「丢包」。
+         * 回退是**同一条轨自己的**时间倒流，不能跨轨比较。 */
+        int64_t last_in_video_dts_ = -1;
+        int64_t last_in_audio_dts_ = -1;
+        /* 其它类型（本流通常没有）的兜底基线。 */
         int64_t last_in_dts_ = -1;
         int64_t last_out_dts_ = -1;
         int64_t ts_shift_ = 0;
+        /* 音视频原始时间轴偏差告警的限流时间戳（秒）。 */
+        int64_t skew_warn_s_ = 0;
         GopCache cache_;
         WRITER_MAP writer_map_;//(session_key, av_writer_base*)
 

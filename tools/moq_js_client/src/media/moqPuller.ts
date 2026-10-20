@@ -28,6 +28,10 @@ import { WebCodecsPlayer } from './webcodecsPlayer'
 const LIVE_LATENCY_S = 2.0
 const MAX_LATENCY_S = 3.5
 const SUBSCRIBE_TIMEOUT_MS = 30000
+/* SUBSCRIBE_OK 之后等第一个媒体对象的上限。超过它，服务端多半**根本没有**
+ * 可发的东西（发布端没公告广播 / 没有轨），而不是网络慢 —— 与「收到过媒体
+ * 之后断流」的 stallWatch 是两件事，后者只在 mediaSeen 之后才启动。 */
+const FIRST_MEDIA_TIMEOUT_MS = 10000
 
 type BufRange = { start: number; end: number }
 
@@ -121,6 +125,8 @@ export class MoqPuller {
   private onPhase: ((p: SessionPhase) => void) | null = null
   private mediaSeen = false
   private stall = new StallWatch()
+  /** 「SUBSCRIBE 成功但一个媒体对象都没来」的看门狗（见 FIRST_MEDIA_TIMEOUT_MS） */
+  private firstMediaTimer = 0
   private connGen = 0
 
   private readonly onVideoError = () => {
@@ -263,6 +269,22 @@ export class MoqPuller {
      * 请求流里读完。服务端若有 GOAWAY 等控制消息，将来需要另加读取。
      * 数据流不再在这里开：入口是上面那行 pumpIncomingUni。 */
 
+    /* 从这一刻开始算「第一个媒体对象多久没来」。
+     * ⚠️ 这条与 noteMedia 之后的 stallWatch 是**两件事**：那个只在收到过
+     * 媒体后启动，所以「发布端根本没在推」时它会一直沉默 —— 页面表现为
+     * connected、pushed=0、rendered=0，用户只能猜。 */
+    this.firstMediaTimer = window.setTimeout(() => {
+      this.firstMediaTimer = 0
+      if (this.closed || this.mediaSeen || gen !== this.connGen) return
+      log_error(
+        'moq-pull',
+        `no media within ${FIRST_MEDIA_TIMEOUT_MS / 1000}s of SUBSCRIBE — the server accepted ` +
+          `the subscription but has nothing to send (the publisher has not announced/published ` +
+          `its tracks; server side shows "subscribe gop ... packets=0")`,
+      )
+      this.setPhase('connected but no media')
+    }, FIRST_MEDIA_TIMEOUT_MS)
+
     wt.closed.catch((e) => {
       if (gen !== this.connGen || this.wt !== wt) return
       this.closed = true
@@ -279,6 +301,10 @@ export class MoqPuller {
     this.connGen += 1
     this.closed = true
     this.stall.stop()
+    if (this.firstMediaTimer) {
+      window.clearTimeout(this.firstMediaTimer)
+      this.firstMediaTimer = 0
+    }
     if (this.chaseTimer) {
       window.clearInterval(this.chaseTimer)
       this.chaseTimer = 0
@@ -442,6 +468,10 @@ export class MoqPuller {
     if (this.closed) return
     if (!this.mediaSeen) {
       this.mediaSeen = true
+      if (this.firstMediaTimer) {
+        window.clearTimeout(this.firstMediaTimer)
+        this.firstMediaTimer = 0
+      }
       this.stall.start(() => this.onMediaStall())
       this.setPhase('receiving stream')
       return

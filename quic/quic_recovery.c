@@ -75,7 +75,7 @@ static void print_unack_packet(QuicRecoveryCtx *ctx, const char *tag) {
                 int used = quic_frame_parse_stream(fp, flen, &sid, &off, &fin, &sd, &sl);
                 if (used <= 0) break;
                 if (printed < 40) {
-                    LOG_WARN("[ack-audit]%s pn=%llu stream=%llu off=%llu len=%zu end=%llu lost=%d chunk=%llu",
+                    LOG_DEBUG("[ack-audit]%s pn=%llu stream=%llu off=%llu len=%zu end=%llu lost=%d chunk=%llu",
                              tag ? tag : "",
                              (unsigned long long)p->pn,
                              (unsigned long long)sid,
@@ -94,7 +94,7 @@ static void print_unack_packet(QuicRecoveryCtx *ctx, const char *tag) {
             }
         }
     }
-    LOG_WARN("[ack-audit]%s summary: unacked_pkts=%d printed=%d", tag ? tag : "", unacked_total, printed);
+    LOG_DEBUG("[ack-audit]%s summary: unacked_pkts=%d printed=%d", tag ? tag : "", unacked_total, printed);
 }
 
 /* inflight 扣减 — 带 underflow 检测 + 饱和保护（防 unsigned 翻转）。
@@ -143,8 +143,10 @@ static void update_rtt(QuicRecoveryCtx *ctx, uint64_t rtt_sample) {
     if (base < QUIC_MIN_PTO_MS) base = QUIC_MIN_PTO_MS;
     ctx->pto_base_ = base;
 
+    /* 每个 RTT 样本都会走到这里；移动/Wi-Fi 链路 RTT >100ms 是常态，
+     * 放 WARN 等于按样本数刷屏。真正要看的 RTT 在 `ACK rx` / `tx rate` 汇总里。 */
     if (ctx->pto_base_ > 100 || ctx->smoothed_rtt_ > 100 || rtt_sample > 100) {
-        LOG_WARN("[quic-recovery] RTT large rtt: rtt_sample=%llums → srtt=%llu rttvar=%llu min_rtt=%llu pto_base=%llu",
+        LOG_DEBUG("[quic-recovery] RTT large rtt: rtt_sample=%llums → srtt=%llu rttvar=%llu min_rtt=%llu pto_base=%llu",
              (unsigned long long)rtt_sample,
              (unsigned long long)ctx->smoothed_rtt_,
              (unsigned long long)ctx->rttvar_,
@@ -174,6 +176,18 @@ static void chunk_init_timestamps(QuicRecoveryCtx *ctx, QuicRecoveryChunk *c) {
     const uint64_t now = uv_now(ctx->loop_);
     c->first_sent_ms = now;
     c->last_retrans_ms = now;
+}
+
+/* 「池子满 / 踢 chunk」这两条日志在故障期会成百上千次地刷 —— 实测那个 67MB 的
+ * moq_lite.log 里，光 `chunk pool exhausted` 一个人就有 39293 行。
+ * 按次数节流：前 3 次全打，之后每 1000 次一条，并把**累计次数**带上，
+ * 这样「故障有多大」仍然看得出来，而日志不会被它撑爆。
+ * （static 是跨连接共享的，但它只影响日志节流，不影响任何状态。） */
+static unsigned g_chunk_pool_events;
+
+static int chunk_pool_should_log(void) {
+    g_chunk_pool_events++;
+    return g_chunk_pool_events <= 3 || (g_chunk_pool_events % 1000) == 0;
 }
 
 static QuicRecoveryChunk *chunk_alloc(QuicRecoveryCtx *ctx) {
@@ -218,14 +232,73 @@ static QuicRecoveryChunk *chunk_alloc(QuicRecoveryCtx *ctx) {
                 oldest_retrans = c->retrans_count;
             }
         }
-        LOG_ERROR("[quic-recovery] chunk pool exhausted: count=%d "
-                  "(first8: lost=%d sending=%d) oldest chunk_id=%llu retrans=%d "
-                  "next_id=%llu - no ACKED to reclaim, suspect ACKs not applied",
-                  ctx->chunk_count_, lost_n, sending_n,
-                  (unsigned long long)oldest_id, oldest_retrans,
-                  (unsigned long long)ctx->next_chunk_id_);
+        if (chunk_pool_should_log()) {
+            LOG_ERROR("[quic-recovery] chunk pool exhausted: count=%d "
+                      "(first8: lost=%d sending=%d) oldest chunk_id=%llu retrans=%d "
+                      "next_id=%llu - no ACKED to reclaim, suspect ACKs not applied "
+                      "(event #%u, logging 1/1000)",
+                      ctx->chunk_count_, lost_n, sending_n,
+                      (unsigned long long)oldest_id, oldest_retrans,
+                      (unsigned long long)ctx->next_chunk_id_,
+                      g_chunk_pool_events);
+        }
+    }
+
+    /* ── 兜底：池子必须**永远**能腾出一个 chunk ──────────────────────────
+     * ⚠️ 这是整条会话的死锁源头，不是理论风险。池子被 512 个非 ACKED 的 chunk
+     * 占满之后会进入一个**不可逆**的状态：
+     *   chunk_alloc 返回 NULL → 新包拿到 chunk_id = UINT64_MAX（无主）→
+     *   它们的 ACK 在 chunk_mark_acked 里查不到（上面那 7717 条 NOT FOUND 里
+     *   打的就是 18446744073709551615）→ 再没有任何 chunk 变成 ACKED →
+     *   池子永远回收不了 → 永久停摆：发送停滞、只剩重传，最后 recovery 判死。
+     * 实测（Android 推流 → moqlite 服务端）：chunk pool exhausted 39293 次，
+     * 而**服务端收到了 98.4% 的媒体** —— 数据都到了，只是客户端再也证明不了。
+     * 所以这里主动踢掉一个**最没希望**的 chunk（LOST 优先，其次重传次数最多），
+     * 保证池子一定可用。被踢的那块数据本来也过不去，丢它不亏；换来的是
+     * 一次丢包不再能把整条会话永久带走。 */
+    {
+        int victim = -1, victim_score = -1;
+        for (int i = 0; i < ctx->chunk_count_; i++) {
+            const QuicRecoveryChunk *c = &ctx->chunks_[i];
+            if (c->state == QUIC_CHUNK_ACKED) continue;   /* 上面刚清过，不会再剩 */
+            int score = c->retrans_count +
+                        (c->state == QUIC_CHUNK_LOST ? 1000000 : 0);
+            if (score > victim_score) { victim_score = score; victim = i; }
+        }
+        if (victim >= 0) {
+            QuicRecoveryChunk *v = &ctx->chunks_[victim];
+            if (chunk_pool_should_log()) {
+                LOG_WARN("[quic-recovery] chunk pool full: evicting chunk=%llu "
+                         "(retrans=%d state=%d) so the pool stays usable "
+                         "(event #%u, logging 1/1000)",
+                         (unsigned long long)v->chunk_id, v->retrans_count,
+                         v->state, g_chunk_pool_events);
+            }
+            free(v->frames);
+            /* 稳定地滤掉这一项（与上面 compaction 同一手法，保持 ID 有序）。 */
+            int w2 = 0;
+            for (int i = 0; i < ctx->chunk_count_; i++) {
+                if (i == victim) continue;
+                ctx->chunks_[w2++] = ctx->chunks_[i];
+            }
+            ctx->chunk_count_ = w2;
+            QuicRecoveryChunk *c = &ctx->chunks_[ctx->chunk_count_++];
+            memset(c, 0, sizeof(*c));
+            c->chunk_id = ctx->next_chunk_id_++;
+            chunk_init_timestamps(ctx, c);
+            return c;
+        }
     }
     return NULL;
+}
+
+/* 「ACK 找不到 chunk」这条 WARN 在故障期实测能刷几千行，按 1/1000 节流，
+ * 但**不删除** —— 它仍是「ACK 没生效、chunk 永远回收不了」唯一的线索。 */
+static unsigned g_ack_miss_events;
+
+static int ack_miss_should_log(void) {
+    g_ack_miss_events++;
+    return g_ack_miss_events <= 3 || (g_ack_miss_events % 1000) == 0;
 }
 
 /* ACK 到达 → 标记 chunk 及其所有 sent_packet 为已确认 */
@@ -237,9 +310,13 @@ static void chunk_mark_acked(QuicRecoveryCtx *ctx, uint64_t chunk_id) {
          * eventually exhausting all 512 slots and leaving zombie chunks
          * to be retransmitted indefinitely. This log is the only clue
          * for that failure mode -- do not remove. */
-        LOG_WARN("[quic-recovery] chunk_mark_acked: chunk=%llu NOT FOUND "
-                 "(chunk_count=%d) - ACK has no effect, chunk unreclaimable",
-                 (unsigned long long)chunk_id, ctx->chunk_count_);
+        if (ack_miss_should_log()) {
+            LOG_WARN("[quic-recovery] chunk_mark_acked: chunk=%llu NOT FOUND "
+                     "(chunk_count=%d) - ACK has no effect, chunk unreclaimable "
+                     "(event #%u, logging 1/1000)",
+                     (unsigned long long)chunk_id, ctx->chunk_count_,
+                     g_ack_miss_events);
+        }
         return;
     }
     if (c->state == QUIC_CHUNK_ACKED) {
@@ -277,10 +354,11 @@ static void mark_pn_acked(QuicRecoveryCtx *ctx, uint64_t pn, int level,
         /* PN 空间隔离 — Initial/Handshake/Application 的 PN 各自独立，
          * 只确认属于同一 level 的包，避免跨空间误匹配 */
         if (pkt_type_to_level(p->pkt_type) != level) continue;
+        /* 重传副本被 ACK 是**正常**路径，不是异常；放 DEBUG，否则重传一多就刷屏。 */
         if (p->pn == pn && p->ack_eliciting && p->lost) {
-            LOG_WARN("[quic-recovery] pn=%llu acked BUT lost (retransmitted?) chunk=%llu",
-                     (unsigned long long)pn,
-                     (unsigned long long)p->chunk_id);
+            LOG_DEBUG("[quic-recovery] pn=%llu acked BUT lost (retransmitted?) chunk=%llu",
+                      (unsigned long long)pn,
+                      (unsigned long long)p->chunk_id);
         }
         p->acknowledged = 1;
         (*newly_acked_count)++;
@@ -327,7 +405,16 @@ static void compact_sent_packets(QuicRecoveryCtx *ctx) {
             free(p->frames);
             continue;
         }
-        if (p->lost && !p->frames) continue;
+        /* ⚠️ **原来这里还有一条 `if (p->lost && !p->frames) continue;`，删了。**
+         * 那种记录是 detect_losses 把 frames 释放掉之后留下的：载荷没了，但条目
+         * 本身只有几十字节，而它是「这个 PN 属于哪个 chunk」的**唯一**映射。
+         * 丢掉它，之后到达的那个 PN 的 ACK 在 mark_pn_acked 里就查不到，
+         * 对应的 chunk 这辈子都标不上 ACKED —— 正是
+         *   「chunk_mark_acked: chunk=… NOT FOUND - ACK has no effect,
+         *     chunk unreclaimable」和 chunk pool exhausted 的来源
+         * （实测各 7717 / 39293 次）。
+         * 留着它，环满时由 on_packet_sent 的溢出分支淘汰最旧的 —— 仍然有界，
+         * 而且比「一变成 lost 就丢」多给了 ACK 一整个环深度的机会去匹配上。 */
         tmp[new_count++] = *p;
     }
     if (new_count < ctx->sent_count_) {
@@ -372,6 +459,7 @@ static int process_ack_ranges(QuicRecoveryCtx *ctx, const QuicAckFrame *ack,
 
 static void detect_losses(QuicRecoveryCtx *ctx, uint64_t now_ms) {
     int loss_detected = 0;
+    int fast_retx = 0;           /* 本轮已经立即重传了几个（见下面 QUIC_LOSS_RETRANSMIT_PER_PASS） */
     int app_loss_detected = 0;   /* 是否有应用层（1-RTT）丢包 */
     uint64_t rtt_ref = ctx->smoothed_rtt_ > ctx->latest_rtt_ ?
                        ctx->smoothed_rtt_ : ctx->latest_rtt_;
@@ -411,11 +499,18 @@ static void detect_losses(QuicRecoveryCtx *ctx, uint64_t now_ms) {
             /* Chunk already reclaimed or never allocated: this sent_packet
              * has no owner. Skipping silently would leave inflight
              * accounting and loss detection without a basis, so record it
-             * to trace chunk lifecycle problems. */
-            LOG_WARN("[quic-recovery] detect_losses: chunk=%llu NOT FOUND "
-                     "(pn=%llu, chunk_count=%d) - skipping packet",
-                     (unsigned long long)p->chunk_id,
-                     (unsigned long long)p->pn, ctx->chunk_count_);
+             * to trace chunk lifecycle problems.
+             * ⚠️ 节流：chunk_alloc 的兜底会**主动踢掉**最没希望的 chunk，
+             * 被踢的那条留下的 sent_packet 就会走到这里 —— 那是预期行为，
+             * 不该把日志刷爆。 */
+            if (chunk_pool_should_log()) {
+                LOG_WARN("[quic-recovery] detect_losses: chunk=%llu NOT FOUND "
+                         "(pn=%llu, chunk_count=%d) - skipping packet "
+                         "(event #%u, logging 1/1000)",
+                         (unsigned long long)p->chunk_id,
+                         (unsigned long long)p->pn, ctx->chunk_count_,
+                         g_chunk_pool_events);
+            }
         }
         if (c && c->state == QUIC_CHUNK_LOST) {
             if (p->ack_eliciting && !p->lost)
@@ -437,10 +532,26 @@ static void detect_losses(QuicRecoveryCtx *ctx, uint64_t now_ms) {
         }
         if (p->pkt_type == -1) app_loss_detected = 1;
 
-        /* 首次丢包 → 立即重传（直接 UDP，不等任何定时器） */
-        if (ctx->send_imm_fn) {
+        /* 首次丢包 → 立即重传（直接 UDP，不等任何定时器）。
+         *
+         * ⚠️ **每次进入本函数（=每收到一个 ACK）最多发这么多**。
+         * 原来这里对**每一个**新判定为 lost 的包都立刻用 send_imm 发一遍，
+         * 而 send_imm **绕过 cwnd 和 pacing**；detect_losses 又是每个 ACK 都跑。
+         * 于是：一个 ACK 判定几百个包 lost → 立刻几百个不经拥塞控制的包，
+         * 每个都消耗一个**新 PN**。PN 因此远远跑到对端前面（实测客户端
+         * pn≈704k，而对端 ACK 里的 largest 只有 ≈110k），4096 条的
+         * sent_packet 环早就把那一段挤掉了 —— 之后每一个 ACK 都匹配不上
+         * （实测 progress 恒为 0、acked_total 冻在 32325），
+         * bif 涨到 2MB 而 cwnd 只有 12KB，BBR 的 max_bw 塌到 1，
+         * 最终就是网页端看到的「放了几秒然后卡死」。
+         *
+         * 剩下的 lost 包不用急：它们还留在 chunk 表里，由同样设了上限的 PTO
+         * 兜底重传。 */
+        #define QUIC_LOSS_RETRANSMIT_PER_PASS 4
+        if (ctx->send_imm_fn && fast_retx < QUIC_LOSS_RETRANSMIT_PER_PASS) {
             ctx->current_retrans_chunk_id_ = p->chunk_id;
             ctx->send_imm_fn(ctx->conn_, p->pkt_type, p->frames, p->frames_len);
+            fast_retx++;
             /* 必须记账：PTO 循环靠这两个字段判断「刚重传过」。
              * 不更新的话 last_retrans_ms 停留在旧值，冷却判断恒真、
              * PTO 会立刻把同一个 chunk 再重传一次（实测日志里
@@ -549,24 +660,62 @@ static void on_pto_timer(void *user) {
         }
     }
 
-    /* PTO 兜底：遍历 chunk，找到未 ACK 的 → 直接 UDP 重传 */
+    /* PTO 兜底：遍历 chunk，找到未 ACK 的 → 直接 UDP 重传。
+     *
+     * ⚠️ **每次 PTO 只探这么多包**（RFC 9002 §6.2.4：PTO 到期发一到两个
+     * ack-eliciting 包去探路），**不是**把整个 chunk 表全量重发。
+     *
+     * 原来这里是"每个 PTO 把所有未确认的 chunk 都重传一遍"，而且走 send_imm
+     * ——**绕过 cwnd 和 pacing**。池子满时就是 512 × 1.2KB ≈ 600KB / PTO，
+     * pto_base ~100-300ms ⇒ **约 6MB/s 的重传风暴**。实测（Android → 本机）：
+     *   客户端 PN 在 390 秒里涨了 2.55M（≈6500 包/秒、≈7MB/s），
+     *   而编码器只产 1.2Mbps（≈125 包/秒）—— 多出来的 50 倍全是重传。
+     * 链路被自己灌满 → 丢包 → 更多未确认 chunk → 下个 PTO 再全量重发 →
+     * **自锁**。这也正解释了「局域网怎么会丢这么多包」：不是网络丢的，
+     * 是我们自己打崩的。bif 涨到 973KB、cwnd 卡在 12KB、新数据一个字节发不出去。
+     */
+    #define QUIC_PTO_PROBES_PER_TIMER 4
+    int probes_sent = 0;
     for (int i = 0; i < ctx->chunk_count_; i++) {
         QuicRecoveryChunk *c = &ctx->chunks_[i];
         if (c->state == QUIC_CHUNK_ACKED || !c->frames) continue;
+        if (probes_sent >= QUIC_PTO_PROBES_PER_TIMER) break;
 
         /* PTO 冷却：20 次重传后放弃 + 同 chunk 一个 pto_base_ 内不重复重传。
          * 放弃上限仅对应用层（1-RTT）生效；握手空间（Initial/Handshake）
-         * 豁免，持续重传到握手完成清理，避免弱网握手死锁。 */
+         * 豁免，持续重传到握手完成清理，避免弱网握手死锁。
+         *
+         * ⚠️ **还要加一道「毫无进展」的闸**（QUIC_RECOVERY_NO_PROGRESS_MS）。
+         * 单看 retrans_count 会误杀：一条因为 ACK 丢失而始终没被标记确认的
+         * chunk 会一路重传到 20，可此时整条路可能好得很 —— 实测触发的那一刻
+         * 对端 98% 的媒体都收到了、新的 group 流还在开。那一次就是这个误判把
+         * 整条会话关掉的。判据改成「这一条卡住 **且** 最近一段时间一个包都没
+         * 被新确认」：前者说明这条 chunk 过不去，后者才说明路真的死了。 */
         if (c->retrans_count >= 20 && c->pkt_type == -1) {
-            LOG_WARN("[quic-recovery] PTO retrans over count:%d chunk=%llu %zuB state=%d"
-                     " retrans=%d",
-                     c->retrans_count,
-                     (unsigned long long)c->chunk_id, c->frames_len,
-                     c->state, c->retrans_count);
-            if(ctx->on_connection_dead) {
-                LOG_WARN("[quic-recovery] PTO retrans over call on_connection_dead");
-                ctx->on_connection_dead(ctx->conn_);
-                return;
+            uint64_t now_pto = uv_now(ctx->loop_);
+            if (ctx->last_progress_ms_ != 0 &&
+                now_pto - ctx->last_progress_ms_ <= QUIC_RECOVERY_NO_PROGRESS_MS) {
+                /* 路还在跑 → 这条 chunk 只是不幸，继续重传它，别动整条会话。 */
+                static int warned = 0;
+                if (warned < 5) {
+                    warned++;
+                    LOG_WARN("[quic-recovery] chunk=%llu retrans=%d but path is still "
+                             "making progress (%llums since last ACK) — NOT killing the "
+                             "session",
+                             (unsigned long long)c->chunk_id, c->retrans_count,
+                             (unsigned long long)(now_pto - ctx->last_progress_ms_));
+                }
+            } else {
+                LOG_WARN("[quic-recovery] PTO retrans over count:%d chunk=%llu %zuB state=%d"
+                         " retrans=%d",
+                         c->retrans_count,
+                         (unsigned long long)c->chunk_id, c->frames_len,
+                         c->state, c->retrans_count);
+                if (ctx->on_connection_dead) {
+                    LOG_WARN("[quic-recovery] PTO retrans over call on_connection_dead");
+                    ctx->on_connection_dead(ctx->conn_);
+                    return;
+                }
             }
         }
         /* 首次发送后至少等一个 pto_base_ 才允许 PTO 重传。
@@ -591,10 +740,13 @@ static void on_pto_timer(void *user) {
                  c->state, c->retrans_count);
         if (ctx->send_imm_fn) {
             ctx->current_retrans_chunk_id_ = c->chunk_id;
-            LOG_WARN("[quic-recovery] PTO retrans chunk=%llu %zuB retrans=%d pto=%llu",
-                     (unsigned long long)c->chunk_id, c->frames_len,
-                     c->retrans_count, (unsigned long long)ctx->pto_count_);
+            /* 上面那条 LOG_DEBUG 已经覆盖同一件事；PTO 重传风暴时这条按 chunk
+             * 数刷屏，降到 DEBUG。 */
+            LOG_DEBUG("[quic-recovery] PTO retrans chunk=%llu %zuB retrans=%d pto=%llu",
+                      (unsigned long long)c->chunk_id, c->frames_len,
+                      c->retrans_count, (unsigned long long)ctx->pto_count_);
             ctx->send_imm_fn(ctx->conn_, c->pkt_type, c->frames, c->frames_len);
+            probes_sent++;
         }
         c->retrans_count++;
         c->last_retrans_ms = now;
@@ -761,9 +913,9 @@ void quic_recovery_on_packet_sent(QuicRecoveryCtx *ctx, uint64_t pn,
                 LOG_ERROR("[quic-recovery] parse_stream failed, used=%d", used);
                 break;
             }
-            LOG_WARN("[retrans-audit] new_pn=%llu chunk=%llu stream=%llu off=%llu len=%zu",
-                     (unsigned long long)pn, (unsigned long long)c->chunk_id,
-                     (unsigned long long)sid, (unsigned long long)off, sl);
+            LOG_DEBUG("[retrans-audit] new_pn=%llu chunk=%llu stream=%llu off=%llu len=%zu",
+                      (unsigned long long)pn, (unsigned long long)c->chunk_id,
+                      (unsigned long long)sid, (unsigned long long)off, sl);
             fp += used; flen -= (size_t)used;
         }
     }
@@ -791,7 +943,33 @@ void quic_recovery_on_ack_received(QuicRecoveryCtx *ctx,
     detect_losses(ctx, now_ms);
     compact_sent_packets(ctx);
 
-    if (progress) ctx->pto_count_ = 0;
+    /* ── 观测：对端回的 ACK 到底有没有到、我们能不能用上 ──────────────
+     * 与服务端 quic_connection.c 里的「ACK queued」是一对，用来判定故障卡在
+     * 哪一侧：
+     *   - 故障期间**没有**这行 → ACK 根本没到我们手里（回程路径）
+     *   - 有这行但 progress=0 → ACK 到了却清不掉任何东西（PN/记账不匹配）
+     *   - progress=1 → 正常在用
+     * 1s 限流，别刷屏。 */
+    {
+        static uint64_t last_ms, n;
+        n++;
+        if (last_ms == 0 || now_ms - last_ms >= 1000) {
+            last_ms = now_ms;
+            LOG_DEBUG("[quic-recovery] ACK rx: largest=%llu first_range=%llu ranges=%d "
+                      "progress=%d acked_total=%llu (n=%llu)",
+                     (unsigned long long)ack->largest_acknowledged,
+                     (unsigned long long)ack->first_ack_range,
+                     ack->num_ranges, progress,
+                     (unsigned long long)ctx->packets_acked_,
+                     (unsigned long long)n);
+        }
+    }
+
+    if (progress) {
+        ctx->pto_count_ = 0;
+        /* 有包被新确认 = 路还活着。on_connection_dead 的闸门要用它（见下）。 */
+        ctx->last_progress_ms_ = now_ms;
+    }
     arm_pto_timer(ctx);
 }
 

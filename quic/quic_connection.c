@@ -158,6 +158,12 @@ struct QuicConnection {
     uint64_t   idle_timeout_ms_;
     QuicTimer  idle_timer_;
 #define QUIC_IDLE_TIMEOUT_DEFAULT_MS 20000
+    /* 最后一次收到 / 发出 UDP 包的时刻（uv_now 毫秒）。空闲超时触发时打进
+     * 日志，用来区分「对端不发了」和「我们自己也早就不发了」：
+     *   last_tx 很久以前 → 是本端停发（流控/拥塞/业务没数据），不是对端的问题。
+     *   last_tx 就在 1 秒内、last_rx 20 秒前 → 我们一直在发，对端一个包都没回。 */
+    uint64_t   last_rx_ms_;
+    uint64_t   last_tx_ms_;
 
     /* 保活（PING at idle_timeout/2） */
     int        keepalive_enabled_;
@@ -390,11 +396,13 @@ static void log_cwnd_block(QuicConnection *conn, const char *where) {
         conn->recovery_ctx_.cc_->ops->get_info) {
         conn->recovery_ctx_.cc_->ops->get_info(conn->recovery_ctx_.cc_, &info);
     }
-    LOG_INFO("[quic-conn] %s deferred by cwnd bif=%llu cwnd=%llu payload=%zu backoff=%dms, cwnd=%llu max_bw_bps=%llu, state:%d, min_rtt_us=%llu",
-             where,
-             (unsigned long long)bif, (unsigned long long)cwnd,
-             conn->pkt_payload_len_, conn->flush_backoff_ms_,
-            info.cwnd, info.max_bw_bps, info.state, info.min_rtt_us);
+    /* 被 cwnd 挡住是**稳态行为**（尤其 pacing floor 生效时），1s 一条会把
+     * INFO 日志淹掉；排查拥塞控制时切 debug。 */
+    LOG_DEBUG("[quic-conn] %s deferred by cwnd bif=%llu cwnd=%llu payload=%zu backoff=%dms, cwnd=%llu max_bw_bps=%llu, state:%d, min_rtt_us=%llu",
+              where,
+              (unsigned long long)bif, (unsigned long long)cwnd,
+              conn->pkt_payload_len_, conn->flush_backoff_ms_,
+              info.cwnd, info.max_bw_bps, info.state, info.min_rtt_us);
 }
 
 /* 从 CC 刷新 pacing 速率。仅 BBR 会填 pacing_rate_bps，
@@ -427,12 +435,13 @@ static void log_pacing_block(QuicConnection *conn) {
         return;
     }
     conn->last_pacing_block_log_ms_ = now;
-    LOG_INFO("[quic-conn] flush deferred by pacing payload=%zu rate=%llu B/s "
-             "tokens=%.0f burst=%llu",
-             conn->pkt_payload_len_,
-             (unsigned long long)pacing_send_rate(&conn->pacer_),
-             conn->pacer_.tokens,
-             (unsigned long long)conn->pacer_.max_burst);
+    /* 同上：pacing 挡一下是正常的，稳态下每秒一条没有信息量。 */
+    LOG_DEBUG("[quic-conn] flush deferred by pacing payload=%zu rate=%llu B/s "
+              "tokens=%.0f burst=%llu",
+              conn->pkt_payload_len_,
+              (unsigned long long)pacing_send_rate(&conn->pacer_),
+              conn->pacer_.tokens,
+              (unsigned long long)conn->pacer_.max_burst);
 }
 
 /* pacing 阻塞时的退避：固定一个 tick，不走指数退避。
@@ -540,6 +549,29 @@ int quic_conn_queue_frames(void *vconn, const uint8_t *frames, size_t flen) {
     return 0;
 }
 
+/* ── ACK 观测（排查「发送端一直重传、收端到底回没回 ACK」）────────────
+ *
+ * 1-RTT 的 ACK 从 quic_conn_queue_ack() 走（record_rx_pn 只记账），
+ * 出现 gap 时的立即 ACK 从 build_and_send_ack() 走。两处都打一行，1s 限流。
+ *
+ * 这张日志是判断「到底是丢包还是我们没回 ACK」最直接的证据：
+ *   - 故障期间**完全没有**这行 → 那些包根本没被收到（网络 / 解密 / PN 解码）
+ *   - 有这行，但 largest 停在原地不往前走 → ACK 内容或 PN 记账的问题
+ *   - alen < 0 那条 ERROR → ACK 帧根本没拼出来（会被静默丢掉，见下）
+ */
+static void log_ack_observability(QuicConnection *conn, const char *where,
+                                  uint64_t largest, uint64_t first_range, int alen) {
+    static uint64_t last_ms;
+    static uint64_t n;
+    uint64_t now = uv_now(conn->loop_);
+    n++;
+    if (last_ms != 0 && now - last_ms < 1000) return;
+    last_ms = now;
+    LOG_DEBUG("[quic-conn] ACK %s: largest=%llu first_range=%llu alen=%d (total=%llu)",
+              where, (unsigned long long)largest, (unsigned long long)first_range,
+              alen, (unsigned long long)n);
+}
+
 void quic_conn_queue_ack(void *vconn) {
     QuicConnection *conn = (QuicConnection*)vconn;
     int level = QUIC_TLS_LEVEL_APPLICATION;
@@ -555,7 +587,19 @@ void quic_conn_queue_ack(void *vconn) {
     ack.first_ack_range      = conn->ack_first_range_[level];
 
     int alen = quic_frame_write_ack(ack_buf, sizeof(ack_buf), &ack);
-    if (alen < 0) return;
+    if (alen < 0) {
+        /* ⚠️ 原来是**静默 return**：need_ack_ 上面已经清零了，这个 ACK 就这么
+         * 丢了，而且不会重试（要等下一个包到达才重新置位）。收端于是对已经收到的
+         * 包不回 ACK，发端只能一直重传 —— 正是我们要排查的那种症状。
+         * 现在至少能在日志里看到它。 */
+        LOG_ERROR("[quic-conn] ACK frame write FAILED (largest=%llu first_range=%llu)"
+                  " — ACK dropped, peer will see no ack for it",
+                  (unsigned long long)ack.largest_acknowledged,
+                  (unsigned long long)ack.first_ack_range);
+        return;
+    }
+    log_ack_observability(conn, "queued", ack.largest_acknowledged,
+                          ack.first_ack_range, alen);
 
     /* ACK 帧放在最前面 */
     if (conn->pkt_payload_len_ + (size_t)alen > QUIC_MAX_PAYLOAD_LEN) {
@@ -1185,7 +1229,36 @@ static void do_udp_send(QuicConnection *conn, const uint8_t *data, size_t len) {
         free(ctx);
         return;
     }
+    conn->last_tx_ms_ = uv_now(conn->loop_);
     stats_on_send(conn, len);
+
+    /* ── 发送速率摘要（1s 一次）────────────────────────────────────
+     * 直接回答「是不是一阵一阵地发」：每秒的包数/字节数，以及当时的 in-flight
+     * 和 pacing 速率。平稳时应该接近恒定（30fps H.264 + 48kHz AAC ≈ 125 包/s、
+     * 约 160KB/s）；忽大忽小就是突发。
+     * 接收端看到的「一会儿卡住、一会儿飞快」多半就是这里的列在跳。
+     * ⚠️ static 是进程级共享的：客户端只有一个连接，无所谓；服务端多连接时
+     * 看到的是**汇总**，用来判断「服务端整体是不是在打嗝」也够用。 */
+    {
+        static uint64_t tx_last_ms, tx_pkts, tx_bytes;
+        uint64_t now = uv_now(conn->loop_);
+        tx_pkts++;
+        tx_bytes += len;
+        if (tx_last_ms == 0) {
+            tx_last_ms = now;
+        } else if (now - tx_last_ms >= 1000) {
+            uint64_t dt = now - tx_last_ms;
+            LOG_INFO("[quic-conn] tx rate: %llu pkt/s, %llu B/s "
+                     "(bif=%llu pacing=%llu B/s)",
+                     (unsigned long long)(tx_pkts * 1000 / dt),
+                     (unsigned long long)(tx_bytes * 1000 / dt),
+                     (unsigned long long)quic_recovery_get_bytes_in_flight(&conn->recovery_ctx_),
+                     (unsigned long long)pacing_send_rate(&conn->pacer_));
+            tx_pkts = 0;
+            tx_bytes = 0;
+            tx_last_ms = now;
+        }
+    }
 }
 
 /* 判断 payload 是否包含 ack-eliciting 数据帧（STREAM/CRYPTO）。
@@ -1481,6 +1554,8 @@ static int build_and_send_ack(QuicConnection *conn, int level) {
                   (unsigned long long)ack.first_ack_range, level);
         return -1;
     }
+    log_ack_observability(conn, "sent-now", ack.largest_acknowledged,
+                          ack.first_ack_range, alen);
 
     /* ACK 帧作为单独的短头包发送，或捎带在下一个出站包中 */
     /* 简化：如果 ACK 后还有数据发送，会自然捎带。这里发送单独的 ACK-only 包 */
@@ -1576,6 +1651,7 @@ void QuicConnectionFeedRaw(QuicConnection *conn,
     uint8_t       *replay_buf_to_free = NULL;  /* 非 NULL 表示来自 goto 回放 */
     if (conn->state_ == QUIC_STATE_CLOSED) return;
 
+    conn->last_rx_ms_ = uv_now(conn->loop_);
     arm_idle_timer(conn);
 
     /* RFC 9000 §8.1: 记录接收字节用于反放大检测 */
@@ -2772,8 +2848,17 @@ void QuicConnectionSetOnStreamReset(QuicConnection *conn,
 static void on_idle_timer(void *user) {
     QuicConnection *conn = (QuicConnection*)user;
     if (!conn || conn->freeing_ || conn->state_ >= QUIC_STATE_CLOSING) return;
-    LOG_INFO("[quic-conn] idle timeout after %llums, closing connection",
-             (unsigned long long)conn->idle_timeout_ms_);
+    const uint64_t now = uv_now(conn->loop_);
+    const uint64_t rx_age = (conn->last_rx_ms_ && now >= conn->last_rx_ms_)
+                            ? now - conn->last_rx_ms_ : 0;
+    const uint64_t tx_age = (conn->last_tx_ms_ && now >= conn->last_tx_ms_)
+                            ? now - conn->last_tx_ms_ : 0;
+    LOG_INFO("[quic-conn] idle timeout after %llums: peer=%s:%d "
+             "last_rx=%llums ago last_tx=%llums ago — closing",
+             (unsigned long long)conn->idle_timeout_ms_,
+             conn->peer_ip_[0] ? conn->peer_ip_ : "?",
+             conn->peer_port_,
+             (unsigned long long)rx_age, (unsigned long long)tx_age);
     QuicConnectionClose(conn, QUIC_ERR_IDLE_TIMEOUT, "idle timeout");
 }
 

@@ -2,6 +2,8 @@
 #include "quic_connection.h"
 #include "quic_stream.h"
 #include "logger.h"
+#include <netdb.h>      /* struct addrinfo / AF_INET / SOCK_DGRAM —— uv_getaddrinfo 用 */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -45,6 +47,11 @@ struct quic_client {
     uv_mutex_t              task_mutex;
     qc_task_t              *task_head;
     qc_task_t              *task_tail;
+    /* ⚠️ 队列长度必须记着，而且必须有上限。生产者（编码器线程写帧）通常
+     * 远远快于消费者（loop 线程；一旦它卡住就更明显），无界队列会把进程的
+     * 地址空间吃光 —— 实测连调试器都在里面 malloc 失败
+     * （"address space is full"）。 */
+    int                     task_count;
 
     /* 本客户端要 offer 的 ALPN（NULL = 用 tls_ctx_set_alpn 的写死默认）。
      * 存**副本**而不是借指针：quic_client_set_alpn 可能从任意线程调用，而真正
@@ -52,22 +59,54 @@ struct quic_client {
      * 自己那份字符串。 */
     char                  **alpn;
     int                     alpn_count;
+
+    /* 本轮连接的代号。DNS 解析是**异步**的，期间调用方完全可能已经 close 了 ——
+     * 回调里靠它判断自己是不是过期了（见 on_resolved）。close 时自增。 */
+    uint64_t                gen;
+    /* 正在进行的解析（NULL = 没有）。close 时用来 uv_cancel，避免那个 request
+     * 吊着 loop 不放（uv_loop_close 会返回 EBUSY）。 */
+    struct qc_resolve      *resolve;
 };
 
 /* ── task queue (mutex) ────────────────────────── */
 
+/* 4096 太宽了：每个写任务还拷着一整帧（关键帧几十 KB），4096 × 几十 KB
+ * 就是上百 MB。1024 ≈ 8 秒的帧量，对「loop 短暂卡一下」已经绰绰有余。 */
+#define QC_TASK_QUEUE_MAX 1024
+
 static void task_push(quic_client_t *c, qc_task_t *t) {
     uv_mutex_lock(&c->task_mutex);
+    /* ⚠️ 上限保护。生产者（编码器线程）通常远快于消费者（loop 线程），
+     * 队列无界会把进程的地址空间吃光 —— 实测连调试器都在里面 malloc 失败
+     * （"address space is full"）。满了就丢**新来的**；但 CLOSE **永远放行**，
+     * 否则连接既发不出数据、也关不掉。 */
+    if (t->type != QC_TASK_CLOSE && c->task_count >= QC_TASK_QUEUE_MAX) {
+        static uint64_t dropped;
+        dropped++;
+        uv_mutex_unlock(&c->task_mutex);
+        free(t->host);
+        free(t->data);
+        free(t);
+        if (dropped == 1 || dropped % 1000 == 0) {
+            LOG_WARN("[qc-api] task queue full (%d), dropped %llu tasks",
+                     QC_TASK_QUEUE_MAX, (unsigned long long)dropped);
+        }
+        return;
+    }
     t->next = NULL;
     if (!c->task_head) c->task_head = c->task_tail = t;
     else c->task_tail->next = t, c->task_tail = t;
+    c->task_count++;
     uv_mutex_unlock(&c->task_mutex);
 }
 
 static qc_task_t *task_pop(quic_client_t *c) {
     uv_mutex_lock(&c->task_mutex);
     qc_task_t *t = c->task_head;
-    if (t) c->task_head = t->next;
+    if (t) {
+        c->task_head = t->next;
+        if (c->task_count > 0) c->task_count--;
+    }
     if (!c->task_head) c->task_tail = NULL;
     uv_mutex_unlock(&c->task_mutex);
     return t;
@@ -232,6 +271,125 @@ int quic_client_stream_is_uni(const quic_stream_t *s) {
 }
 
 /* ============================================
+ * DNS 解析 —— connect 之前把 host 解成 IPv4 字面量
+ *
+ * ⚠️ **为什么必须限 IPv4**：本仓 QUIC 的发送路径是写死的 IPv4 ——
+ * quic_connection.c 里 `struct sockaddr_in addr; addr.sin_family = AF_INET;
+ * uv_ip4_addr(conn->peer_ip_, …)`。DNS 若先返回 AAAA（很常见，getaddrinfo
+ * 通常偏好 IPv6），那个 v6 字面量喂给 uv_ip4_addr 会解析失败、sockaddr 全零，
+ * 包等于发到 0.0.0.0 —— **不报错**。所以 hints.ai_family = AF_INET。
+ *
+ * 刻意**不判断**「这是域名还是 IP 字面量」：uv_getaddrinfo 对数字字面量本来
+ * 就立即返回（不走网络），一条路径两种情况都能吃 —— 少一处会写错的判断
+ * （IPv6 方括号、inet_pton 的返回值、前导零…）。
+ *
+ * 解析是异步的，所以中间必然存在「还没连上但也没失败」的窗口。期间调用方
+ * 可能 close —— 回调里靠 gen 判断自己是否过期（见 on_resolved）。
+ * ============================================ */
+
+typedef struct qc_resolve {
+    quic_client_t   *c;
+    qc_task_t       *task;      /* CONNECT 任务：解析收尾时才释放 */
+    uint64_t         gen;       /* 发起时的代号 */
+    uv_getaddrinfo_t req;
+} qc_resolve_t;
+
+static void on_resolved(uv_getaddrinfo_t *req, int status, struct addrinfo *res);
+
+/* 建 SSL 参数、发起握手。ip 必须是 IPv4 字面量（解析那步保证了）。 */
+static void qc_do_connect(quic_client_t *c, const char *ip, int port) {
+    c->qc = QuicConnectionCreate(c->loop);
+    if (!c->qc) {
+        c->state = QC_STATE_IDLE;
+        if (c->cb.on_connect) c->cb.on_connect(c, -1, c->cb.user_data);
+        return;
+    }
+    QuicConnectionSetIdleTimeout(c->qc, 300000);
+    QuicConnectionSetAppData(c->qc, c);
+    QuicConnectionSetOnConnected(c->qc, on_quic_connected);
+    QuicConnectionSetOnStreamData(c->qc, on_quic_stream_data);
+    QuicConnectionSetOnStreamReset(c->qc, on_quic_stream_reset);
+    QuicConnectionSetOnClose(c->qc, on_quic_close);
+    /* ALPN 必须在 Connect 之前设 —— 它设的是已建好的 SSL 对象，握手一发起
+     * offer 就发出去了。不设时保持 tls_ctx_set_alpn 的写死默认。 */
+    if (c->alpn && c->alpn_count > 0) {
+        QuicConnectionSetAlpnList(c->qc,
+                                  (const char *const *)c->alpn,
+                                  c->alpn_count);
+    }
+    QuicConnectionConnect(c->qc, ip, port);
+}
+
+/* 发起解析。返回 0 = request 已排上（task 由回调释放，调用方**不要**再 free），
+ * <0 = 没发起（调用方照旧 free task）。 */
+static int qc_start_resolve(quic_client_t *c, qc_task_t *t) {
+    qc_resolve_t *r = (qc_resolve_t*)calloc(1, sizeof(*r));
+    if (!r) return -1;
+    r->c    = c;
+    r->task = t;
+    r->gen  = c->gen;
+    r->req.data = r;
+
+    char port[16];
+    snprintf(port, sizeof(port), "%d", t->port);
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_INET;        /* ⚠️ 见上面的说明 */
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = IPPROTO_UDP;
+
+    int rc = uv_getaddrinfo(c->loop, &r->req, on_resolved, t->host, port, &hints);
+    if (rc != 0) {
+        LOG_WARN("[qc-api] uv_getaddrinfo(%s) failed: %s", t->host, uv_strerror(rc));
+        free(r);
+        return -1;
+    }
+    c->resolve = r;
+    return 0;
+}
+
+static void on_resolved(uv_getaddrinfo_t *req, int status, struct addrinfo *res) {
+    qc_resolve_t  *r = (qc_resolve_t*)req->data;
+    quic_client_t *c = r->c;
+    qc_task_t     *t = r->task;
+
+    /* 过期判定：解析期间可能已经 close（gen 变了），或状态已经不是 CONNECTING。
+     * 这两条都不能省 —— 过期了还去建连接，就是给一个已经关掉的会话装新连接。 */
+    const int stale = (r->gen != c->gen) ||
+                      (c->state != QC_STATE_CONNECTING) || c->closing;
+
+    char ip[64] = {0};
+    if (!stale && status == 0 && res) {
+        for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+            if (ai->ai_family != AF_INET || !ai->ai_addr) continue;
+            uv_ip4_name((const struct sockaddr_in*)ai->ai_addr, ip, sizeof(ip));
+            break;
+        }
+    }
+    if (res) uv_freeaddrinfo(res);
+    if (c->resolve == r) c->resolve = NULL;
+
+    if (stale) {
+        free(t->host); free(t->data); free(t); free(r);
+        return;
+    }
+
+    if (ip[0]) {
+        LOG_INFO("[qc-api] resolved %s:%d -> %s", t->host, t->port, ip);
+        qc_do_connect(c, ip, t->port);
+    } else {
+        /* 解析不出来要**明确报失败**，不能让调用方一直等 on_connect。 */
+        LOG_WARN("[qc-api] cannot resolve \"%s\" (%s)", t->host,
+                 status != 0 ? uv_strerror(status) : "no IPv4 address");
+        c->state = QC_STATE_IDLE;
+        if (c->cb.on_connect)
+            c->cb.on_connect(c, status != 0 ? status : -1, c->cb.user_data);
+    }
+    free(t->host); free(t->data); free(t); free(r);
+}
+
+/* ============================================
  * loop 线程 — async_cb
  * ============================================ */
 
@@ -243,22 +401,14 @@ static void async_cb(uv_async_t *h) {
         case QC_TASK_CONNECT:
             if (c->state == QC_STATE_IDLE) {
                 c->state = QC_STATE_CONNECTING;
-                c->qc = QuicConnectionCreate(c->loop);
-                QuicConnectionSetIdleTimeout(c->qc, 300000);
-                QuicConnectionSetAppData(c->qc, c);
-                QuicConnectionSetOnConnected(c->qc, on_quic_connected);
-                QuicConnectionSetOnStreamData(c->qc, on_quic_stream_data);
-                QuicConnectionSetOnStreamReset(c->qc, on_quic_stream_reset);
-                QuicConnectionSetOnClose(c->qc, on_quic_close);
-                /* ALPN 必须在 Connect 之前设 —— 它设的是已建好的 SSL 对象，
-                 * 握手一发起 offer 就发出去了。不设时保持 tls_ctx_set_alpn
-                 * 的写死默认（h3 + quic-echo），老调用方行为不变。 */
-                if (c->alpn && c->alpn_count > 0) {
-                    QuicConnectionSetAlpnList(c->qc,
-                                              (const char *const *)c->alpn,
-                                              c->alpn_count);
-                }
-                QuicConnectionConnect(c->qc, t->host, t->port);
+                c->gen++;                 /* 本轮连接的代号，close 时再自增 */
+                /* 先解析再连。解析成功的话 task 交给 on_resolved 释放，
+                 * 所以这里必须 continue —— 跳过循环尾部那次 free。 */
+                if (qc_start_resolve(c, t) == 0) continue;
+                /* 连解析都没排上（OOM / uv 报错）：立刻报失败，别让调用方干等。 */
+                c->state = QC_STATE_IDLE;
+                if (c->cb.on_connect)
+                    c->cb.on_connect(c, -1, c->cb.user_data);
             }
             break;
         case QC_TASK_OPEN_STREAM:
@@ -279,6 +429,13 @@ static void async_cb(uv_async_t *h) {
             break;
         case QC_TASK_CLOSE:
             c->closing = 1; c->state = QC_STATE_CLOSING;
+            /* 作废在途的解析：gen 一变，on_resolved 就会把自己判成过期并只做清理。
+             * 另外 uv_cancel 一下，免得那个 request 吊着 loop（loop_close 会 EBUSY）。
+             * ⚠️ 这里**不能**自己 free(r) —— 取消掉的 request 仍会回调一次，
+             * 由回调释放。uv_cancel 返回 EBUSY 表示它已经完成、结果正在路上，
+             * 那条路同样由回调的 gen 检查兜住。 */
+            c->gen++;
+            if (c->resolve) uv_cancel((uv_req_t*)&c->resolve->req);
             /* ALPN 表用完即弃 —— 连接关了它不再有意义，留着只是内存。
              * （本 API 不负责释放 quic_client_t 自身，与既有行为一致。） */
             if (c->alpn) {

@@ -1,0 +1,95 @@
+# ============================================================
+# Android 客户端（tools/android）的忽略规则
+#
+# 基准是官方模板 github/gitignore 的 Android.gitignore（2026-10 取的那版），
+# 再加本仓特有的两条（见文件末尾）。
+#
+# ⚠️ **仓库根的 .gitignore 已经覆盖了一部分，这里不重复**：
+#     build/          → `app/build`、`build/openssl`（OpenSSL 的构建目录）都在内
+#     *.log  *.so  *.a  *.o  *.dylib
+#     .idea/          → 整个目录（官方模板也是整目录忽略）
+#     *.DS_Store  compile_commands.json
+#
+# ⚠️ 官方模板**故意不收**的几类（老模板有、现在删掉了，因为都被 `build/` 覆盖）：
+#     *.dex  *.class  *.ap_  *.aar  gen/  out/  proguard/
+#   本文件也**不加回来** —— 多一条规则就多一处能静默吃掉东西的地方。
+#
+# ⚠️ 有几类文件是**故意要进仓库**的，别顺手 ignore 掉：
+#     gradle/wrapper/gradle-wrapper.jar      构建入口，缺了 ./gradlew 跑不起来
+#     gradle/gradle-daemon-jvm.properties    钉住 daemon 用的 JDK 工具链
+#     gradle/libs.versions.toml              版本目录（AGP/Kotlin/Compose 版本）
+#     app/src/main/assets/**                 随包资源
+#
+# ⚠️ **不要**加 `*.pem` / `*.key`：本仓的 cert/ 是**故意提交**的。这里说的
+#   "签名材料" 指 Android 的 keystore，不是 TLS 证书，两者别混。
+# ============================================================
+
+# ── 本机配置（含绝对路径，绝不进仓库）─────────────
+# 里面有 sdk.dir（可能还有 ndk.dir）—— 每台机器都不一样，提交上去别人编不过。
+local.properties
+
+# ── Gradle / Kotlin 构建缓存 ────────────────────
+.gradle/
+# Kotlin 2.x（K2）之后新出的构建缓存目录。官方模板已收录。
+.kotlin/
+/captures
+
+# ── NDK / JNI 的中间产物 ────────────────────────
+# `.externalNativeBuild` 是 AS 2.2 起的目录；AS 3.5 起换成 `.cxx/`，两个都忽略。
+# 前者是主 CMake 缓存（含 compile_commands.json、Ninja 文件、探测结果），
+# 后者是 AGP 的 externalNativeBuild 中间层。
+# ⚠️ 前面不留 `/` —— 这两个目录 `app/` 下同样会生成，官方模板也是这个写法
+# （不需要 `**/.cxx/`，不带斜杠的模式本来就匹配任意层级）。
+.cxx/
+.externalNativeBuild/
+
+# ── 签名材料（密钥，别进仓库）────────────────────
+# ⚠️ 这几条在老模板里是**注释掉**的，现在官方已明确打开 —— keystore 泄漏等于
+# 应用身份泄漏，没有任何理由提交。
+*.jks
+*.keystore
+# 下面两个不是官方模板的条目，但 AGP 文档/社区里普遍这么叫，顺手收掉：
+keystore.properties
+key.properties
+
+# ── 打包产物 ────────────────────────────────────
+# 正常情况下都在 `build/` 里（已被仓库根忽略）；这几条是官方模板的清单。
+*.apk
+*.aab
+# AGP 从库模块导出的输出元数据
+output-metadata.json
+
+# ── 构建期生成 ──────────────────────────────────
+# 崩溃转储（官方模板 "Android Profiling" 那节）
+*.hprof
+
+# ── IDE ─────────────────────────────────────────
+*.iml
+# 官方模板现在是**整个 `.idea/` 一起忽略**（本仓根 .gitignore 也是），所以下面
+# 这几条是冗余的。留着无害。
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+
+# ── 本仓特有 ①：预编译的 Android OpenSSL ─────────
+# 由 build_openssl_android.sh 生成，每个 ABI 十几 MB。
+# ⚠️ 必须**整目录**忽略，不能只靠根 .gitignore 的 `*.a`：`.a` 被忽略只是巧合，
+# 而 include/ 下那几千个 OpenSSL 头文件是**会**被提交进去的。
+/3rdparty/openssl/
+
+# ── 本仓特有 ②：例外 —— 预置的依赖要能进仓库 ─────
+# ⚠️ 仓库根的 `*.so` / `*.a` 是**全仓**生效的（官方模板假设没有这种全局规则，
+# 所以它不需要这条）。它会把**预置**在 jniLibs 下的原生库也一起吃掉 ——
+# 那种文件是依赖、不是产物，被静默忽略的后果是「别人 clone 下来编不过，
+# 还找不到为什么」。这里放回来（前提是 jniLibs 目录本身没被忽略，确实没有）。
+!app/src/main/jniLibs/**/*.so
+!app/src/main/jniLibs/**/*.a
+
+# ── 兜底：别让将来某条 `*.jar` 规则吃掉 wrapper ──
+# 现在没有忽略 `*.jar`。但几种主流模板里都有这条 `!` —— 万一以后有人加了
+# `*.jar`、或用生成器合并了别的技术栈，wrapper jar 会**静默**消失，
+# 表现是别人 clone 下来 `./gradlew` 直接跑不起来。零成本，先放着。
+!/gradle/wrapper/gradle-wrapper.jar

@@ -16,9 +16,8 @@
  *   ③ 调 moqlite 的 C API —— set_role(PUBLISHER) → publish → publish_track →
  *      逐帧 track_frame → track_end。
  *
- * ⚠️ 用法里的 host 用**域名**，别用 127.0.0.1：服务端证书没有 IP SAN，做验证
- * 的实现（rustls/libmoq）会以 NotValidForName 拒掉且线上静默。（本 API 的 TLS
- * 是 SSL_VERIFY_NONE，IP 也能连 —— 但别养成习惯。）
+ * 用法里的 host **域名和 IP 都行**（内部走 uv_getaddrinfo 解析；数字字面量不走
+ * 网络）。解析只取 IPv4 —— 本仓 QUIC 的发送路径是写死的 IPv4。
  * ============================================================ */
 
 #include "flv_reader.hpp"          /* tools/flv2moq_client 的那份，逐字复用 */
@@ -335,11 +334,10 @@ void Usage(const char *argv0) {
             "          [-s <speed>] [-t <seconds>] [--vtrack name] [--atrack name]\n"
             "\n"
             "  file       FLV file (H.264 + AAC)\n"
-            "  url        server address; use the DOMAIN, not an IP\n"
-            "             (the server cert has no IP SAN)\n"
+            "  url        moql://host:port/path (domain or IP)\n"
             "  broadcast  on-wire broadcast name, e.g. cli_test.hang\n"
             "\n"
-            "example: %s test.flv moql://www.webrtcserver.com.cn:4433/anon \\\n"
+            "example: %s test.flv moql://192.168.1.221:4433/anon \\\n"
             "             cli_test.hang\n",
             argv0, argv0);
 }

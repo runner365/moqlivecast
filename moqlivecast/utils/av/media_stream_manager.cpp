@@ -46,22 +46,50 @@ namespace cpp_streamer
         const int64_t pts = pkt->pts_ < 0 ? dts : pkt->pts_;
         const int64_t cts = pts - dts;
 
+        /* 回退基线**按轨**取：跨轨比较会把两条时钟的 epoch 差当成回退。 */
+        int64_t &last_in = (pkt->av_type_ == MEDIA_VIDEO_TYPE) ? last_in_video_dts_
+                         : (pkt->av_type_ == MEDIA_AUDIO_TYPE) ? last_in_audio_dts_
+                         : last_in_dts_;
+
         if (clock_reset_pending_ && last_out_dts_ >= 0) {
             ts_shift_ = last_out_dts_ + 40 - dts;
             clock_reset_pending_ = false;
-            last_in_dts_ = -1;
+            last_in_video_dts_ = last_in_audio_dts_ = last_in_dts_ = -1;
             LogInfof(logger_, "stream %s new publisher clock dts=%lld shift=%lld continue=%lld",
                      stream_key_.c_str(), (long long)dts, (long long)ts_shift_,
                      (long long)last_out_dts_);
-        } else if (!pkt->is_seq_hdr_ && last_in_dts_ >= 0 && dts + 1000 < last_in_dts_) {
+        } else if (!pkt->is_seq_hdr_ && last_in >= 0 && dts + 1000 < last_in) {
             ts_shift_ = (last_out_dts_ < 0 ? 0 : last_out_dts_) + 40 - dts;
-            LogInfof(logger_, "stream %s dts reset %lld -> %lld, shift=%lld",
-                     stream_key_.c_str(), (long long)last_in_dts_, (long long)dts,
-                     (long long)ts_shift_);
+            LogInfof(logger_, "stream %s track %s dts reset %lld -> %lld, shift=%lld",
+                     stream_key_.c_str(),
+                     pkt->av_type_ == MEDIA_VIDEO_TYPE ? "video" : "audio",
+                     (long long)last_in, (long long)dts, (long long)ts_shift_);
+            /* 这个 shift 作用在**共享**输出时间轴上，另一条轨的基线也必须清掉，
+             * 否则它下个包会再触发一次「回退」，把时间轴再推 40ms。 */
+            last_in_video_dts_ = last_in_audio_dts_ = last_in_dts_ = -1;
         }
         clock_reset_pending_ = false;
 
-        if (!pkt->is_seq_hdr_) last_in_dts_ = dts;
+        if (!pkt->is_seq_hdr_) last_in = dts;
+
+        /* ── 诊断：两条原始时间轴的 epoch 差 ──
+         * 正常 < 几十 ms；一旦差出秒级，说明发布端的两个时钟不同源。
+         * 旧逻辑会在每次交替时「修正」它，结果是把时间轴加速成倍的灾难；
+         * 现在不改行为，但要让它**可见**。 */
+        if (last_in_video_dts_ >= 0 && last_in_audio_dts_ >= 0) {
+            const int64_t skew = last_in_video_dts_ - last_in_audio_dts_;
+            const int64_t now_s = NowMs() / 1000;
+            if ((skew > 1000 || skew < -1000) && now_s != skew_warn_s_) {
+                skew_warn_s_ = now_s;
+                LogWarnf(logger_,
+                         "stream %s audio/video timestamps differ by %lld ms "
+                         "(video=%lld audio=%lld) — the publisher is using two "
+                         "different clocks; A/V sync will be wrong",
+                         stream_key_.c_str(), (long long)skew,
+                         (long long)last_in_video_dts_,
+                         (long long)last_in_audio_dts_);
+            }
+        }
 
         pkt->dts_ = dts + ts_shift_;
         if (pkt->dts_ < 0) pkt->dts_ = 0;

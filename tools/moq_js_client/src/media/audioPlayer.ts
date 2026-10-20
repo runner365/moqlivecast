@@ -25,7 +25,13 @@ import { log_error, log_info, log_warn } from '../logger'
  *  服务端 1x 推、这里 1x 播，积压不会自己消，环满了顶掉最旧，
  *  播放位置就被顶到 (最新 - 这个值)，稳态延迟等于它。
  *  取值 = 抗网络抖动所需 vs 直播延迟的权衡。见 pcmPlayer.worklet.js 的说明。 */
-const AUDIO_RING_SECONDS = 0.5
+/* ⚠️ 0.5s 太紧了 —— 实测 0.5s 的环在真实链路抖动下累计丢了 231 秒音频
+ * （dropped=11082400 帧），听感就是「声音断断续续、像丢包」。
+ * 而手机→服务端是**完整的**（服务端 delivered 稳定 47 帧/秒），
+ * 服务端→浏览器也稳定（tx rate 平稳、队列零丢弃）—— 丢就丢在这一个环上。
+ * 1.5s 是延迟与抗抖动的折中：稳态延迟就是这个值。要更低延迟就往下调，
+ * 要更稳就往上调。 */
+const AUDIO_RING_SECONDS = 1.5
 
 /** 单次补静音上限（微秒）：超过它说明是时间轴断点（服务端重锚/重启），不是
  *  丢帧 —— 硬补会把时钟推歪，只补到上限并报警（残余误差有界）。
@@ -146,6 +152,9 @@ export class AudioPlayer {
   }
 
   private pushedFrames = 0
+  /** worklet 就绪前被丢掉的帧数（诊断；正常应恒为 0）。 */
+  private droppedBeforeReady = 0
+  private warnedNoNode = false
   /** 上一块写入后的媒体时间（微秒，块尾 pts）。-1 = 还没推过 / 刚 flush。
    *  这里只用它统计 maxDecodedGapUs，**不据此补静音**（见 push() 的说明）。 */
   private lastPushEndUs = -1
@@ -212,6 +221,15 @@ export class AudioPlayer {
     return this.ready
   }
 
+  /** Worklet 环按几个声道/多少采样率分配 —— 调用方必须把 PCM 换成这个形状。 */
+  get sinkChannels(): number {
+    return this.channels
+  }
+
+  get sinkSampleRate(): number {
+    return this.sampleRateHz
+  }
+
   /**
    * 推入一块 PCM（交错 Float32）。ptsUs = 这块的媒体时间戳（微秒）。
    * 第一块会把 basePtsUs 记下来，作为媒体时钟原点。
@@ -223,7 +241,22 @@ export class AudioPlayer {
    */
   push(interleaved: Float32Array, ptsUs: number) {
     const node = this.node
-    if (this.closed || !node) return
+    if (this.closed) return
+    if (!node) {
+      /* worklet 模块是异步加载的，若首包（订阅时的 GOP 回放）比它先到，
+       * 这些 PCM 目前会被**静默丢掉**。丢掉的不只是"迟到的包"——那正是给
+       * 环形缓冲垫底的那一段，丢了它环就起不来，之后每秒都会欠载。 */
+      this.droppedBeforeReady += interleaved.length / this.channels
+      if (!this.warnedNoNode) {
+        this.warnedNoNode = true
+        log_warn(
+          'wc-audio',
+          `push before worklet ready — PCM is being dropped (${this.droppedBeforeReady} frames so far); ` +
+            `the ring will start empty and underrun`,
+        )
+      }
+      return
+    }
     if (this.basePtsUs < 0) {
       this.basePtsUs = ptsUs
       log_info('wc-audio', `media clock base set ptsUs=${ptsUs}`)

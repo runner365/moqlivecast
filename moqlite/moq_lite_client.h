@@ -152,10 +152,18 @@ int moq_lite_session_set_alpn(const char *const *protos, int count);
  *   - 不写路径 = 根；
  *   - 方案只接受 moql:// / moq-lite://（裸 QUIC）。给了 https:// 会返回
  *     MOQ_LITE_ERR_URL —— 那是 WebTransport 那条路，本库不做。
- * ⚠️ host **用域名**（如 www.webrtcserver.com.cn），不要用 127.0.0.1：
- * 服务端证书没有 IP SAN，rustls 之外的严格实现会以 NotValidForName 拒掉。
- * （本库的 TLS 验证是 SSL_VERIFY_NONE，所以 IP 也能连上 —— 但换成任何
- * 做验证的实现就不行了，别养成习惯。）
+ * host **域名和 IP 字面量都行** —— 内部走 uv_getaddrinfo 解析（数字字面量
+ * 本来就立即返回、不走网络），所以下面两种写法都对：
+ *     moql://www.example.com:4433/anon
+ *     moql://192.168.1.221:4433/anon
+ *
+ * ⚠️ 解析**只取 IPv4**：本仓 QUIC 的发送路径是写死的 IPv4（`sockaddr_in` +
+ * uv_ip4_addr），拿到 AAAA 会解析失败、包发到 0.0.0.0 去 —— **不报错**。
+ * 所以纯 IPv6 的域名连不上（要支持得先改 UDP 发送路径）。
+ *
+ * 证书那件事和这里无关：本库 TLS 是 SSL_VERIFY_NONE、不校验证书，所以服务端
+ * 证书没有 IP SAN 也照样连 —— 填 IP 就行。反过来，**做证书校验**的客户端
+ * （moq-cli / libmoq）必须用域名，否则以 NotValidForName 拒掉。
  * 返回 0 成功入队（结果走 on_connected），<0 立即失败见错误码。 */
 int moq_lite_session_connect(moq_lite_session_t s, const char *url,
                              const moq_lite_session_cb_t *cb);

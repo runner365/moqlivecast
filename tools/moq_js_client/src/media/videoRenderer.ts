@@ -365,7 +365,14 @@ export class VideoRenderer {
       this.canvas.width = w
       this.canvas.height = h
       gl.viewport(0, 0, w, h)
-      log_info('wc-render', `canvas resized -> ${w}x${h}`)
+      /* 把**来源**也打出来：canvas 用的是 display，若它与 coded 不同，
+       * 说明码流带 crop —— 那会是错位，不是旋转，两者别混。 */
+      const vf = src as Partial<VideoFrame>
+      log_info(
+        'wc-render',
+        `canvas resized -> ${w}x${h} (src display=${vf.displayWidth ?? 'n/a'}x${vf.displayHeight ?? 'n/a'} ` +
+          `coded=${vf.codedWidth ?? 'n/a'}x${vf.codedHeight ?? 'n/a'})`,
+      )
     }
     try {
       gl.bindTexture(gl.TEXTURE_2D, this.texture)

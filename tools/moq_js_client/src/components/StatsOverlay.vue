@@ -1,6 +1,7 @@
 <template>
   <div class="stats" aria-label="media stats">
     <div><span class="k">fps</span>{{ fmt(stats.videoFps, 1) }}</div>
+    <div><span class="k">afps</span>{{ fmt(stats.audioFps, 1) }}</div>
     <div><span class="k">V</span>{{ fmt(stats.videoKbps, 0) }} <span class="u">kbps</span></div>
     <div><span class="k">A</span>{{ fmt(stats.audioKbps, 0) }} <span class="u">kbps</span></div>
     <div><span class="k">GOP</span>{{ gop }}</div>

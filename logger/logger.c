@@ -12,6 +12,7 @@
  * ============================================ */
 typedef struct LogNode {
     char          *line;
+    int            level;      /* 转发给 sink 时要带上等级 */
     struct LogNode *next;
 } LogNode;
 
@@ -28,6 +29,19 @@ static pthread_cond_t  g_cond    = PTHREAD_COND_INITIALIZER;
 static LogNode        *g_head    = NULL;
 static LogNode        *g_tail    = NULL;
 static int             g_running = 0;   /* 0=未启动, 1=运行中, -1=退出中 */
+
+/* ⚠️ 队列上限。**必须**有：写日志的线程往往比落盘快得多（落盘那一侧每行都
+ * fflush），一旦上游刷屏（QUIC 重传风暴一次几千行），队列会无界长下去 ——
+ * 实测把整个进程的地址空间吃光，连调试器都在里面 malloc 失败
+ * （"couldn't allocate space for materialized struct: address space is full"）。
+ * 满了就丢**最旧**的：排障时真正要看的是最后那一段。 */
+#define LOG_QUEUE_MAX 20000
+static int             g_qlen    = 0;
+static uint64_t        g_dropped = 0;
+
+/* 额外出口（见 logger.h）。**只设置一次**（启动前），日志线程只读。 */
+static log_sink_fn     g_sink      = NULL;
+static void           *g_sink_user = NULL;
 
 static const char *level_names[] = { "ERROR", "WARN ", "INFO ", "DEBUG" };
 
@@ -53,6 +67,7 @@ static void *log_thread(void *arg) {
         LogNode *node = g_head;
         g_head = node->next;
         if (!g_head) g_tail = NULL;
+        g_qlen--;
         pthread_mutex_unlock(&g_mutex);
 
         /* 无锁 IO */
@@ -66,6 +81,9 @@ static void *log_thread(void *arg) {
             fputs(node->line, is_err ? stderr : stdout);
             fflush(is_err ? stderr : stdout);
         }
+        /* 额外出口（JNI → Kotlin）。放在 file/console 之后：它最慢
+         * （要过 JVM），别拖慢另外两个。 */
+        if (g_sink) g_sink(node->level, node->line, g_sink_user);
 
         free(node->line);
         free(node);
@@ -107,6 +125,12 @@ void log_set_level(LogLevel level) {
     g_level = level;
 }
 
+void log_set_sink(log_sink_fn fn, void *user) {
+    /* 不加锁：约定在日志线程起来之前设一次，之后只读。 */
+    g_sink_user = user;
+    g_sink      = fn;
+}
+
 void log_shutdown(void) {
     pthread_mutex_lock(&g_mutex);
     if (g_running != 1) {
@@ -131,7 +155,9 @@ void log_shutdown(void) {
 void log_write(LogLevel level, const char *file, int line,
                const char *fmt, ...) {
     if (level > g_level) return;
-    if (!g_log_file && !g_console) return;
+    /* 三个出口全关才真的什么都不用做 —— 少了 g_sink 这一项的话，
+     * 只开 sink（Android 上 console 是关的）时日志会被这里直接吞掉。 */
+    if (!g_log_file && !g_console && !g_sink) return;
 
     /* 时间戳 */
     struct timeval tv;
@@ -166,17 +192,35 @@ void log_write(LogLevel level, const char *file, int line,
 
     LogNode *node = (LogNode*)malloc(sizeof(LogNode));
     if (!node) { free(full); return; }
-    node->line = full;
-    node->next = NULL;
+    node->line  = full;
+    node->level = (int)level;
+    node->next  = NULL;
 
     pthread_mutex_lock(&g_mutex);
     ensure_thread();
+    /* 队列满 → 丢最旧的（见 LOG_QUEUE_MAX 的说明）。 */
+    if (g_qlen >= LOG_QUEUE_MAX) {
+        LogNode *old = g_head;
+        if (old) {
+            g_head = old->next;
+            if (!g_head) g_tail = NULL;
+            g_qlen--;
+            g_dropped++;
+            free(old->line);
+            free(old);
+            if (g_dropped == 1 || g_dropped % 10000 == 0) {
+                fprintf(stderr, "[logger] queue full (%d), dropped %llu old lines\n",
+                        LOG_QUEUE_MAX, (unsigned long long)g_dropped);
+            }
+        }
+    }
     if (g_tail) {
         g_tail->next = node;
         g_tail = node;
     } else {
         g_head = g_tail = node;
     }
+    g_qlen++;
     pthread_cond_signal(&g_cond);
     pthread_mutex_unlock(&g_mutex);
 }

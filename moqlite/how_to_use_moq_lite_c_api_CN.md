@@ -109,7 +109,8 @@ int main(void) {
     moq_lite_session_cb_t cb = {0};
     cb.on_connected = on_connected;
     cb.on_close     = on_close;
-    moq_lite_session_connect(s, "moql://www.webrtcserver.com.cn:4433/anon", &cb);
+    /* host 域名或 IP 都行（解析只取 IPv4）—— 见 API 参考。 */
+    moq_lite_session_connect(s, "moql://relay.example.com:4433/anon", &cb);
 
     uv_run(g_loop, UV_RUN_DEFAULT);   /* 循环归你 */
     return 0;
@@ -198,8 +199,15 @@ int moq_lite_session_connect(moq_lite_session_t s, const char *url,
   给 `https://` 会返回 `MOQ_LITE_ERR_URL`（那是 WebTransport 那条路，本库不做）。
 - **path 决定服务端路由**：`moql://host:4433/anon` 里的 `anon` 就是服务端的入口
   路径（`moqlivecast` 的 `moq_lite_subpath`）。不写 = 服务端默认路径。
-- ⚠️ **host 用域名，别用 IP**。`moqlivecast` 的证书没有 IP SAN，换任何做证书
-  校验的实现都会以 `NotValidForName` 拒掉（而且线上完全静默）。
+- `host` **域名和 IP 字面量都行** —— 内部走 `uv_getaddrinfo` 解析，数字字面量
+  本来就立即返回、不走网络。所以 `moql://relay.example.com:4433/anon` 和
+  `moql://192.168.1.221:4433/anon` 都对。
+  ⚠️ 解析**只取 IPv4**：本仓 QUIC 的发送路径是写死的 IPv4（`sockaddr_in` +
+  `uv_ip4_addr`），拿到 AAAA 会解析失败、包发到 `0.0.0.0` 去 —— **不报错**。
+  所以纯 IPv6 的域名连不上。
+  证书是另一码事：本库 TLS 是 `SSL_VERIFY_NONE`、不校验证书，证书没有 IP SAN
+  也照样连、填 IP 就行。反过来做证书校验的客户端（`moq-cli` / libmoq）**必须**
+  用域名。
 - `cb` 会被**深拷贝**，你不必保持它存活。
 
 ```c
