@@ -43,6 +43,9 @@ public:
     bool Stopped() const { return stopped_; }
     /* stopped 且 session 已释放 —— manager 可以安全 erase 了。 */
     bool FullyStopped() const { return stopped_ && session_ == 0; }
+    /* 本地 publisher 已消失、连接还在宽限期里。此时这条 PushLink 不能当成
+     * 「本地有源」来挡回源。 */
+    bool Paused() const { return paused_; }
     const std::string &Key() const { return local_key_; }
     int64_t PausedMs() const { return paused_at_ms_; }
 

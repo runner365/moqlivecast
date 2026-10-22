@@ -258,8 +258,16 @@ bool ClusterManager::EnsurePulled(const std::string &local_key,
         return true;
     }
 
-    /* 本地已经有推流：等它的 catalog，不需要回源。 */
-    if (pushes_.find(local_key) != pushes_.end()) return false;
+    /* 本地已经有**活跃**推流：等它的 catalog，不需要回源。
+     * ⚠️ PushLink 在「本地 publisher 消失后的 30s 宽限期」里仍留在 pushes_
+     * 中（paused_=true），此时本地根本没有源。如果把它当成「本地有推流」
+     * 直接 return false，播放器会 SUBSCRIBE_OK 后一直无媒体，直到宽限期
+     * 结束、用户重新 connect 才触发回源（实测复现）。 */
+    auto push_it = pushes_.find(local_key);
+    if (push_it != pushes_.end() && push_it->second &&
+        !push_it->second->Paused()) {
+        return false;
+    }
     if (MediaStreamManager::HasPublisher(local_key)) return true;
 
     auto nit = negative_cache_.find(local_key);
@@ -302,7 +310,19 @@ bool ClusterManager::OnTimer() {
     for (auto it = pushes_.begin(); it != pushes_.end();) {
         it->second->OnTick(now);
         if (it->second->FullyStopped()) {
+            const std::string key = it->first;
             it = pushes_.erase(it);
+
+            /* 宽限期结束、推流链路彻底停了，但还有播放器在等这个 key，
+             * 本地又没有 publisher：补一次回源。覆盖「播放器先挂上、本地推流
+             * 随后彻底消失」的时序；/moq 等播放器的 key 就是 app/stream，
+             * 这里 wire 直接用同一个 key。 */
+            if (MediaStreamManager::PlayerCount(key) > 0 &&
+                !MediaStreamManager::HasPublisher(key)) {
+                LOG_INFO("[cluster] push %s stopped with waiting player, "
+                         "starting pull", key.c_str());
+                EnsurePulled(key, key);
+            }
         } else {
             ++it;
         }
@@ -313,10 +333,25 @@ bool ClusterManager::OnTimer() {
         link->OnTick(now);
 
         if (link->FullyStopped()) {
+            const std::string key = it->first;
             if (link->AcquireTimedOut() && opts_.negative_cache_ms > 0) {
-                negative_cache_[it->first] = now + opts_.negative_cache_ms;
+                negative_cache_[key] = now + opts_.negative_cache_ms;
             }
             it = pulls_.erase(it);
+
+            /* 「本地推流优先」接管这个 key 后（AbandonLocalWins），拉流条目
+             * 要在这里才被擦掉。本地 catalog 往往比这一拍更早到达，那时
+             * StartPush 会被 IsPulled() 挡住；条目没了之后必须补一次上推，
+             * 否则新接管的本地流永远不上推 Center。
+             * Stop()/超时的回源会 ReleasePublisher，HasPublisher 为 false，
+             * 不会误推。 */
+            std::string json;
+            if (MediaStreamManager::HasPublisher(key) &&
+                MediaStreamManager::GetCatalogJson(key, json)) {
+                LOG_INFO("[cluster] push %s: local publisher took over after pull "
+                         "stop, starting upstream", key.c_str());
+                StartPush(key, json);
+            }
             continue;
         }
 

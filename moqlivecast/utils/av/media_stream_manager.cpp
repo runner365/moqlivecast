@@ -322,6 +322,11 @@ namespace cpp_streamer
             stream_ptr->claim_takeovers_);
         stream_ptr->publisher_id_ = owner_id;
         stream_ptr->publisher_exist_ = true;
+        /* 换源：旧 GOP 属于旧发布端（可能是另一个编码器实例 / 另一条时间轴）。
+         * 新订阅者若回放它，第一帧之后会跟新源的 live 帧接不上 —— 实测表现为
+         * 「出第一帧后卡住」。清掉缓存，等新源的关键帧重新开 GOP；现有播放器
+         * 不受影响（它们是 live 扇出，不读缓存）。 */
+        stream_ptr->cache_.Clear();
         return ret;
     }
 

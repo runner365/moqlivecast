@@ -239,6 +239,14 @@ void MoqRfcHandler::RemoveSubscriber(WTServerSession &sess) {
 bool MoqRfcHandler::KickPublisherSession(const std::string &session_id,
                                          const std::string &stream_key) {
     if (session_id.empty()) return false;
+    /* 集群回源不是 /moq 会话：它自己会在下一帧校验 owner、走
+     * ClusterPullLink::AbandonLocalWins() 退出，这里不用（也踢不了）它。 */
+    if (session_id.rfind("cluster-pull:", 0) == 0) {
+        LOG_INFO("[moq-rfc] kick publisher: %s is a cluster pull for %s; "
+                 "it will yield on the next frame",
+                 session_id.c_str(), stream_key.c_str());
+        return false;
+    }
     auto it = sessions_.find(session_id);
     if (it == sessions_.end() || !it->second) {
         /* 旧会话可能已经自己断了，只剩流记录里的 owner 没清。 */

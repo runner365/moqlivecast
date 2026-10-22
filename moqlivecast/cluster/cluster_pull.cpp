@@ -555,16 +555,32 @@ void ClusterPullLink::EmitFrame(const std::string &name,
      * 让 RTMP/HTTP-FLV 播放器整条断开好。限流打一条 WARN 便于观察。 */
     auto lit = last_dts_ms_.find(name);
     if (lit != last_dts_ms_.end() && dts_ms <= lit->second) {
-        if (ClusterNowMs() - dts_warn_ms_ >= 1000) {
-            dts_warn_ms_ = ClusterNowMs();
-            LOG_WARN("[cluster] pull %s: track \"%s\" dts not increasing: "
-                     "ts_us=%llu base=%lld dts=%lld prev=%lld — frame dropped",
+        const int64_t prev = lit->second;
+        /* >1s 的大回退 = 发布端时钟重置 / 换源。不能逐帧丢掉等它追上旧
+         * 时间轴（实测：本地推流换源后，回源第一帧之后画面卡住，直到页面
+         * stall 超时）。重设共享基准，让新时间轴从 prev+40ms 接着走；
+         * 重复帧 / 小回退仍然丢弃。 */
+        if (prev - dts_ms > 1000) {
+            base_ms_ = ts_ms - (prev + 40);
+            dts_ms = prev + 40;
+            last_dts_ms_.clear();   /* 另一条轨也按新基准重新起算 */
+            LOG_INFO("[cluster] pull %s: track \"%s\" clock jumped back >1s "
+                     "(ts_us=%llu), rebased to dts=%lld",
                      local_key_.c_str(), name.c_str(),
                      static_cast<unsigned long long>(frame.ts_us),
-                     (long long)base_ms_, (long long)dts_ms,
-                     (long long)lit->second);
+                     (long long)dts_ms);
+        } else {
+            if (ClusterNowMs() - dts_warn_ms_ >= 1000) {
+                dts_warn_ms_ = ClusterNowMs();
+                LOG_WARN("[cluster] pull %s: track \"%s\" dts not increasing: "
+                         "ts_us=%llu base=%lld dts=%lld prev=%lld — frame dropped",
+                         local_key_.c_str(), name.c_str(),
+                         static_cast<unsigned long long>(frame.ts_us),
+                         (long long)base_ms_, (long long)dts_ms,
+                         (long long)prev);
+            }
+            return;
         }
-        return;
     }
     last_dts_ms_[name] = dts_ms;
 
