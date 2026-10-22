@@ -7,6 +7,21 @@
 
 namespace cpp_streamer
 {
+
+namespace {
+/* RTMP 的 app 常带查询串（鉴权 token 就写在 ? 后面）。stream key 是
+ * app + "/" + stream，必须只取路径部分，否则 key 会变成
+ * "live?token=x/abc"，和拉流侧的 app=live 永远对不上。末尾的 '/' 也一并去掉
+ * （不同客户端对 tcUrl/app 的写法不完全一致）。 */
+std::string NormalizeRtmpApp(const std::string& raw) {
+    std::string app = raw;
+    const size_t q = app.find('?');
+    if (q != std::string::npos) app.resize(q);
+    while (!app.empty() && app.back() == '/') app.pop_back();
+    return app;
+}
+} /* namespace */
+
 uint32_t g_config_chunk_size = 4096;
 
 RtmpControlHandler::RtmpControlHandler(RtmpSessionBase* session,
@@ -179,7 +194,14 @@ int RtmpControlHandler::HandleRtmpConnectCommand(uint32_t stream_id, std::vector
                         LogErrorf(logger_, "app type is not string:%d", (int)item->GetAmfType());
                         return -1;
                     }
-                    session_->req_.app_ = item->desc_str_;
+                    const std::string raw_app = item->desc_str_;
+                    const std::string app = NormalizeRtmpApp(raw_app);
+                    if (app != raw_app) {
+                        LogInfof(logger_, "RTMP app normalized: \"%s\" -> \"%s\" "
+                                 "(query/trailing slash stripped)",
+                                 raw_app.c_str(), app.c_str());
+                    }
+                    session_->req_.app_ = app;
                 }
                 iter = item->amf_obj_.find("tcUrl");
                 if (iter != item->amf_obj_.end()) {
@@ -323,12 +345,29 @@ int RtmpControlHandler::HandleRtmpPublishCommand(uint32_t stream_id, std::vector
                 break;
         }
     }
+    if (session_->req_.app_.empty() || stream_name.empty()) {
+        LogErrorf(logger_, "RTMP publish with empty app or stream name "
+                  "(app=\"%s\" stream=\"%s\")",
+                  session_->req_.app_.c_str(), stream_name.c_str());
+        return -1;
+    }
     session_->req_.stream_name_  = stream_name;
     session_->req_.publish_flag_ = true;
     session_->req_.is_ready_     = true;
     session_->req_.key_ = session_->req_.app_;
     session_->req_.key_ += "/";
     session_->req_.key_ += stream_name;
+    /* 推流进入数据面之前唯一一条能确认「谁、推到哪条 key」的日志 ——
+     * 后面的 seqhdr / 拉流日志都只有字节，没法看出 app/stream 是否接对了。 */
+    LogInfof(logger_, "RTMP publish ready: app=\"%s\" stream=\"%s\" key=\"%s\"",
+             session_->req_.app_.c_str(), stream_name.c_str(),
+             session_->req_.key_.c_str());
+
+    /* 认领 stream key（新顶旧 + 防抖）。失败时按错误路径关闭本会话 ——
+     * 这里返回 -1，HandleRequest 会 Close()，不会再发 publish 成功应答。 */
+    if (!session_->OnPublishReady()) {
+        return -1;
+    }
     return SendRtmpPublishResp();
 }
 

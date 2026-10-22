@@ -12,6 +12,7 @@
 #include <memory>
 #include <vector>
 #include <list>
+#include <functional>
 
 namespace cpp_streamer
 {
@@ -129,6 +130,13 @@ namespace cpp_streamer
         static GopCache *GetGop(const std::string &stream_key);
         static bool HasGopMedia(const std::string &stream_key);
 
+        /* 这条流当前是否有 publisher（本地推流）。回源判定用：本地已经有
+         * 推流的 key 不需要再去 Center 拉。 */
+        static bool HasPublisher(const std::string &stream_key);
+        /* 已注册的播放器数量（不含 publisher）。回源回收用：没有观看者且
+         * 一段时间没有新需求就关掉回源连接。 */
+        static size_t PlayerCount(const std::string &stream_key);
+
         /* 当前登记为「有 publisher」的 stream_key 清单，供发布端角色
          * （moq-lite export）回答 ANNOUNCE 用。
          * 返回**拷贝**而不是内部引用：调用方在 QUIC 回调里遍历，而对端随时
@@ -143,11 +151,33 @@ namespace cpp_streamer
         static bool SetCatalogJson(const std::string &stream_key,
                                    const std::string &owner_id,
                                    const std::string &json);
-        static bool GetCatalogJson(const std::string &stream_key, std::string &out);
+        /* rev 出参（可空）= 当前 catalog 版本号。订阅侧用它判断“这份更新发过没有”。 */
+        static bool GetCatalogJson(const std::string &stream_key, std::string &out,
+                                   uint64_t *rev = nullptr);
+
+        /* catalog.json 内容发生变化（rev 自增）时同步回调。
+         * 调用线程 = SetCatalogJson 的线程（全进程唯一的 uv loop）。
+         * 用途：给已经订阅了 catalog.json 的 moq-lite 客户端补发**新的一组**
+         * （moq-lite 里 catalog 更新就是“再发一组”，重发组 0 会被去重丢弃）。
+         * 传 nullptr 注销。 */
+        using CatalogUpdatedFn = std::function<void(const std::string &stream_key,
+                                                    uint64_t rev)>;
+        /* 兼容旧用法：清空后只留这一个监听者。 */
+        static void SetCatalogUpdatedCallback(CatalogUpdatedFn fn);
+        /* 追加一个监听者（多消费者：moq-lite 下行 + cluster 上推）。
+         * 按注册顺序同步回调，注册在前的先收到。 */
+        static void AddCatalogUpdatedCallback(CatalogUpdatedFn fn);
+        static void ClearCatalogUpdatedCallbacks();
 
     public:
         static void AddStreamCallback(StreamManagerCallbackI* cb) {
             cb_vec_.push_back(cb);
+        }
+        /* 进程收尾时摘掉回调，避免管理器的静态表指向已析构的对象。 */
+        static void RemoveStreamCallback(StreamManagerCallbackI* cb) {
+            for (auto it = cb_vec_.begin(); it != cb_vec_.end(); ++it) {
+                if (*it == cb) { cb_vec_.erase(it); return; }
+            }
         }
 
     private:
@@ -156,6 +186,7 @@ namespace cpp_streamer
     private:
         static std::unordered_map<std::string, MEDIA_STREAM_PTR> media_streams_map_;//key("app/stream"), MEDIA_STREAM_PTR
         static std::vector<StreamManagerCallbackI*> cb_vec_;
+        static std::vector<CatalogUpdatedFn> catalog_updated_cbs_;
 
     private:
         static AvWriterInterface* hls_writer_;

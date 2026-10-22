@@ -203,6 +203,19 @@ bool MoqLiteEgress::OpenGroup(int64_t ts_us) {
     return true;
 }
 
+/* 对端 reset 掉当前组流：不补哨兵（流已经没了），但**必须推进组号**。
+ * 对端按 (subscribe id, group seq) 去重；重开同一个组号会被当成重复忽略。
+ * 音频实测踩过：组流被 reset 后一直重开 0 号组，播放端从此没有声音。 */
+void MoqLiteEgress::AbandonGroup() {
+    if (group_sid_ == 0) return;
+    group_sid_ = 0;
+    group_frames_ = 0;
+    group_prev_us_ = 0;
+    group_open_us_ = 0;
+    group_had_media_ = false;
+    group_seq_++;
+}
+
 void MoqLiteEgress::CloseGroup(bool clean_end) {
     if (group_sid_ == 0) return;
 
@@ -300,7 +313,7 @@ void MoqLiteEgress::Push(const uint8_t *data, size_t len, bool fin) {
             WarnRateLimited("group stream %llu is dead, abandoning group seq=%llu",
                             (unsigned long long)group_sid_,
                             (unsigned long long)group_seq_);
-            group_sid_ = 0;
+            AbandonGroup();
             return;
         }
         /* r == 1：整段未被接受，落到下面排队。 */
@@ -347,7 +360,7 @@ bool MoqLiteEgress::FlushPending() {
                 pending_bytes_ -= pending_.front().data.size();
                 pending_.pop_front();
             }
-            if (group_sid_ == sid) group_sid_ = 0;
+            if (group_sid_ == sid) AbandonGroup();
             continue;
         }
 
@@ -507,10 +520,30 @@ int MoqLiteEgress::WritePacket(Media_Packet_Ptr pkt) {
      *
      * SendGop（回放那条路）本来就有等价的过滤（want_type），只有这条 live
      * 路径漏了，所以 M2/M3 自测才一直没暴露出来。 */
-    if ((pkt->av_type_ == MEDIA_VIDEO_TYPE) != is_video_) return 0;
+    /* ⚠️ 必须是**显式白名单**，不能写成 `(av_type == VIDEO) != is_video`。
+     * 后者会把第三种类型（MEDIA_METADATA_TYPE，RTMP 的 onMetaData）当成
+     * “非视频”收进**音频** writer，然后按音频 tag 头剥 2 字节当 AAC 发出去，
+     * 对端解码器会报 Reserved bit set / 噪声。WebTransport 与 HTTP-FLV/RTMP
+     * writer 各自都有 metadata 分支，只有这条 egress 需要在这里挡掉。 */
+    const bool want_type = is_video_ ? (pkt->av_type_ == MEDIA_VIDEO_TYPE)
+                                     : (pkt->av_type_ == MEDIA_AUDIO_TYPE);
+    if (!want_type) return 0;
 
     const int64_t ts_us = FrameTsUs(pkt);
     const bool key = pkt->is_key_frame_;
+
+    /* 诊断：publisher 中断/恢复（重推、切源）之后，音频是不是还在发。
+     * 只打第一条恢复帧，稳态零开销。 */
+    if (last_frame_ts_us_ >= 0 && ts_us - last_frame_ts_us_ > 500000) {
+        LOG_INFO("[moq-lite] egress %s track=\"%s\": media resumed after %lldms "
+                 "(ts_us=%lld group=%llu seq=%llu)",
+                 peer_.c_str(), track_.c_str(),
+                 (long long)((ts_us - last_frame_ts_us_) / 1000),
+                 (long long)ts_us,
+                 (unsigned long long)group_sid_,
+                 (unsigned long long)group_seq_);
+    }
+    last_frame_ts_us_ = ts_us;
 
     if (is_video_) {
         if (key) {
@@ -525,9 +558,20 @@ int MoqLiteEgress::WritePacket(Media_Packet_Ptr pkt) {
         }
     } else {
         /* 音频：按秒打包。到点了就先收尾再开新组。
+         *
+         * ⚠️ 必须和 **group_open_us_**（本组第一帧的时间）比，不能和
+         * group_prev_us_（**上一帧**的时间，每帧都更新）比 —— 后者算出来永远
+         * 只有一帧的间隔（~21ms），永远到不了 1 秒，整条流会变成一个几分钟长
+         * 的大组。实测对端最终会把那条组流 reset 掉，而下面 AbandonGroup 之前
+         * 没有推进组号，重开的组还是 0 号，被对端按组号去重忽略 → **永久没声**。
          * ⚠️ clean_end = **true** —— 音频也要那个收尾哨兵，因为 FIN 得搭在
          * 非空段上才发得出去（见 Push 上方的长注释）。 */
-        if (group_sid_ != 0 && (ts_us - group_prev_us_) >= kAudioGroupUs) {
+        /* 时间戳回退也要换组：publisher 重启时共享时钟可能让音频比上一帧
+         * 早几十毫秒。若继续追加到旧组，组内会出现**负的 frame delta** ——
+         * 对端的 group consumer 有理由把它判成畸形/中止。新组的首帧差值是
+         * 绝对时间戳，永远是正的。 */
+        if (group_sid_ != 0 &&
+            ((ts_us - group_open_us_) >= kAudioGroupUs || ts_us < group_prev_us_)) {
             CloseGroup(true);
         }
         if (group_sid_ == 0 && !OpenGroup(ts_us)) return 0;

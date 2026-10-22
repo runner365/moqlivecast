@@ -80,6 +80,9 @@ private:
     /* 收尾当前组。clean_end = true 时补一个零载荷的结束哨兵帧，**FIN 就搭在
      * 那一帧上**（绝不单独发零长 FIN，原因见 Push 上方的长注释）。 */
     void CloseGroup(bool clean_end);
+    /* 对端 reset 掉当前组流：不补哨兵，但**推进组号**。对端按组号去重，
+     * 重开旧组号会被忽略（音频实测过“永久没声”）。 */
+    void AbandonGroup();
     /* 把一小段编码结果推给当前组流；背压时排进 pending_ 下次重试。
      * `fin=true` 的那一段**不可丢**（丢了组流永远不结束）。 */
     void Push(const uint8_t *data, size_t len, bool fin);
@@ -115,10 +118,15 @@ private:
     uint64_t group_frames_ = 0;
     int64_t  group_prev_us_ = 0;/* 组内上一帧的时间戳；**每组重置为 0**，
                                  * 所以首帧的差 = 它的绝对时间戳 */
-    int64_t  group_open_us_ = 0;/* 开组时的时间戳。只在「一个媒体帧都没写进去
-                                 * 就收尾」的退化路径上用来给哨兵填时间戳 ——
-                                 * 否则哨兵会报 0，把对端的播放头往回拽。 */
+    int64_t  group_open_us_ = 0;/* 本组第一帧的时间戳。两个用途：
+                                 *  1) 音频按秒切组：ts_us - group_open_us_ >= 1s
+                                 *     （**不能**用每帧都更新的 group_prev_us_）；
+                                 *  2) 「一个媒体帧都没写进去就收尾」时给哨兵填
+                                 *     时间戳，否则哨兵报 0 会把播放头往回拽。 */
     bool     group_had_media_ = false;
+    /* 上一帧的通道时间戳（微秒），仅用于诊断：publisher 中断后恢复时打一条
+     * “resumed after Nms”，用来区分「服务端没发」和「客户端没播」。 */
+    int64_t  last_frame_ts_us_ = -1;
 
     /* ── 背压待发队列 ──
      * SendEx 返回 1 = **整段未被接受**，原样排到队尾下次再推。为什么是队列而

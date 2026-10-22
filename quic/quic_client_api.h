@@ -48,6 +48,12 @@ typedef void (*quic_client_on_stream_reset_cb)(quic_client_t *c,
                                                quic_stream_t *s,
                                                uint64_t error_code, void *user);
 
+/* 对端 FIN 了一条流（读方向结束）。追加在末尾，可为 NULL。
+ * on_stream_data 的签名里没有 fin 参数，所以流结束必须单独通知 —— 订阅侧
+ * 靠它推进「一个组收齐了」（moq-lite 一个组一条 uni 流）。 */
+typedef void (*quic_client_on_stream_fin_cb)(quic_client_t *c,
+                                             quic_stream_t *s, void *user);
+
 /* write callback: ret=0 全部 ACK, ret=-2 超时, ret<0 错误。
  * 回调在 loop 线程中执行，可安全再次调用 quic_client_stream_write 继续发送 */
 typedef void (*quic_client_write_cb)(quic_stream_t *s, int ret, void *user);
@@ -65,6 +71,7 @@ typedef struct {
      * 只发过、没收过数据的流（那种流在客户端本地还没建记录）—— 照样通知，
      * 因为「它被拒了」这个事实不依赖我们有没有那条流的记录。 */
     quic_client_on_stream_reset_cb    on_stream_reset;
+    quic_client_on_stream_fin_cb      on_stream_fin;
 } quic_client_callbacks_t;
 
 /* ── 生命周期 ─────────────────────────────── */
@@ -91,6 +98,13 @@ void quic_client_set_alpn(quic_client_t *c, const char *const *protos,
 
 /* 关闭客户端 */
 void quic_client_close(quic_client_t *c);
+
+/* 释放一个**已关闭**的客户端（内存 + uv_async 句柄）。必须在 loop 线程、
+ * on_close 回调返回之后调用；调用后 c 与它所有 quic_stream_t 立即失效。
+ *
+ * ⚠️ 只调 quic_client_close 不会释放 c 自身（连接对象与 c 的生命周期是分开的）
+ * —— 按流建连的服务端如果不调这里，每关一条连接就漏一个客户端。 */
+void quic_client_free(quic_client_t *c);
 
 /* ── Stream ────────────────────────────────── */
 

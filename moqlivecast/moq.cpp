@@ -3,6 +3,8 @@
 #include "moq/moq_lite_server.hpp"
 #include "moq_handler.hpp"
 #include "httpflv_server.hpp"
+#include "net/rtmp/rtmp_server.hpp"
+#include "cluster/cluster_manager.hpp"
 #include "media_stream_manager.hpp"
 #include "utils/logger.hpp"
 #include "utils/meta_log.hpp"
@@ -20,13 +22,22 @@ std::unique_ptr<cpp_streamer::WTServer> g_srv;
 std::unique_ptr<cpp_streamer::MoqLiteServer> g_moq_lite;
 std::unique_ptr<cpp_streamer::Logger> g_cxx_log;
 std::unique_ptr<cpp_streamer::HttpFlvServer> g_httpflv;
+std::unique_ptr<cpp_streamer::RtmpServer> g_rtmp;
+std::unique_ptr<cpp_streamer::ClusterManager> g_cluster;
 uv_signal_t g_sig;
 
 void OnSignal(uv_signal_t *sig, int signum) {
     LOG_WARN("[moq] signal %d, shutting down", signum);
     if (g_srv) g_srv->Stop();
+    /* 先摘回调和集群组件，再拆会话 —— 回调捕获了 g_moq_lite / g_cluster，
+     * 显式注销能避免任何退出路径上的时序意外。 */
+    if (g_cluster) g_cluster->Shutdown();
+    cpp_streamer::MediaStreamManager::SetCatalogUpdatedCallback(nullptr);
+    cpp_streamer::MediaStreamManager::SetPlayCallback(nullptr);
+    g_cluster.reset();
     g_srv.reset();
     g_moq_lite.reset();
+    g_rtmp.reset();
     g_httpflv.reset();
     cpp_streamer::MetaLog::Instance().Shutdown();
     uv_stop(sig->loop);
@@ -75,6 +86,31 @@ int main(int argc, char *argv[]) {
     LOG_INFO("[moq] http-flv https://%s:%d/{app}/{stream}.flv",
              cfg.HttpFlvListenIp().c_str(), cfg.HttpFlvPort());
 
+    /* ── RTMP server（TCP，独立端口）──
+     * 可选组件：只有 rtmp.enable: true 才创建。必须放在
+     * MediaStreamManager::SetLogger 之后 —— 每个 RTMP session 都会直接
+     * 写 MediaStreamManager。
+     *
+     * ⚠️ 这里**必须**检查 Ok()。TcpServer 以前把 uv_tcp_init/bind/listen 的
+     * 返回值全吞了，端口被占用时表现为“服务在跑、但没人能连上”，日志里一句
+     * 都没有。现在启动期就明确报错并退出，不留一个哑的 listener。 */
+    if (cfg.RtmpEnabled()) {
+        g_rtmp = std::make_unique<cpp_streamer::RtmpServer>(
+            loop, cfg.RtmpListenIp(), cfg.RtmpPort(),
+            cfg.RtmpIdleTimeoutMs(), g_cxx_log.get());
+        if (!g_rtmp->Ok()) {
+            LOG_ERROR("[moq] rtmp listen failed %s:%d: bind=%s listen=%s",
+                      cfg.RtmpListenIp().c_str(), cfg.RtmpPort(),
+                      uv_strerror(g_rtmp->BindError()),
+                      uv_strerror(g_rtmp->ListenError()));
+            g_rtmp.reset();
+            return 1;
+        }
+        LOG_INFO("[moq] rtmp://%s:%d/{app}/{stream}  (idle_timeout=%dms)",
+                 cfg.RtmpListenIp().c_str(), cfg.RtmpPort(),
+                 cfg.RtmpIdleTimeoutMs());
+    }
+
     g_srv = std::make_unique<cpp_streamer::WTServer>(loop);
     if (!g_srv->Handle()) {
         LOG_ERROR("[moq] WTServer create failed");
@@ -103,6 +139,16 @@ int main(int argc, char *argv[]) {
          * 分派点在 http3_server 的握手完成回调里，这里只负责把接住的那半边
          * 接上。 */
         g_moq_lite = std::make_unique<cpp_streamer::MoqLiteServer>();
+        /* catalog.json 更新有两个消费者：
+         *   ① 已连接的 moq-lite 订阅方补发新组；
+         *   ② ClusterManager 据此建立/更新上推连接。
+         * 注册顺序 = 回调顺序：先 moq-lite（本地服务不延迟），再 cluster。
+         * 回调在 SetCatalogJson 的调用线程上执行，也就是这条唯一 uv loop。 */
+        cpp_streamer::MediaStreamManager::SetCatalogUpdatedCallback(nullptr);
+        cpp_streamer::MediaStreamManager::AddCatalogUpdatedCallback(
+            [](const std::string &key, uint64_t rev) {
+                if (g_moq_lite) g_moq_lite->OnCatalogUpdated(key, rev);
+            });
         /* 用独立的路由表（config 的 moq_lite_subpath），不复用 WebTransport
          * 那张 —— 两者的 path 语义不同，见 config.hpp 的说明。 */
         for (const auto &sp : cfg.MoqLiteSubPaths()) {
@@ -158,6 +204,44 @@ int main(int argc, char *argv[]) {
                 }
             });
 
+        /* ── Cluster（Edge 出站链路）──
+         * 必须在 MediaStreamManager 的 logger 与 catalog 回调就位之后创建；
+         * 中心模式这里什么也不建，行为与单机一致。 */
+        g_cluster = std::make_unique<cpp_streamer::ClusterManager>(loop);
+        if (!g_cluster->Init(cfg)) {
+            LOG_ERROR("[moq] cluster config rejected");
+            g_cluster.reset();
+            g_srv.reset();
+            return 1;
+        }
+        if (g_cluster->Enabled()) {
+            cpp_streamer::ClusterManager *cluster = g_cluster.get();
+            cpp_streamer::MediaStreamManager::AddCatalogUpdatedCallback(
+                [cluster](const std::string &key, uint64_t rev) {
+                    cluster->OnCatalogUpdated(key, rev);
+                });
+            cpp_streamer::MediaStreamManager::SetPlayCallback(
+                &cpp_streamer::ClusterManager::PlayerRequestTrampoline);
+            /* moq-lite 客户端订阅本地没有的流：让会话挂起等回源，而不是立刻
+             * reset。超时值来自 cluster.subscribe_timeout_ms。 */
+            g_moq_lite->SetOnStreamMissing(
+                [cluster](const std::string &key, const std::string &wire) {
+                    return cluster->EnsurePulled(key, wire);
+                },
+                cfg.ClusterSubscribeTimeoutMs());
+            /* Center 上的广播目录 → 本地客户端的 announce 流；本地
+             * ANNOUNCE_REQUEST 的快照里也要合并这份目录。 */
+            g_moq_lite->SetRemoteAnnounceProvider(
+                [cluster](std::vector<std::string> *out) {
+                    cluster->AppendRemoteBroadcasts(out);
+                });
+            g_cluster->SetAnnounceSink(
+                [](const std::string &wire, bool added) {
+                    if (g_moq_lite) g_moq_lite->NotifyRemoteAnnounce(wire, added);
+                });
+            g_cluster->Start();
+        }
+
         const std::vector<std::string> &alpn = cfg.AlpnList();
         std::vector<const char *> alpn_ptrs;
         alpn_ptrs.reserve(alpn.size());
@@ -177,7 +261,13 @@ int main(int argc, char *argv[]) {
 
     uv_run(loop, UV_RUN_DEFAULT);
 
+    if (g_cluster) g_cluster->Shutdown();
+    cpp_streamer::MediaStreamManager::SetCatalogUpdatedCallback(nullptr);
+    cpp_streamer::MediaStreamManager::SetPlayCallback(nullptr);
+    g_cluster.reset();
     g_srv.reset();
+    g_moq_lite.reset();
+    g_rtmp.reset();
     g_httpflv.reset();
     cpp_streamer::MetaLog::Instance().Shutdown();
     g_cxx_log.reset();

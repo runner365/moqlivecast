@@ -110,6 +110,7 @@ typedef struct MoqStream {
 
     /* ── Group（uni 0x0）── */
     int      hdr_done;
+    int      group_end_notified;
     uint64_t sub_id_in_group;
     uint64_t group;
     uint64_t frame_index;
@@ -153,6 +154,10 @@ typedef struct MoqSub {
 typedef struct MoqBc {
     uint32_t   slot;
     int        used, dead;
+    /* 由 moq_lite_broadcast_path 按已知路径直接造出来的句柄，没有对应的
+     * ANNOUNCE。ANNOUNCE_END 按 ann_id 匹配，必须跳过它，否则一次序号碰撞
+     * 就能把按需回源用的广播句柄判死。 */
+    int        synthetic;
     struct MoqSession *sess;
     char      *prefix;   /* 我们请求的 prefix */
     char      *suffix;   /* 对端报的 suffix */
@@ -271,6 +276,8 @@ typedef struct MoqPeerStream {
 /* 请求流的解析状态放在 MoqStream 上（每个 kind 自己的字段），这里只给一个
  * 反向指针把两边连起来。 */
 
+typedef struct PendingOpen PendingOpen;
+
 typedef struct MoqSession {
     uint32_t slot;
     int      used, dead, closing;
@@ -305,6 +312,13 @@ typedef struct MoqSession {
     size_t          serve_cnt, serve_cap;
     MoqPeerStream **peers;
     size_t          peer_cnt, peer_cap;
+
+    /* 本会话的开流意图队列。**必须按会话分开**：回调里只拿得到
+     * quic_stream_t，靠队列把「这次开流是给谁的」传过去；进程级单例在多会话
+     * 并发开流时会把 A 会话的意图弹给 B 会话（集群里每个流一条连接，必然
+     * 多会话）。 */
+    PendingOpen    *pending;
+    size_t          pending_cnt, pending_cap;
 } MoqSession;
 
 struct MoqPub;
@@ -312,10 +326,8 @@ struct MoqPubTrack;
 
 /* 进程内全局状态 —— 注册表是单例（句柄是整数，得有个进程级的表来解引用），
  * 但**事件循环不是**：每条会话各自带调用方给的 loop，见 MoqSession::loop。
- * ⚠️ 这带来一个真实限制：注册表是进程级、而 loop 是调用方级的，所以
- * **多个 loop 上各跑一条会话时，session_get/sub_get 的锁是共享的**（那部分
- * 没问题），但 `g_pending`（开流意图队列）是单例、不带 loop 维度 —— 目前
- * 只有单 loop 场景在用。要用多 loop 就得把它挪进 MoqSession。 */
+ * 注册表由 g_ctx_mutex 保护；开流意图队列是**每会话**一份
+ * （MoqSession::pending），多会话并发开流互不串扰。 */
 typedef struct {
     MoqSession    **sessions;
     size_t          session_cnt, session_cap;
@@ -438,6 +450,53 @@ static MoqBc *bc_get(moq_lite_broadcast_t h) {
         b = g_ctx.bcs[h];
     pthread_mutex_unlock(&g_ctx_mutex);
     return b;
+}
+
+/* 为已知广播路径造一个 synthetic 广播句柄（不经过 ANNOUNCE）。
+ * 两份表都要登记，理由与 parse_announce 里一致：句柄按全局表解引用，
+ * 会话表用于会话关闭时统一失效。 */
+static MoqBc *bc_create_synthetic(MoqSession *s, const char *path) {
+    if (!s || s->dead) { err_set(MOQ_LITE_ERR_STATE, "session dead"); return NULL; }
+    if (!path || !path[0]) { err_set(MOQ_LITE_ERR_ARGS, "empty broadcast path"); return NULL; }
+
+    MoqBc *bc = (MoqBc*)calloc(1, sizeof(*bc));
+    if (!bc) { err_set(MOQ_LITE_ERR_NOMEM, "oom"); return NULL; }
+    bc->used      = 1;
+    bc->synthetic = 1;
+    bc->sess      = s;
+    bc->prefix    = strdup("");
+    bc->suffix    = strdup(path);
+    bc->path      = strdup(path);
+    bc->ann_id    = UINT64_MAX;
+    if (!bc->prefix || !bc->suffix || !bc->path) {
+        free(bc->prefix); free(bc->suffix); free(bc->path); free(bc);
+        err_set(MOQ_LITE_ERR_NOMEM, "oom");
+        return NULL;
+    }
+
+    pthread_mutex_lock(&g_ctx_mutex);
+    size_t slot = alloc_slot((void***)&g_ctx.bcs, &g_ctx.bc_cnt, &g_ctx.bc_cap,
+                             bc, sizeof(MoqBc*));
+    pthread_mutex_unlock(&g_ctx_mutex);
+    if (slot == (size_t)-1) {
+        free(bc->prefix); free(bc->suffix); free(bc->path); free(bc);
+        err_set(MOQ_LITE_ERR_NOMEM, "oom");
+        return NULL;
+    }
+    bc->slot = (uint32_t)slot;
+
+    if (alloc_slot((void***)&s->bcs, &s->bc_cnt, &s->bc_cap, bc,
+                   sizeof(MoqBc*)) == (size_t)-1) {
+        pthread_mutex_lock(&g_ctx_mutex);
+        if (slot < g_ctx.bc_cnt && g_ctx.bcs[slot] == bc) g_ctx.bcs[slot] = NULL;
+        pthread_mutex_unlock(&g_ctx_mutex);
+        free(bc->prefix); free(bc->suffix); free(bc->path); free(bc);
+        err_set(MOQ_LITE_ERR_NOMEM, "oom");
+        return NULL;
+    }
+    LOG_INFO("[moq-lite-cli] broadcast handle for known path \"%s\" (synthetic)",
+             path);
+    return bc;
 }
 
 /* 发布侧的句柄反查。与上面几个同构，但**发布侧的写入一律在 loop 线程**
@@ -719,8 +778,8 @@ typedef enum {
     kOpenAnnounceReply, /* bidi：应答对端的 announce 请求（用同一条流）*/
     kOpenTrackInfo,     /* bidi：应答对端的 track 请求（TRACK_INFO + FIN）*/
 } OpenKind;
-static void pending_push(OpenKind kind, MoqSub *sub);
-static void pending_push_box(OpenKind kind, void *box);
+static void pending_push(MoqSession *s, OpenKind kind, MoqSub *sub);
+static void pending_push_box(MoqSession *s, OpenKind kind, void *box);
 
 /* ⚠️ 开流与「登记这次开流是给谁的」必须成对 —— 回调里只拿得到
  * quic_stream_t，靠堆栈弹出的意图才知道该挂到哪个订阅上。漏了 push 的后果是
@@ -728,13 +787,13 @@ static void pending_push_box(OpenKind kind, void *box);
  * 所以这两个函数**自己**做 push，调用方只要调它们就行。 */
 static void sub_open_track(MoqSub *sub) {
     if (sub->track_stream || sub->dead) return;
-    pending_push(kOpenTrack, sub);
+    pending_push(sub->sess, kOpenTrack, sub);
     quic_client_open_stream(sub->sess->cli);
 }
 
 static void sub_open_subscribe(MoqSub *sub) {
     if (sub->sub_stream || sub->dead) return;
-    pending_push(kOpenSubscribe, sub);
+    pending_push(sub->sess, kOpenSubscribe, sub);
     quic_client_open_stream(sub->sess->cli);
 }
 
@@ -971,6 +1030,12 @@ static void parse_group(MoqStream *r) {
         if (r->buf.len)
             LOG_WARN("[moq-lite-cli] group stream ended mid-frame, %zu trailing "
                      "bytes dropped", r->buf.len);
+        if (r->hdr_done && !r->group_end_notified) {
+            r->group_end_notified = 1;
+            MoqSub *sub = session_sub_by_id(s, r->sub_id_in_group);
+            if (sub && sub->cb.on_group_end)
+                sub->cb.on_group_end(sub->slot, r->group, sub->cb.user);
+        }
         r->done = 1;
     }
 }
@@ -1098,7 +1163,9 @@ static void parse_announce(MoqStream *r) {
             /* ann_id 是这条流上的**隐式**序号（线上不带，两端各自数）。 */
             for (size_t i = 0; i < s->bc_cnt; i++) {
                 MoqBc *bc = s->bcs[i];
-                if (bc && !bc->dead && bc->ann_id == id) {
+                /* synthetic 句柄没有对应的 ANNOUNCE，id 是占位值；跳过它，
+                 * 免得一次序号碰撞把按需回源的广播判死。 */
+                if (bc && !bc->dead && !bc->synthetic && bc->ann_id == id) {
                     bc->dead = 1;
                     LOG_INFO("[moq-lite-cli] ANNOUNCE_END id=%llu path=\"%s\"",
                              (unsigned long long)id, bc->path);
@@ -1365,7 +1432,7 @@ static void serve_catalog_update(MoqSession *s, MoqPub *p) {
         if (ss->cat_pub != p) continue;
         LOG_INFO("[moq-lite-cli] sub %llu: catalog.json changed -> sending group %llu",
                  (unsigned long long)ss->sid, (unsigned long long)ss->group_seq);
-        pending_push_box(kOpenTrackGroup, ss);
+        pending_push_box(s, kOpenTrackGroup, ss);
         quic_client_open_uni_stream(s->cli);
     }
 }
@@ -1631,7 +1698,7 @@ static void serve_write_frame(MoqServeSub *ss, uint64_t ts_us,
             ss->group_open_us = (int64_t)ts_us;
             ss->group_prev_us = 0;   /* 组内累加基线，每组重置 */
             ss->group_had_media = 0;
-            pending_push_box(kOpenTrackGroup, ss);
+            pending_push_box(ss->sess, kOpenTrackGroup, ss);
             quic_client_open_uni_stream(ss->sess->cli);
         }
         /* ⚠️ 这一帧是组的**第一帧**（视频那边就是关键帧），必须攒下来。
@@ -1832,7 +1899,7 @@ static void serve_parse_subscribe(MoqStream *r) {
                      * 对端收到「接受」却永远等不到 catalog 那一帧，于是也
                      * 不会去订阅任何媒体轨（实测就是这样停住的：订阅进来了、
                      * 之后一片安静）。 */
-                    pending_push_box(kOpenTrackGroup, ss);
+                    pending_push_box(r->sess, kOpenTrackGroup, ss);
                     quic_client_open_uni_stream(r->sess->cli);
                 } else { free(ss); }
             }
@@ -1914,6 +1981,15 @@ static void stream_parse(MoqStream *r) {
     /* 对端自己的 setup 流：参数（Path 等）只有服务端方向有意义，读到就扔。 */
     if (r->kind == kStreamSetup) { r->done = 1; return; }
 
+    /* Group 是**单向**流，必然是**对端开的**（r->local == 0）：不能掉进下面
+     * 「对端开的 bidi 请求」那一支，否则它的数据会被 default 静默丢掉 ——
+     * 订阅方永远收不到 catalog / 媒体帧，而 SUBSCRIBE_START 一切正常。
+     * （实测症状：回源连接建好、订阅 accepted、然后一直等到超时。） */
+    if (r->kind == kStreamGroup) {
+        parse_group(r);
+        return;
+    }
+
     /* ⚠️ bidi 的两套解析**方向相反**，靠 r->local 区分：
      *   local=1：流是我们开的 → 对端的**应答**（应答不带 STREAM_TYPE，
      *            所以 r->kind 是开流时就定好的）。
@@ -1944,41 +2020,54 @@ static void stream_parse(MoqStream *r) {
  * ============================================================ */
 
 /* 开流请求按**调用顺序**完成，但回调里只拿得到 quic_stream_t —— 所以用一个
- * 队列把「这次开流是给谁的」传过去。只有 bidi 开流走它；uni 开流只有 SETUP
- * 一个用途，单列一个回调，不必进队列。 */
-typedef struct { OpenKind kind; MoqSub *sub; void *box; } PendingOpen;
+ * 队列把「这次开流是给谁的」传过去。bidi（track/subscribe/announce）和 uni
+ * （发布侧的组流）都走它；SETUP 是连接建立后第一条 uni 开流，不进队列。
+ *
+ * ⚠️ 队列**必须按会话分开**（MoqSession::pending）—— 集群里每个流一条连接，
+ * 多条会话在同一 loop 上并发开流；用进程级单例会按错误顺序弹意图，把流挂到
+ * 另一条会话的订阅上。 */
+struct PendingOpen { OpenKind kind; MoqSub *sub; void *box; };
 
-static PendingOpen *g_pending;
-static size_t g_pending_cnt, g_pending_cap;
-
-static void pending_push3(OpenKind kind, MoqSub *sub, void *box) {
+static void pending_push3(MoqSession *s, OpenKind kind, MoqSub *sub, void *box) {
+    if (!s) return;
     /* 这是**值**数组（不是指针数组），所以不走 alloc_slot —— 那个按 void*
      * 元素大小增长。这里手工增长。 */
-    if (ensure_slot((void***)&g_pending, &g_pending_cap, g_pending_cnt,
+    if (ensure_slot((void***)&s->pending, &s->pending_cap, s->pending_cnt,
                     sizeof(PendingOpen)) < 0) {
         LOG_ERROR("[moq-lite-cli] cannot queue stream-open intent");
         return;
     }
-    g_pending[g_pending_cnt].kind = kind;
-    g_pending[g_pending_cnt].sub  = sub;
-    g_pending[g_pending_cnt].box  = box;
-    g_pending_cnt++;
+    s->pending[s->pending_cnt].kind = kind;
+    s->pending[s->pending_cnt].sub  = sub;
+    s->pending[s->pending_cnt].box  = box;
+    s->pending_cnt++;
 }
 
-static void pending_push(OpenKind kind, MoqSub *sub) {
-    pending_push3(kind, sub, NULL);
+static void pending_push(MoqSession *s, OpenKind kind, MoqSub *sub) {
+    pending_push3(s, kind, sub, NULL);
 }
 
-static void pending_push_box(OpenKind kind, void *box) {
-    pending_push3(kind, NULL, box);
+static void pending_push_box(MoqSession *s, OpenKind kind, void *box) {
+    pending_push3(s, kind, NULL, box);
 }
 
-static int pending_pop(PendingOpen *out) {
-    if (g_pending_cnt == 0) return 0;
-    *out = g_pending[0];
-    memmove(g_pending, g_pending + 1, (g_pending_cnt - 1) * sizeof(PendingOpen));
-    g_pending_cnt--;
-    return 1;
+/* 按**流的类别**弹意图：uni 回调只能弹 kOpenTrackGroup，bidi 回调只能弹
+ * announce/track/subscribe。两类开流共享一条 FIFO，回调到达顺序却可能交错
+ * （实测：on_connected 里先发 SETUP 的 uni 开流、紧接 announce 的 bidi 开流，
+ * uni 回调先到，把 announce 的意图弹走 → bidi 回调判成 unsolicited 并 reset
+ * 掉 announce 流，目录永远建立不起来）。同类请求之间仍保持 FIFO 顺序。 */
+static int pending_pop_kind(MoqSession *s, int uni, PendingOpen *out) {
+    if (!s) return 0;
+    for (size_t i = 0; i < s->pending_cnt; i++) {
+        const int is_uni = (s->pending[i].kind == kOpenTrackGroup);
+        if (is_uni != uni) continue;
+        *out = s->pending[i];
+        memmove(&s->pending[i], &s->pending[i + 1],
+                (s->pending_cnt - i - 1) * sizeof(PendingOpen));
+        s->pending_cnt--;
+        return 1;
+    }
+    return 0;
 }
 
 static void on_session_connected(quic_client_t *c, int status, void *user) {
@@ -2007,6 +2096,13 @@ static void on_session_connected(quic_client_t *c, int status, void *user) {
         return;
     }
 
+    /* 保活：集群链路（尤其 discovery）稳态可能完全没有业务流量，不开 PING
+     * 的话每 20s 就会撞一次空闲超时、白白重连。 */
+    {
+        QuicConnection *conn = quic_client_conn(s->cli);
+        if (conn) QuicConnectionSetKeepalive(conn, 1);
+    }
+
     quic_client_open_uni_stream(s->cli);   /* SETUP 流 */
     if (s->cb.on_connected) s->cb.on_connected(s->slot, 0, s->cb.user);
 }
@@ -2021,7 +2117,7 @@ static void on_session_uni_open(quic_client_t *c, quic_stream_t *st, void *user)
     if (!s || s->dead) return;
 
     PendingOpen po = {0};
-    if (pending_pop(&po) && po.kind == kOpenTrackGroup) {
+    if (pending_pop_kind(s, /*uni=*/1, &po) && po.kind == kOpenTrackGroup) {
         MoqServeSub *ss = (MoqServeSub*)po.box;
         if (!ss || ss->dead) { quic_client_stream_reset(st, kStreamInternalError); return; }
         if (ss->cat_pub) serve_catalog_on_stream(ss, st);
@@ -2043,7 +2139,7 @@ static void on_session_bidi_open(quic_client_t *c, quic_stream_t *st, void *user
     if (!s || s->dead) return;
 
     PendingOpen po = {0};
-    if (!pending_pop(&po)) {
+    if (!pending_pop_kind(s, /*uni=*/0, &po)) {
         LOG_WARN("[moq-lite-cli] unsolicited bidi stream open — resetting");
         quic_client_stream_reset(st, kStreamInternalError);
         return;
@@ -2137,6 +2233,27 @@ static void on_session_close(quic_client_t *c, int err, void *user) {
         if (s->bcs[i]) s->bcs[i]->dead = 1;
     if (s->cb.on_close) s->cb.on_close(s->slot, err, moq_lite_strerror(err),
                                        s->cb.user);
+}
+
+static void on_session_stream_fin(quic_client_t *c, quic_stream_t *st,
+                                  void *user) {
+    (void)c;
+    MoqSession *s = (MoqSession*)user;
+    if (!s || s->dead) return;
+
+    MoqStream *r = stream_find(s, st);
+    if (!r) {
+        /* 没见过数据的单向流直接 FIN：大概率是对端自己的 Setup 流（内容与
+         * 客户端无关，读完即弃）。当 Group 解析会报「STREAM_TYPE 都没读全」的
+         * 假警告，所以这里直接放掉。 */
+        if (quic_client_stream_is_uni(st)) return;
+        r = stream_add(s, st, kStreamAnnounce, 0);
+        if (!r) return;
+    }
+    if (r->done) return;
+    r->fin = 1;
+    stream_parse(r);
+    if (r->done) stream_remove(s, r);
 }
 
 static void on_session_stream_reset(quic_client_t *c, quic_stream_t *st,
@@ -2233,6 +2350,7 @@ int moq_lite_session_connect(moq_lite_session_t h, const char *url,
     ccb.on_stream_open     = on_session_bidi_open;
     ccb.on_stream_open_uni = on_session_uni_open;
     ccb.on_stream_data     = on_session_stream_data;
+    ccb.on_stream_fin      = on_session_stream_fin;
     ccb.on_stream_reset    = on_session_stream_reset;
     ccb.on_close           = on_session_close;
     ccb.user_data          = s;
@@ -2291,7 +2409,7 @@ int moq_lite_session_announce(moq_lite_session_t h, const char *prefix) {
      * 个 scope 下的全部」，是最常见的用法；发别的值在对不上时**静默失败**
      * （对端回 active=0 的空集合、不报错），所以不做这个容易用错的旋钮。
      * 需要别的行为时再把它接出来。 */
-    pending_push(kOpenAnnounce, NULL);
+    pending_push(s, kOpenAnnounce, NULL);
     quic_client_open_stream(s->cli);
     LOG_INFO("[moq-lite-cli] announce requested (prefix=\"\" = everything under "
              "the routed path)");
@@ -2308,12 +2426,9 @@ void moq_lite_session_close(moq_lite_session_t h) {
     if (s->cli) quic_client_close(s->cli);
 }
 
-moq_lite_sub_t moq_lite_subscribe(moq_lite_broadcast_t bh, const char *track,
-                                  const moq_lite_sub_cb_t *cb) {
-    MoqBc *bc = bc_get(bh);
-    if (!bc || bc->dead || !bc->sess || bc->sess->dead)
-        return (moq_lite_sub_t)err_set(MOQ_LITE_ERR_ARGS,
-                                       "invalid or expired broadcast handle");
+/* 在一个有效广播句柄上创建订阅（两处公开入口共用）。 */
+static moq_lite_sub_t sub_create(MoqBc *bc, const char *track,
+                                 const moq_lite_sub_cb_t *cb) {
     if (!track || !track[0])
         return (moq_lite_sub_t)err_set(MOQ_LITE_ERR_ARGS, "empty track name");
 
@@ -2349,6 +2464,42 @@ moq_lite_sub_t moq_lite_subscribe(moq_lite_broadcast_t bh, const char *track,
      * sub_open_track 自己会 push 意图，不必在这里再来一次。 */
     sub_open_track(sub);
     return (moq_lite_sub_t)slot;
+}
+
+moq_lite_sub_t moq_lite_subscribe(moq_lite_broadcast_t bh, const char *track,
+                                  const moq_lite_sub_cb_t *cb) {
+    MoqBc *bc = bc_get(bh);
+    if (!bc || bc->dead || !bc->sess || bc->sess->dead)
+        return (moq_lite_sub_t)err_set(MOQ_LITE_ERR_ARGS,
+                                       "invalid or expired broadcast handle");
+    return sub_create(bc, track, cb);
+}
+
+moq_lite_broadcast_t moq_lite_broadcast_path(moq_lite_session_t h,
+                                             const char *path) {
+    MoqSession *s = session_get(h);
+    if (!s) return (moq_lite_broadcast_t)err_set(MOQ_LITE_ERR_ARGS,
+                                                 "invalid session handle");
+    if (!s->connected)
+        return (moq_lite_broadcast_t)err_set(MOQ_LITE_ERR_STATE,
+                                            "session not connected");
+    MoqBc *bc = bc_create_synthetic(s, path);
+    return bc ? (moq_lite_broadcast_t)bc->slot : 0;
+}
+
+moq_lite_sub_t moq_lite_subscribe_path(moq_lite_session_t h,
+                                       const char *broadcast,
+                                       const char *track,
+                                       const moq_lite_sub_cb_t *cb) {
+    MoqSession *s = session_get(h);
+    if (!s) return (moq_lite_sub_t)err_set(MOQ_LITE_ERR_ARGS,
+                                           "invalid session handle");
+    if (!s->connected)
+        return (moq_lite_sub_t)err_set(MOQ_LITE_ERR_STATE,
+                                       "session not connected");
+    MoqBc *bc = bc_create_synthetic(s, broadcast);
+    if (!bc) return 0;
+    return sub_create(bc, track, cb);
 }
 
 void moq_lite_unsubscribe(moq_lite_sub_t h) {
@@ -2729,6 +2880,111 @@ void moq_lite_track_end(moq_lite_track_t th) {
     }
     hold_clear(t);
     t->dead = 1;
+}
+
+/* ============================================================
+ * 会话释放
+ *
+ * `_close` 只把句柄标死并关连接；句柄在**进程级**表里，库不回收它们。
+ * 按流建连的服务端（每路一条 QUIC 连接）必须在本会话 on_close 返回之后调
+ * 这里，否则每关一条连接就漏一份会话、广播、订阅与底层客户端。
+ * ============================================================ */
+
+void moq_lite_session_free(moq_lite_session_t h) {
+    MoqSession *s = session_get(h);
+    if (!s) return;
+    if (!s->dead) {
+        err_set(MOQ_LITE_ERR_STATE,
+                "close the session and wait for on_close before freeing");
+        return;
+    }
+
+    /* ── ① 进程级句柄表：先摘槽，再释放对象 ── */
+    pthread_mutex_lock(&g_ctx_mutex);
+
+    for (size_t i = 0; i < g_ctx.sub_cnt; i++) {
+        MoqSub *sub = g_ctx.subs[i];
+        if (!sub || sub->sess != s) continue;
+        g_ctx.subs[i] = NULL;
+        sub->used = 0; sub->dead = 1;
+        free(sub->track);
+        free(sub);
+    }
+
+    for (size_t i = 0; i < g_ctx.bc_cnt; i++) {
+        MoqBc *bc = g_ctx.bcs[i];
+        if (!bc || bc->sess != s) continue;
+        g_ctx.bcs[i] = NULL;
+        bc->used = 0; bc->dead = 1;
+        free(bc->prefix);
+        free(bc->suffix);
+        free(bc->path);
+        free(bc);
+    }
+
+    for (size_t i = 0; i < g_ctx.track_cnt; i++) {
+        MoqPubTrack *t = g_ctx.tracks[i];
+        if (!t || !t->pub || t->pub->sess != s) continue;
+        g_ctx.tracks[i] = NULL;
+        hold_clear(t);
+        free(t->hold);
+        free(t->name);
+        free(t->codec);
+        free(t->config);
+        free(t);
+    }
+    for (size_t i = 0; i < g_ctx.pub_cnt; i++) {
+        MoqPub *p = g_ctx.pubs[i];
+        if (!p || p->sess != s) continue;
+        g_ctx.pubs[i] = NULL;
+        moq_buf_free(&p->catalog);
+        free(p->path);
+        free(p);
+    }
+
+    if (s->slot < g_ctx.session_cnt && g_ctx.sessions[s->slot] == s)
+        g_ctx.sessions[s->slot] = NULL;
+
+    pthread_mutex_unlock(&g_ctx_mutex);
+
+    /* ── ② 会话私有数组 ── */
+    for (size_t i = 0; i < s->stream_cnt; i++) {
+        MoqStream *r = s->streams[i];
+        if (!r) continue;
+        moq_buf_free(&r->buf);
+        free(r->req_prefix);
+        free(r);
+    }
+    free(s->streams);
+
+    for (size_t i = 0; i < s->serve_cnt; i++) {
+        MoqServeSub *ss = s->serve_subs[i];
+        if (!ss) continue;
+        serve_frame_drop(ss);
+        free(ss->pend);
+        free(ss);
+    }
+    free(s->serve_subs);
+
+    for (size_t i = 0; i < s->peer_cnt; i++) {
+        MoqPeerStream *ps = s->peers[i];
+        if (!ps) continue;
+        moq_buf_free(&ps->reply);
+        free(ps);
+    }
+    free(s->peers);
+
+    free(s->bcs);       /* 对象已在 ① 释放 */
+    free(s->pubs);
+    free(s->pending);
+    free(s->host);
+    free(s->path);
+
+    /* ── ③ 底层客户端：连接已关闭，这里释放 client 自身与 uv_async ── */
+    quic_client_t *cli = s->cli;
+    s->cli = NULL;
+    free(s);
+    if (cli) quic_client_free(cli);
 }
 
 /* ============================================================

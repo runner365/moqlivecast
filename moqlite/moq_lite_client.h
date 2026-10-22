@@ -124,6 +124,13 @@ typedef struct {
     void (*on_drop)(moq_lite_sub_t sub, uint64_t gstart, uint64_t gend,
                     uint64_t error_code, void *user);
 
+    /* 一个组收齐了（组流 FIN）。**追加在末尾**，老调用方的零初始化不受影响。
+     *
+     * 帧是按到达顺序回调的，而组流是**独立的 QUIC 流**，会乱序到达；需要
+     * 按组号重排的消费方靠这个信号推进「当前组」（否则只能等到下一组的第一帧，
+     * 而它本身就可能先到）。 */
+    void (*on_group_end)(moq_lite_sub_t sub, uint64_t group, void *user);
+
     void *user;
 } moq_lite_sub_cb_t;
 
@@ -178,9 +185,17 @@ const char *moq_lite_session_alpn(moq_lite_session_t s);
  * 返回 0 已发出，<0 失败。 */
 int moq_lite_session_announce(moq_lite_session_t s, const char *prefix);
 
-/* 关闭会话（任意线程）。之后所有句柄失效；资源在 loop 线程释放，
- * 无需再调 _free（调了也无害，幂等）。 */
+/* 关闭会话（任意线程）。之后所有句柄失效；资源在 loop 线程释放。 */
 void moq_lite_session_close(moq_lite_session_t s);
+
+/* 释放一个**已关闭**的会话（以及它名下的广播/订阅/发布句柄与底层客户端）。
+ *
+ * ⚠️ 只调 `_close` 不会释放这些内存：句柄在进程级表里，库不替你回收。按流
+ * 建连的服务端（每路一条 QUIC 连接）必须在本会话的 `on_close` **返回之后**
+ * 调这里，否则每关一条连接就漏一份会话 + 客户端。
+ *
+ * 必须在 loop 线程调用；调用后该会话的所有句柄立即失效。 */
+void moq_lite_session_free(moq_lite_session_t s);
 
 
 /* ── 角色：本端是把媒体推给对端，还是从对端拉 ── */
@@ -265,6 +280,20 @@ void moq_lite_track_end(moq_lite_track_t t);
 moq_lite_sub_t moq_lite_subscribe(moq_lite_broadcast_t bc,
                                   const char *track,
                                   const moq_lite_sub_cb_t *cb);
+
+/* 用**已知广播路径**造一个广播句柄（不经过 ANNOUNCE）。
+ *
+ * 用于「按需回源」：调用方已经知道要拉的广播名，不能等 on_announce 的时序。
+ * 该句柄在会话关闭后失效；没有对应的 ANNOUNCE_END，不会被公告流影响。 */
+moq_lite_broadcast_t moq_lite_broadcast_path(moq_lite_session_t s,
+                                             const char *path);
+
+/* broadcast_path + subscribe 的便捷封装。
+ * 返回订阅句柄，0 = 失败。 */
+moq_lite_sub_t moq_lite_subscribe_path(moq_lite_session_t s,
+                                       const char *broadcast,
+                                       const char *track,
+                                       const moq_lite_sub_cb_t *cb);
 
 /* 取消订阅（关掉那条 bidi 流）。幂等。 */
 void moq_lite_unsubscribe(moq_lite_sub_t sub);

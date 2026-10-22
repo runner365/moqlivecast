@@ -76,11 +76,20 @@ public:
     /* 会话终结（对端关闭 / 我们关的 / 出错）。回调返回后本对象可能已被销毁，
      * 实现里不要在这之后再碰 sess。 */
     using OnClose = std::function<void(MoqLiteSession &sess)>;
+    /* 本地缺流时的回源钩子（cluster edge）。返回 true = 已经发起回源，
+     * SUBSCRIBE 可以挂起一段时间等 catalog；false / 未注册 = 直接拒绝。
+     * local_key 是本端拼出来的 key（routed_path/broadcast），wire 是对端
+     * SUBSCRIBE 里的 broadcast —— 远端广播已经是 app-qualified 的名字
+     * （如 live1/stream1），回源必须按它去 Center 找，不能用本端路由路径。 */
+    using OnStreamMissing =
+        std::function<bool(const std::string &local_key, const std::string &wire)>;
 
     MoqLiteSession(QuicConnection *conn,
                    std::string alpn,
                    std::string remote_ip, int remote_port,
-                   OnRoute on_route, OnClose on_close);
+                   OnRoute on_route, OnClose on_close,
+                   OnStreamMissing on_stream_missing = nullptr,
+                   int deferred_subscribe_ms = 3000);
     ~MoqLiteSession();
 
     MoqLiteSession(const MoqLiteSession &) = delete;
@@ -88,6 +97,19 @@ public:
 
     /* 挂回调 + 开自己的 Setup 流。构造完立刻调。 */
     void Start();
+
+    /* 回源挂起中的 SUBSCRIBE 超时清理（由 MoqLiteServer 的 tick 调用）。 */
+    void SweepPendingPeerSubscribes(int64_t now_ms);
+
+    /* 本地可公告的广播发生变化时，向**对端开的 announce 流**补发
+     * ANNOUNCE_START / ANNOUNCE_END。wire 是线上广播名（带 '/' 的相对路径）。
+     * 幂等：同一条已经在 ids 里就不会重复发。 */
+    void AnnounceBroadcast(const std::string &wire, bool added);
+
+    /* 额外的可公告集合（集群 edge 的远端广播）。只在回答 ANNOUNCE_REQUEST
+     * 时合并进来；变化仍然走 AnnounceBroadcast。 */
+    using AnnounceProvider = std::function<void(std::vector<std::string> *)>;
+    void SetAnnounceProvider(AnnounceProvider provider);
 
     QuicConnection *Conn() const { return conn_; }
     const std::string &Alpn() const { return alpn_; }
@@ -120,6 +142,11 @@ public:
 
     /* 主动关会话（会话错误码取 -06 §4.4.1） */
     void CloseSession(uint64_t error_code, const char *reason);
+
+    /* catalog.json 内容更新（MediaStreamManager 的 rev 自增）时由上层转发：
+     * 给本会话里订阅了这条 key 的 catalog 订阅方各补发一个新组。
+     * 同一条 loop 线程；与订阅解析、下行写入不会并发。 */
+    void OnCatalogUpdated(const std::string &stream_key, uint64_t rev);
 
     /* ── M3：媒体落地 ── */
 
@@ -228,8 +255,39 @@ private:
     std::string remote_ip_;
     int         remote_port_ = 0;
 
+    /* 一个挂起的 SUBSCRIBE：请求已完整解析，但本地还没有 catalog（正在回源）。 */
+    struct PendingPeerSub {
+        uint64_t sid = 0;
+        uint64_t sub_id = 0;
+        std::string broadcast;
+        std::string track;
+        std::string key;
+        uint64_t priority = 0;
+        uint64_t max_age_ms = 0;
+        uint64_t start_group = 0;
+        uint64_t end_group_raw = 0;
+        uint64_t start_frame = 0;
+        uint64_t end_frame_raw = 0;
+        int64_t  deadline_ms = 0;
+    };
+
+    /* 对端开的 announce 流：请求前缀 + 已公告的 (广播全名 → 隐式 announce id)。
+     * -06 的 announce id 不带在线上，收侧按出现顺序自己数，所以每条流各自一份
+     * 从 0 开始的计数器。 */
+    struct PeerAnnounce {
+        std::string prefix;
+        uint64_t next_id = 0;
+        std::map<std::string, uint64_t> ids;
+    };
+    std::map<uint64_t, PeerAnnounce> peer_announces_;   /* sid → 状态 */
+
     OnRoute on_route_;
     OnClose on_close_;
+    OnStreamMissing on_stream_missing_;
+    AnnounceProvider announce_provider_;
+    int deferred_subscribe_ms_ = 3000;
+    /* sub_id → 挂起中的订阅。回源拿到 catalog 后在这里重试。 */
+    std::map<uint64_t, PendingPeerSub> pending_peer_subs_;
 
     std::map<uint64_t, RecvStream> streams_;
     bool peer_setup_done_ = false;
@@ -290,6 +348,7 @@ private:
     struct ServeSub {
         uint64_t sid = 0;          /* 请求所在的那条 bidi 流（应答写回这里）*/
         std::string broadcast;     /* 对端请求的 broadcast 全名 */
+        std::string key;           /* 解析后的本地 key（catalog 更新按它匹配） */
         std::string track;         /* catalog.json 或 rendition key */
         uint64_t priority = 0;
         uint64_t max_age_ms = 0;
@@ -305,6 +364,10 @@ private:
         uint64_t first_group = 0;
         uint64_t groups = 0;
         uint64_t frames = 0;
+        /* catalog.json 订阅专用：已经发到第几组 / 对应哪一版 catalog。
+         * 更新时据此只补发“对方还没收到”的那一版，不重复发。 */
+        uint64_t catalog_group = 0;
+        uint64_t catalog_rev = 0;
     };
 
     /* 对端 SETUP 里 Role 参数的原值：0 Both（默认）/ 1 Publisher / 2 Subscriber。
@@ -329,6 +392,9 @@ private:
      * 所以这三条只可能是对端开的）。 */
     void ParsePeerAnnounce(uint64_t sid, RecvStream &st);
     void ParsePeerSubscribe(uint64_t sid, RecvStream &st);
+    /* catalog 就绪后真正建立下行（原 ParsePeerSubscribe 的收尾）。 */
+    bool AttachPeerSubscribe(PendingPeerSub sub);
+    void RetryPendingPeerSubscribes(const std::string &stream_key);
     void ParsePeerTrack(uint64_t sid, RecvStream &st);
     /* 把线上 broadcast 名解析成本地 key，并确认这条 track 真的存在。
      * 解析不出来 / 没有 catalog / catalog 里没这条 rendition → false
@@ -337,10 +403,19 @@ private:
      * 是 "catalog" —— 下行写入器靠它决定过滤哪个 av_type。可为 nullptr。 */
     bool ResolveServeTrack(const std::string &broadcast, const std::string &track,
                            std::string *local_key, std::string *kind);
+    /* 本地 key → 对端可见的广播名：
+     *   <本端路由>/<app>/<stream>（Center 的集群推流）→ <app>/<stream>
+     *   <app>/<stream>（Edge 本地推流 / Center 直接 ingest）→ 原样
+     * 目的：公告永远带源端 app，回源方才能把 (app, stream) 身份原样带回。 */
+    std::string AnnounceWireOf(const std::string &stream_key) const;
     /* catalog.json 轨的下行：一条 SUBSCRIBE_START + 一个单帧组（裸 JSON）。
      * catalog 不是媒体，不走 MoqLiteEgress。st 是那条订阅流（拒绝时 reset 它）。 */
     void ServeCatalog(uint64_t sid, uint64_t sub_id, RecvStream &st,
                       const std::string &local_key);
+    /* 发一个单帧 catalog 组：一条新的 uni 流，[GROUP][FRAME(ts=0, 裸 JSON)] + FIN。
+     * 组号从 0 起；更新时组号 +1（对端按组号去重，重发旧组会被忽略）。 */
+    bool SendCatalogGroup(uint64_t sub_id, uint64_t group_seq,
+                          const std::string &json, const std::string &local_key);
     /* 算一遍请求前缀之下可公告的广播，把 ANNOUNCE_OK + N 条 ANNOUNCE_START
      * 一次写出去。返回 false 时内部已经 reset 过那条流。 */
     bool AnnounceGrid(uint64_t sid, RecvStream &st, const std::string &prefix);

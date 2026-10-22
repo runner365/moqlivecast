@@ -1,0 +1,85 @@
+# ── Edge 节点示例 2 ───────────────────────────────────────────────
+#
+# 集群形态：Center（普通服务端，缺省 config.yml，moq-lite UDP 4433）
+#            ├── Edge1（edge1.yaml）：UDP 4434 / HTTP-FLV 8081 / RTMP 1936
+#            └── Edge2（本文件）：UDP 4435 / HTTP-FLV 8082 / RTMP 1937
+#
+# 本机是 Edge：
+#   - 本地 RTMP / moq-lite 推流会按 **每流一条 moq-lite 连接** 上推到 Center；
+#   - 本地客户端请求本地没有的流时，按需从 Center 回源；
+#   - Center 不需要特殊 mode（它就是普通服务端），本文件用 center_address 拨它。
+#
+# 推流到本 Edge（RTMP，app 必须等于 moq-lite 入口路径 anon）：
+#   ffmpeg -re -i input.flv -c copy -f flv rtmp://127.0.0.1:1937/anon/123456
+# 从本 Edge 拉流（moq-lite）：
+#   moq --connect "moql://127.0.0.1:4435/anon" --broadcast 123456 export flv | ffplay -
+# 从本 Edge 拉流（RTMP / HTTP-FLV）：
+#   ffplay rtmp://127.0.0.1:1937/anon/123456
+#   ffplay https://127.0.0.1:8082/anon/123456.flv
+
+moq_server:
+  listenip: 0.0.0.0
+  # 与 Center、另一个 Edge 都必须不同（同一台机器上跑多个进程时）。
+  port: 4435
+  # 顺序即服务端偏好，moq-lite-06 必须在 h3 前面（理由见 config.yml）。
+  alpn:
+    - moq-lite-06
+    - h3
+  # WebTransport（h3）的 URL 路径表。
+  subpath:
+    - desc: media format is flv
+      path: flv
+    - desc: media format is moq
+      path: moq
+  # 裸 QUIC 的 moq-lite 路由表：path 是 SETUP 的 Path（发布端的 origin）。
+  # 与 Center 保持一致（anon），这样两边的本地 key 都是 anon/<broadcast>。
+  moq_lite_subpath:
+    - desc: moq-lite anonymous entry
+      path: anon
+  # 留空 = 从环境变量 SSL_CERT_FILE / SSL_KEY_FILE 读取（与 Center 共用即可）。
+  certfile: ""
+  keyfile: ""
+
+httpflv:
+  listenip: 0.0.0.0
+  # 与 Center、Edge1 的 HTTP-FLV 端口区分开。
+  port: 8082
+
+rtmp:
+  enable: true
+  listenip: 0.0.0.0
+  # 与 Center（1935）、Edge1（1936）区分开。
+  port: 1937
+  idle_timeout_ms: 15000
+
+cluster:
+  # 唯一的出站角色是 edge；Center 不写 mode（普通服务端）。
+  mode: edge
+  # 第一期只实现 moq（moq-lite-06，裸 QUIC，每路流一条连接）。
+  protocol: moq
+  # Center 的 **moq-lite UDP 地址**（不是 RTMP / HTTP-FLV 端口）。
+  center_address: 127.0.0.1:4433
+  # Center 的 moq-lite 入口路径（center 的 moq_lite_subpath）。
+  center_path: anon
+  # 出站连接重连退避（毫秒，指数增长，带 ±20% 抖动）。
+  reconnect_min_ms: 500
+  reconnect_max_ms: 10000
+  # moq-lite 订阅在本地缺流时最多挂起多久等 catalog（毫秒）。
+  subscribe_timeout_ms: 3000
+  # 回源连接建立后多久拿不到 catalog 就放弃（毫秒）。
+  pull_acquire_timeout_ms: 5000
+  # 回源流多久没有媒体帧就关闭（毫秒）。
+  pull_idle_timeout_ms: 30000
+  # 并发回源连接上限；未知流名的负缓存窗口。
+  max_pull_connections: 128
+  negative_cache_ms: 5000
+
+log:
+  level: info
+  # 多进程同机时日志文件必须分开。
+  filename: /tmp/moqlivecast_edge2.log
+  console: false
+
+meta_log:
+  log: /tmp/moq_edge2_meta.log
+  interval: 3

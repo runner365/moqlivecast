@@ -1,7 +1,9 @@
 #include "moq/moq_lite_server.hpp"
 
 #include "logger.h"
+#include "utils/timeex.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 namespace cpp_streamer {
@@ -18,6 +20,90 @@ std::string NormalizePath(const std::string &in) {
 }
 
 } /* namespace */
+
+MoqLiteServer::MoqLiteServer() : TimerInterface(100) {
+    /* 100ms tick 只做一件事：清理回源挂起超时的 SUBSCRIBE。
+     * StreamerTimerInitialize 在 moq.cpp 里早于本对象创建。 */
+    StartTimer();
+    /* 本地上推消失时要给订阅方补 ANNOUNCE_END。 */
+    MediaStreamManager::AddStreamCallback(this);
+}
+
+MoqLiteServer::~MoqLiteServer() {
+    StopTimer();
+    MediaStreamManager::RemoveStreamCallback(this);
+}
+
+void MoqLiteServer::SetOnStreamMissing(StreamMissingFn fn, int timeout_ms) {
+    on_stream_missing_ = std::move(fn);
+    if (timeout_ms > 0) deferred_subscribe_ms_ = timeout_ms;
+}
+
+void MoqLiteServer::SetRemoteAnnounceProvider(RemoteAnnounceProvider fn) {
+    remote_announce_provider_ = std::move(fn);
+    for (auto &kv : sessions_) {
+        if (kv.second) kv.second->SetAnnounceProvider(remote_announce_provider_);
+    }
+}
+
+void MoqLiteServer::NotifyRemoteAnnounce(const std::string &wire, bool added) {
+    if (wire.empty() || sessions_.empty()) return;
+
+    std::vector<std::shared_ptr<MoqLiteSession>> snapshot;
+    snapshot.reserve(sessions_.size());
+    for (auto &kv : sessions_) {
+        if (kv.second) snapshot.push_back(kv.second);
+    }
+    for (auto &sess : snapshot) {
+        sess->AnnounceBroadcast(wire, added);
+    }
+}
+
+void MoqLiteServer::OnPublish(const std::string &app,
+                              const std::string &streamname) {
+    (void)app;
+    (void)streamname;
+    /* catalog 到达时 MoqLiteSession::OnCatalogUpdated 会补 ANNOUNCE_START。 */
+}
+
+void MoqLiteServer::OnUnpublish(const std::string &app,
+                                const std::string &streamname) {
+    /* 与 MoqLiteSession::AnnounceWireOf 保持同一套规则：
+     *   key = <app>/<streamname>；
+     *   app 是本端配置的 moq-lite 路由（Center 的 anon、Edge 的 anon）时，
+     *   wire = streamname（即 <app>/<stream> 里的 <stream> 部分）；
+     *   否则 key 本身就是 <app>/<stream>（Center 直接 ingest / Edge 本地推流），
+     *   wire = key。 */
+    const std::string key = app + "/" + streamname;
+    const std::string wire =
+        (paths_.find(app) != paths_.end()) ? streamname : key;
+
+    /* 远端（Center）还公告着同一个广播时不要发 END —— 本地这一路只是撤了，
+     * 客户端仍可以按需回源。 */
+    if (remote_announce_provider_) {
+        std::vector<std::string> remote;
+        remote_announce_provider_(&remote);
+        if (std::find(remote.begin(), remote.end(), wire) != remote.end()) {
+            return;
+        }
+    }
+    NotifyRemoteAnnounce(wire, false);
+}
+
+bool MoqLiteServer::OnTimer() {
+    if (sessions_.empty()) return true;
+
+    std::vector<std::shared_ptr<MoqLiteSession>> snapshot;
+    snapshot.reserve(sessions_.size());
+    for (auto &kv : sessions_) {
+        if (kv.second) snapshot.push_back(kv.second);
+    }
+    const int64_t now_ms = now_millisec();
+    for (auto &sess : snapshot) {
+        sess->SweepPendingPeerSubscribes(now_ms);
+    }
+    return true;
+}
 
 bool MoqLiteServer::Handles(const std::string &alpn) {
     return alpn.rfind(kAlpnPrefix, 0) == 0;
@@ -67,13 +153,15 @@ void MoqLiteServer::OnConnection(QuicConnection *conn, const std::string &alpn,
         return;
     }
 
-    auto sess = std::unique_ptr<MoqLiteSession>(new MoqLiteSession(
+    auto sess = std::make_shared<MoqLiteSession>(
         conn, alpn, remote_ip, remote_port,
         [this](MoqLiteSession &s) { return RouteTo(s); },
-        [this](MoqLiteSession &s) { RemoveSession(s); }));
+        [this](MoqLiteSession &s) { RemoveSession(s); },
+        on_stream_missing_, deferred_subscribe_ms_);
 
     MoqLiteSession *raw = sess.get();
-    sessions_[conn] = std::move(sess);
+    raw->SetAnnounceProvider(remote_announce_provider_);
+    sessions_[conn] = sess;
     raw->Start();
 }
 
@@ -124,6 +212,19 @@ void MoqLiteServer::RemoveSession(MoqLiteSession &sess) {
     sessions_.erase(it);
     LOG_INFO("[moq-lite] %s:%d session removed path=\"%s\", %zu left",
              ip.c_str(), port, path.c_str(), sessions_.size());
+}
+
+void MoqLiteServer::OnCatalogUpdated(const std::string &stream_key, uint64_t rev) {
+    /* 快照：回调里的 QUIC 写可能间接关掉某个会话并从 sessions_ 里摘掉它。
+     * 拿着 shared_ptr 快照遍历，被摘掉的会话在本轮调用期间仍存活。 */
+    std::vector<std::shared_ptr<MoqLiteSession>> snapshot;
+    snapshot.reserve(sessions_.size());
+    for (auto &kv : sessions_) {
+        if (kv.second) snapshot.push_back(kv.second);
+    }
+    for (auto &sess : snapshot) {
+        sess->OnCatalogUpdated(stream_key, rev);
+    }
 }
 
 void MoqLiteServer::Clear() {

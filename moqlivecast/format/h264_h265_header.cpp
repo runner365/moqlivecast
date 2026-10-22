@@ -668,4 +668,134 @@ int ParseHevcSpsFinal(const uint8_t* nalu_data, int nalu_size, int* width, int* 
     return 0; // 成功
 }
 
+/* ── H.264 SPS 宽高解析 ─────────────────────────────────────────────
+ *
+ * moq-lite 的 catalog 需要 codedWidth/codedHeight。RTMP 推流端（OBS/ffmpeg）
+ * 会把 SPS 放在 AVC sequence header 里，这里从 SPS 直接算显示尺寸。
+ *
+ * 公式（ITU-T H.264 §7.4.2.1.1，已含 frame_cropping）：
+ *   width  = (pic_width_in_mbs_minus1 + 1) * 16 - (crop_l + crop_r) * SubWidthC
+ *   height = (2 - frame_mbs_only_flag) * (pic_height_in_map_units_minus1 + 1) * 16
+ *            - (crop_t + crop_b) * SubHeightC
+ * ChromaArrayType = separate_colour_plane_flag ? 0 : chroma_format_idc。 */
+
+static int32_t H264ReadSe(BitReader* r) {
+    const uint32_t ue = ReadUe(r);
+    const int32_t v = static_cast<int32_t>((ue + 1) >> 1);
+    return (ue & 1) ? v : -v;
+}
+
+static void H264SkipScalingList(BitReader* r, int size) {
+    int last = 8;
+    int next = 8;
+    for (int j = 0; j < size; j++) {
+        if (next != 0) {
+            const int delta = H264ReadSe(r);
+            next = (last + delta + 256) % 256;
+        }
+        if (next != 0) last = next;
+    }
+}
+
+int ParseH264SpsDimensions(const uint8_t* nalu_data, int nalu_size,
+                           int* width, int* height, Logger* logger) {
+    if (!nalu_data || nalu_size < 4 || !width || !height) return -1;
+
+    uint8_t* clean = (uint8_t*)malloc((size_t)nalu_size);
+    if (!clean) return -1;
+    const int clean_size = RemoveEmulationPreventionBytes(nalu_data, nalu_size, clean);
+
+    BitReader r;
+    InitBitReader(&r, clean, clean_size);
+
+    ReadBits(&r, 8);                       /* NAL header */
+    const uint32_t profile_idc = ReadBits(&r, 8);
+    ReadBits(&r, 8);                       /* constraint flags + reserved */
+    ReadBits(&r, 8);                       /* level_idc */
+    ReadUe(&r);                            /* seq_parameter_set_id */
+
+    uint32_t chroma_format_idc = 1;        /* baseline/main 默认 4:2:0 */
+    bool separate_colour_plane = false;
+
+    switch (profile_idc) {
+    case 100: case 110: case 122: case 244: case 44:
+    case 83: case 86: case 118: case 128: case 138:
+    case 139: case 134: case 135: {
+        chroma_format_idc = ReadUe(&r);
+        if (chroma_format_idc == 3) {
+            separate_colour_plane = ReadBits(&r, 1) != 0;
+        }
+        ReadUe(&r);                        /* bit_depth_luma_minus8 */
+        ReadUe(&r);                        /* bit_depth_chroma_minus8 */
+        ReadBits(&r, 1);                   /* qpprime_y_zero_transform_bypass_flag */
+        if (ReadBits(&r, 1)) {             /* seq_scaling_matrix_present_flag */
+            const int n = (chroma_format_idc != 3) ? 8 : 12;
+            for (int i = 0; i < n; i++) {
+                if (ReadBits(&r, 1) != 0) {
+                    H264SkipScalingList(&r, i < 6 ? 16 : 64);
+                }
+            }
+        }
+        break;
+    }
+    default:
+        break;
+    }
+
+    ReadUe(&r);                            /* log2_max_frame_num_minus4 */
+    const uint32_t poc_type = ReadUe(&r);
+    if (poc_type == 0) {
+        ReadUe(&r);                        /* log2_max_pic_order_cnt_lsb_minus4 */
+    } else if (poc_type == 1) {
+        ReadBits(&r, 1);                   /* delta_pic_order_always_zero_flag */
+        H264ReadSe(&r);                    /* offset_for_non_ref_pic */
+        H264ReadSe(&r);                    /* offset_for_top_to_bottom_field */
+        const uint32_t cycle = ReadUe(&r); /* num_ref_frames_in_pic_order_cnt_cycle */
+        for (uint32_t i = 0; i < cycle && i < 256; i++) {
+            H264ReadSe(&r);
+        }
+    }
+
+    ReadUe(&r);                            /* max_num_ref_frames */
+    ReadBits(&r, 1);                       /* gaps_in_frame_num_value_allowed_flag */
+
+    const uint32_t width_mbs = ReadUe(&r) + 1;
+    const uint32_t height_map_units = ReadUe(&r) + 1;
+    const uint32_t frame_mbs_only = ReadBits(&r, 1);
+    if (!frame_mbs_only) {
+        ReadBits(&r, 1);                   /* mb_adaptive_frame_field_flag */
+    }
+    ReadBits(&r, 1);                       /* direct_8x8_inference_flag */
+
+    uint32_t crop_l = 0, crop_r = 0, crop_t = 0, crop_b = 0;
+    if (ReadBits(&r, 1)) {                 /* frame_cropping_flag */
+        crop_l = ReadUe(&r);
+        crop_r = ReadUe(&r);
+        crop_t = ReadUe(&r);
+        crop_b = ReadUe(&r);
+    }
+
+    const uint32_t chroma_array_type =
+        separate_colour_plane ? 0 : chroma_format_idc;
+    const uint32_t sub_w =
+        (chroma_array_type == 1 || chroma_array_type == 2) ? 2 : 1;
+    const uint32_t sub_h = (chroma_array_type == 1) ? 2 : 1;
+
+    const int w = (int)(width_mbs * 16) - (int)((crop_l + crop_r) * sub_w);
+    const int h = (int)((2 - frame_mbs_only) * height_map_units * 16) -
+                  (int)((crop_t + crop_b) * sub_h);
+
+    free(clean);
+
+    if (w <= 0 || h <= 0) {
+        if (logger) {
+            LogErrorf(logger, "H.264 SPS parsed to invalid size %dx%d", w, h);
+        }
+        return -1;
+    }
+    *width = w;
+    *height = h;
+    return 0;
+}
+
 }

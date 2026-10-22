@@ -33,6 +33,10 @@ public:
     virtual int RtmpSend(char* data, int len) = 0;
     virtual int RtmpSend(std::shared_ptr<DataBuffer> data_ptr) = 0;
 
+    /* publish 命令就绪时认领 stream key（server 侧的 RtmpSession 实现它）。
+     * 默认 true：其它复用本基类的会话不参与发布端仲裁。 */
+    virtual bool OnPublishReady() { return true; }
+
 public:
     void SetChunkSize(uint32_t chunk_size);
     uint32_t GetChunkSize();

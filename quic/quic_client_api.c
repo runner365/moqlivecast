@@ -42,6 +42,7 @@ struct quic_client {
     quic_client_callbacks_t cb;
     int                     state;
     int                     closing;
+    int                     freeing;   /* 已排入 uv_close，防重复 free */
     QuicConnection         *qc;
     quic_stream_t          *streams;
     uv_mutex_t              task_mutex;
@@ -204,6 +205,48 @@ void quic_client_close(quic_client_t *c) {
     t->type = QC_TASK_CLOSE;
     task_push(c, t);
     uv_async_send(&c->async);
+}
+
+/* uv_close 完成回调：这里之后不会再有任何 QUIC 回调引用 c。 */
+static void client_async_closed(uv_handle_t *h) {
+    quic_client_t *c = (quic_client_t*)h->data;
+    if (!c) return;
+
+    /* 排队中的任务（close 之后不该再有，防御性回收） */
+    uv_mutex_lock(&c->task_mutex);
+    qc_task_t *t = c->task_head;
+    c->task_head = c->task_tail = NULL;
+    c->task_count = 0;
+    uv_mutex_unlock(&c->task_mutex);
+    while (t) {
+        qc_task_t *next = t->next;
+        free(t->host);
+        free(t->data);
+        free(t);
+        t = next;
+    }
+
+    quic_stream_t *s = c->streams;
+    while (s) {
+        quic_stream_t *next = s->next;
+        free(s);
+        s = next;
+    }
+    if (c->alpn) {
+        for (int i = 0; i < c->alpn_count; i++) free(c->alpn[i]);
+        free(c->alpn);
+    }
+    uv_mutex_destroy(&c->task_mutex);
+    free(c);
+}
+
+void quic_client_free(quic_client_t *c) {
+    if (!c || c->freeing) return;
+    c->freeing = 1;
+    /* 不再向会话投递任何回调（连接已经关闭；这里只是兜底）。 */
+    memset(&c->cb, 0, sizeof(c->cb));
+    /* uv_close 的回调在下一次 loop 迭代执行；**必须在 loop 线程调用**。 */
+    uv_close((uv_handle_t*)&c->async, client_async_closed);
 }
 
 void quic_client_open_stream(quic_client_t *c) {
@@ -520,7 +563,8 @@ static void on_quic_stream_data(QuicConnection *qc, uint64_t sid,
     }
     if (c->cb.on_stream_data)
         c->cb.on_stream_data(c, s, data, len, c->cb.user_data);
-    (void)fin;
+    if (fin && c->cb.on_stream_fin)
+        c->cb.on_stream_fin(c, s, c->cb.user_data);
 }
 
 static void on_quic_stream_reset(QuicConnection *qc, uint64_t sid,

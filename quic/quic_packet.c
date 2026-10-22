@@ -192,6 +192,23 @@ int quic_packet_build_long(uint8_t *out, size_t *out_len,
         }
     }
 
+    /* 非 Initial 的长头包同样要保证头保护样本够 16 字节（ACK-only 的
+     * Handshake 包可能很短）。Length varint 本身的长度这里还没算进去，
+     * 保守多补几个字节。 */
+    if (pkt_type != QUIC_PKT_INITIAL) {
+        const size_t sample_end = header_len + 4 + 16;
+        const size_t total = header_len + pn_len + payload_len + 16;
+        if (sample_end > total) {
+            size_t pad = sample_end - total;
+            if (payload_len + pad <= sizeof(pad_buf)) {
+                memcpy(pad_buf, payload, payload_len);
+                memset(pad_buf + payload_len, 0, pad);
+                payload      = pad_buf;
+                payload_len += pad;
+            }
+        }
+    }
+
     /* Length — payload + pn + 16 (tag) */
     size_t body_len = pn_len + payload_len + 16;
     int llen_w = quic_varint_encode(header + header_len, sizeof(header) - header_len, body_len);
@@ -451,6 +468,21 @@ int quic_packet_build_short(uint8_t *out, size_t *out_len,
     /* Payload */
     if (payload_len > 0) {
         memcpy(out + pos, payload, payload_len);
+    }
+
+    /* RFC 9001 §5.4.2：头保护要取 **pn_offset+4 起 16 字节** 的样本。纯 ACK /
+     * PING 这类短包很容易连样本都不够（实测 27 字节的 ACK 在 8 字节 DCID 下
+     * 差 2 字节）：对端会因为样本越过包尾而直接拒包，或者用错样本去不掉头
+     * 保护 → AEAD 失败 → ACK 永远收不到 → 发端 PTO 重传直到连接被判死。
+     * 样本不够就在载荷尾部补 PADDING（0x00，合法且不参与业务）。 */
+    {
+        const size_t sample_end = pn_offset + 4 + 16;
+        const size_t total = pos + payload_len + 16;   /* + AEAD tag */
+        if (sample_end > total) {
+            const size_t pad = sample_end - total;
+            memset(out + pos + payload_len, 0, pad);
+            payload_len += pad;
+        }
     }
 
     /* AAD includes up to and including PN (RFC 9001 §5.3) */

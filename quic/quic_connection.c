@@ -163,6 +163,11 @@ struct QuicConnection {
      *   last_tx 很久以前 → 是本端停发（流控/拥塞/业务没数据），不是对端的问题。
      *   last_tx 就在 1 秒内、last_rx 20 秒前 → 我们一直在发，对端一个包都没回。 */
     uint64_t   last_rx_ms_;
+    /* 最后一次**成功解密**的包。空闲超时必须看它而不是 last_rx_ms_：
+     * 对端重启后，新进程会对未知连接回 Stateless Reset（同样是一串
+     * 解不开的短头包）；如果按「收到任意 UDP 包」重置空闲计时，连接会永远
+     * 以为自己活着，把媒体持续打进黑洞。 */
+    uint64_t   last_valid_rx_ms_;
     uint64_t   last_tx_ms_;
 
     /* 保活（PING at idle_timeout/2） */
@@ -219,7 +224,8 @@ struct QuicConnection {
  * ============================================ */
 static int  send_quic_packet(QuicConnection *conn, int pkt_type,
                              const uint8_t *payload, size_t plen);
-static void record_rx_pn(QuicConnection *conn, int level, uint64_t pn);
+static void record_rx_pn(QuicConnection *conn, int level, uint64_t pn,
+                         int ack_eliciting);
 static int  build_and_send_ack(QuicConnection *conn, int level);
 static void arm_idle_timer(QuicConnection *conn);
 static void arm_keepalive_timer(QuicConnection *conn);
@@ -1261,12 +1267,24 @@ static void do_udp_send(QuicConnection *conn, const uint8_t *data, size_t len) {
     }
 }
 
-/* 判断 payload 是否包含 ack-eliciting 数据帧（STREAM/CRYPTO）。
- * 关键：必须正确跳过所有「非 ack-eliciting」帧（ACK/PING/PADDING/
- * MAX_DATA/MAX_STREAM_DATA/MAX_STREAMS/BLOCKED 等），继续遍历到
- * 后面的 STREAM/CRYPTO 帧。否则「MAX_DATA+STREAM」合并包（服务端
- * 握手完成时 flush 出的 SETTINGS 包）会被 MAX_DATA 开头误判为
- * ack_eliciting=0 → 丢包后不重传 → SETTINGS 交换死锁。 */
+/* 判断 payload 是不是 ack-eliciting。
+ *
+ * RFC 9000 §12.4：**只有**只含 ACK / PADDING / CONNECTION_CLOSE 的包
+ * 不是 ack-eliciting；其余所有帧——包括流控帧（MAX_DATA /
+ * MAX_STREAM_DATA / MAX_STREAMS / *_BLOCKED）、RESET_STREAM /
+ * STOP_SENDING、NEW_CONNECTION_ID / RETIRE_CONNECTION_ID、DATAGRAM、
+ * PING、CRYPTO、STREAM、HANDSHAKE_DONE——都必须回 ACK。
+ *
+ * ⚠️ 旧实现把 MAX_DATA / MAX_STREAM_DATA / MAX_STREAMS / *_BLOCKED 等当作
+ * 「非 ack-eliciting」跳过，于是「ACK + MAX_STREAM_DATA」这种 Chrome 收流时
+ * 最常发的包永远得不到 ACK。Chrome 侧这些包一直 in-flight、没有 forward
+ * progress，约 5 个 RTO（kMinRetransmissionTimeMs=200 → ~6.2s）后以
+ * QUIC_TOO_MANY_RTOS("Network blackhole detected") 关闭连接。实测表现：
+ * 拉流正常出画面几秒后 WebTransport 断开（服务端日志 peer CONNECTION_CLOSE
+ * reason=85:Network blackhole detected）。
+ *
+ * 只 ACK 上面三类帧不会产生 ACK 乒乓：ACK 本身仍不是 ack-eliciting，
+ * 对端不会因此再回 ACK。 */
 static int payload_ack_eliciting(const uint8_t *payload, size_t plen) {
     size_t pos = 0;
     while (pos < plen) {
@@ -1275,9 +1293,7 @@ static int payload_ack_eliciting(const uint8_t *payload, size_t plen) {
 
         switch (ft) {
         case QUIC_FRAME_PADDING:
-        case QUIC_FRAME_PING:
-        case QUIC_FRAME_HANDSHAKE_DONE:
-            pos += 1;
+            pos += 1;   /* PADDING 每帧 1 字节 */
             continue;
 
         case QUIC_FRAME_ACK:
@@ -1286,91 +1302,22 @@ static int payload_ack_eliciting(const uint8_t *payload, size_t plen) {
             c = quic_frame_parse_ack(payload + pos, plen - pos, &ack);
             break;
         }
-        case QUIC_FRAME_CRYPTO: {
-            uint64_t off; const uint8_t *d; size_t l;
-            c = quic_frame_parse_crypto(payload + pos, plen - pos, &off, &d, &l);
-            /* CRYPTO 数据帧是 ack-eliciting */
-            return (c > 0) ? 1 : 0;
-        }
-        case QUIC_FRAME_MAX_DATA: {
-            uint64_t v;
-            c = quic_frame_parse_max_data(payload + pos, plen - pos, &v);
-            break;
-        }
-        case QUIC_FRAME_MAX_STREAM_DATA: {
-            uint64_t sid, v;
-            c = quic_frame_parse_max_stream_data(payload + pos, plen - pos, &sid, &v);
-            break;
-        }
-        case QUIC_FRAME_MAX_STREAMS_BIDI:
-        case QUIC_FRAME_MAX_STREAMS_UNI: {
-            uint64_t v; int bidi;
-            c = quic_frame_parse_max_streams(payload + pos, plen - pos, &v, &bidi);
-            break;
-        }
-        case QUIC_FRAME_DATA_BLOCKED: {
-            uint64_t v;
-            c = quic_frame_parse_data_blocked(payload + pos, plen - pos, &v);
-            break;
-        }
-        case QUIC_FRAME_STREAM_DATA_BLOCKED: {
-            uint64_t sid, v;
-            c = quic_frame_parse_stream_data_blocked(payload + pos, plen - pos, &sid, &v);
-            break;
-        }
-        case QUIC_FRAME_STREAMS_BLOCKED_BIDI:
-        case QUIC_FRAME_STREAMS_BLOCKED_UNI: {
-            uint64_t v; int bidi;
-            c = quic_frame_parse_streams_blocked(payload + pos, plen - pos, &v, &bidi);
-            break;
-        }
-        case QUIC_FRAME_RESET_STREAM: {
-            uint64_t sid, ec, fs;
-            c = quic_frame_parse_reset_stream(payload + pos, plen - pos, &sid, &ec, &fs);
-            break;
-        }
-        case QUIC_FRAME_STOP_SENDING: {
-            uint64_t sid, ec;
-            c = quic_frame_parse_stop_sending(payload + pos, plen - pos, &sid, &ec);
-            break;
-        }
-        case QUIC_FRAME_NEW_CONNECTION_ID: {
-            uint64_t seq, rp; uint8_t cl; const uint8_t *cd; const uint8_t *rt;
-            c = quic_frame_parse_new_conn_id(payload + pos, plen - pos, &seq, &rp, &cl, &cd, &rt);
-            break;
-        }
-        case QUIC_FRAME_RETIRE_CONNECTION_ID: {
-            uint64_t seq;
-            c = quic_frame_parse_retire_conn_id(payload + pos, plen - pos, &seq);
-            break;
-        }
-        case QUIC_FRAME_NEW_TOKEN: {
-            c = quic_frame_parse_new_token(payload + pos, plen - pos);
-            break;
-        }
         case QUIC_FRAME_CONNECTION_CLOSE:
         case QUIC_FRAME_CONNECTION_CLOSE_APP: {
             uint64_t ec; const char *rs; size_t rl;
-            c = quic_frame_parse_connection_close(payload + pos, plen - pos, &ec, &rs, &rl);
-            break;
-        }
-        case QUIC_FRAME_DATAGRAM:
-        case QUIC_FRAME_DATAGRAM_LEN: {
-            const uint8_t *d; size_t l;
-            c = quic_frame_parse_datagram(payload + pos, plen - pos, &d, &l);
+            c = quic_frame_parse_connection_close(payload + pos, plen - pos,
+                                                  &ec, &rs, &rl);
             break;
         }
         default:
-            /* STREAM 帧类型 0x08..0x0f */
-            if (ft >= 0x08 && ft <= 0x0f) return 1;
-            /* 未知帧类型 — 保守视为不 ack-eliciting，停止扫描 */
-            return 0;
+            /* 其余帧一律 ack-eliciting（未知帧也保守地回 ACK）。 */
+            return 1;
         }
 
-        if (c <= 0) return 0;   /* 解析失败，保守判定 */
+        if (c <= 0) return 0;   /* 解析失败：维持旧行为，不额外 ACK */
         pos += (size_t)c;
     }
-    return 0;  /* 全是 ACK/PING/MAX_DATA 等非 ack-eliciting 帧 */
+    return 0;  /* 只含 ACK / PADDING / CONNECTION_CLOSE */
 }
 
 static int send_quic_packet(QuicConnection *conn, int pkt_type,
@@ -1506,11 +1453,19 @@ static int send_quic_packet(QuicConnection *conn, int pkt_type,
  * ACK 管理
  * ============================================ */
 
-static void record_rx_pn(QuicConnection *conn, int level, uint64_t pn) {
+static void record_rx_pn(QuicConnection *conn, int level, uint64_t pn,
+                         int ack_eliciting) {
     /* 更新 largest_rx_pn_ 供后续包 PN 解码使用 */
     if (pn > conn->largest_rx_pn_[level]) {
         conn->largest_rx_pn_[level] = pn;
     }
+
+    /* RFC 9000 §13.2.1：**只 ACK ack-eliciting 包**。
+     * 以前这里对每个收到的包都置 need_ack —— 于是 ACK-only 包会被对端再
+     * ACK 一次，形成永不停歇的 ACK 乒乓：实测两个方向各 ~2 万包/秒，
+     * Initial 空间的 ACK 还会被补 PADDING 到 1200B（~18MB/s），把链路
+     * 灌满、把真正要发的组流饿死。 */
+    if (!ack_eliciting) return;
 
     if (!conn->need_ack_[level]) {
         conn->ack_largest_pn_[level]  = pn;
@@ -1760,6 +1715,7 @@ feed_replay:
                       (unsigned long long)conn->largest_rx_pn_[level]);
             return;
         }
+        conn->last_valid_rx_ms_ = uv_now(conn->loop_);
 
         /* 收到客户端有效 Handshake 包 → 地址验证完成，解除 3x 反放大限制 */
         if (raw_type == QUIC_PKT_HANDSHAKE && !conn->peer_address_validated_) {
@@ -1774,7 +1730,8 @@ feed_replay:
                      (unsigned long long)pn, payload_len);
         }
 
-        record_rx_pn(conn, level, pn);
+        record_rx_pn(conn, level, pn,
+                     payload_ack_eliciting(payload, payload_len));
 
         /* 解析帧 */
         size_t pos = 0;
@@ -2355,6 +2312,7 @@ rollback:
         }
 
         if (!keys_ok) return;
+        conn->last_valid_rx_ms_ = uv_now(conn->loop_);
 
         /* 收到首个 1-RTT 包 → 对端已完成握手（服务端收到客户端 Finished，
          * 客户端收到服务端 Finished），可安全清理 Handshake 空间。 */
@@ -2414,7 +2372,8 @@ rollback:
                 }
             }
 
-            record_rx_pn(conn, QUIC_TLS_LEVEL_APPLICATION, pn);
+            record_rx_pn(conn, QUIC_TLS_LEVEL_APPLICATION, pn,
+                         payload_ack_eliciting(payload, payload_len));
 
             /* ---- 解析帧 ---- */
             size_t pos = 0;
@@ -2849,10 +2808,16 @@ static void on_idle_timer(void *user) {
     QuicConnection *conn = (QuicConnection*)user;
     if (!conn || conn->freeing_ || conn->state_ >= QUIC_STATE_CLOSING) return;
     const uint64_t now = uv_now(conn->loop_);
-    const uint64_t rx_age = (conn->last_rx_ms_ && now >= conn->last_rx_ms_)
-                            ? now - conn->last_rx_ms_ : 0;
+    const uint64_t rx_ref = conn->last_valid_rx_ms_ ? conn->last_valid_rx_ms_
+                                                    : conn->last_rx_ms_;
+    const uint64_t rx_age = (rx_ref && now >= rx_ref) ? now - rx_ref : 0;
     const uint64_t tx_age = (conn->last_tx_ms_ && now >= conn->last_tx_ms_)
                             ? now - conn->last_tx_ms_ : 0;
+    /* 还差一点才算超时（remain 被夹到 1ms / 计时精度）：重新挂上，别提前关。 */
+    if (rx_age + 1 < conn->idle_timeout_ms_) {
+        arm_idle_timer(conn);
+        return;
+    }
     LOG_INFO("[quic-conn] idle timeout after %llums: peer=%s:%d "
              "last_rx=%llums ago last_tx=%llums ago — closing",
              (unsigned long long)conn->idle_timeout_ms_,
@@ -2864,8 +2829,18 @@ static void on_idle_timer(void *user) {
 
 static void arm_idle_timer(QuicConnection *conn) {
     if (conn->idle_timeout_ms_ > 0) {
-        quic_timer_start(&conn->idle_timer_, on_idle_timer, conn,
-                         conn->idle_timeout_ms_, 0);
+        /* 截止点以**最后一次成功解密的包**为准。每次收到 UDP 包（包括对端
+         * 重启后回过来的 Stateless Reset / 任何解不开的短头包）都不能把期限
+         * 往后推，否则连接会永远以为自己活着、把媒体持续打进黑洞，也不会
+         * 重连。收到有效包时 last_valid_rx_ms_ 已经推进，这里算出的就是
+         * 「距离真正的空闲超时还剩多久」。 */
+        const uint64_t now = uv_now(conn->loop_);
+        const uint64_t ref = conn->last_valid_rx_ms_ ? conn->last_valid_rx_ms_
+                                                     : now;
+        const uint64_t elapsed = (now >= ref) ? now - ref : 0;
+        const uint64_t remain = elapsed >= conn->idle_timeout_ms_
+                                    ? 1 : conn->idle_timeout_ms_ - elapsed;
+        quic_timer_start(&conn->idle_timer_, on_idle_timer, conn, remain, 0);
     }
     arm_keepalive_timer(conn);
 }
@@ -2992,6 +2967,8 @@ QuicConnection* QuicConnectionCreate(uv_loop_t *loop) {
 
     conn->loop_ = loop;
     conn->state_ = QUIC_STATE_INIT;
+    /* 空闲超时的基准从创建时刻起算（之后只由成功解密的包推进）。 */
+    conn->last_valid_rx_ms_ = uv_now(loop);
 
     /* pacing：这里只给初值，rate=0 不代表会有一段「不限速期」——
      * 首个包发出前 pacing_allow() 会调 refresh_pacing_rate() 从 CC 取速率，

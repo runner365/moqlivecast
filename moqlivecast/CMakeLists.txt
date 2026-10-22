@@ -28,6 +28,11 @@ set(MOQ_SERVER_STACK
     ${CMAKE_SOURCE_DIR}/quic/congestion_control/quic_cc_bbr.c
     ${CMAKE_SOURCE_DIR}/quic/congestion_control/quic_cc_cubic.c
     ${CMAKE_SOURCE_DIR}/logger/logger.c
+    # moq-lite 客户端（Edge → Center 出站链路）。直接编进可执行文件，而不是
+    # 链接 moqlite_client_core 静态库 —— 后者自带一份 QUIC/TLS 源，会和上面
+    # 的 MOQ_SERVER_STACK 产生重复符号。
+    ${CMAKE_SOURCE_DIR}/moqlite/moq_lite_client.c
+    ${CMAKE_SOURCE_DIR}/moqlite/moq_lite_wire.c
 )
 
 # ── 本目录 C++ 源 / 头文件 ───────────────────────
@@ -83,7 +88,9 @@ target_include_directories(moqlivecast PRIVATE
     ${CMAKE_SOURCE_DIR}/http3
     ${CMAKE_SOURCE_DIR}/logger
     ${CMAKE_SOURCE_DIR}/3rdparty/yaml-cpp/include
+    ${CMAKE_SOURCE_DIR}/moqlite
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/cluster
     ${CMAKE_CURRENT_SOURCE_DIR}/config
     ${CMAKE_CURRENT_SOURCE_DIR}/format
     ${CMAKE_CURRENT_SOURCE_DIR}/format/amf

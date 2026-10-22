@@ -2,6 +2,7 @@
 #define MEDIA_OVER_WT_MOQ_PUSH_HPP
 
 #include "wt_server/wt_server.hpp"
+#include "flv_catalog.hpp"
 #include "media_packet.hpp"
 #include "data_buffer.hpp"
 
@@ -104,6 +105,10 @@ private:
     void EmitFlvVideo(int64_t dts, bool seq, bool key,
                       const uint8_t *data, size_t len, int64_t cts_ms);
     void EmitFlvAudio(int64_t dts, bool seq, const uint8_t *data, size_t len);
+    /* 用 LOC config 里的 avcC / ASC 合成 catalog.json 并入 MediaStreamManager。
+     * 集群上推、moq-lite 订阅都以 catalog 为唯一入口；这条 ingest 路径原来
+     * 不产生 catalog，于是 /moq 推上来的流在集群里不可见。 */
+    void PublishCatalog();
 
     std::string app_;
     std::string stream_;
@@ -118,6 +123,8 @@ private:
     bool writer_closed_ = false;
     bool avc_seq_sent_ = false;
     bool aac_seq_sent_ = false;
+    /* 从 LOC config 帧合成 catalog（与 RTMP 同一套逻辑）。 */
+    FlvCatalogBuilder catalog_builder_;
     /* 对端的控制单向流（只读，承载 SETUP）。 */
     WTServerStream *control_ = nullptr;
     /* 订阅方所属 session —— 媒体路径重试开单向流时要用（见 OpenUniDownlink）。 */

@@ -39,6 +39,61 @@ httpflv:
   listenip: 0.0.0.0
   port: 4433
 
+rtmp:
+  # RTMP 是**独立的 TCP 端口**（惯例 1935），与上面的 UDP 4433 互不影响。
+  #
+  # 缺省关闭：不写这一节、或写了但不给 enable: true，都不会监听。
+  # 字段即使关闭也会解析，方便先把配置写好，等 listener 启动代码接入后
+  # 只改 enable 一项。
+  #
+  # listener 已接入（RtmpServer 在 moq.cpp 里按本项创建并检查 bind/listen）。
+  # publish 已按 key 认领/顶替/释放（与 moq-lite / MOQ 同一套 owner 语义）。
+  # catalog 合成已接入：RTMP 的 AVC/AAC sequence header 会生成 catalog.json，
+  # 因此 H.264 + AAC 的 RTMP 推流也能被 moq-lite 客户端（moq-cli / Android）拉。
+  # ⚠️ app 必须等于 moq-lite 的入口路径（缺省 anon），例如
+  #    rtmp://host:1935/anon/123456 → moq-cli 用 --broadcast 123456 拉。
+  enable: true
+  listenip: 0.0.0.0
+  port: 1935
+  # 握手完成后这么久没有任何读写就关闭会话（毫秒，范围 1000 ~ 600000）。
+  # 原来的实现写死 15 秒。
+  idle_timeout_ms: 15000
+
+cluster:
+  # 两级集群：Edge 把本地推流上推到 Center，本地缺流时按需回源。
+  #
+  # mode: off  = 单机服务端（缺省，行为与以前完全一致）
+  # mode: edge = 本机是边缘节点，需要 center_address
+  #
+  # 没有 mode: center —— 中心节点就是一个 **普通服务端**（mode 不写 / off），
+  # 它不需要知道被谁拨；各 Edge 把自己的 center_address 指向它即可。
+  #
+  # 链路协议第一期只实现 moq（moq-lite-06，裸 QUIC，每路流一条连接）。
+  # center_address 填 Center 的 moq-lite 监听地址（UDP），不是 RTMP 端口。
+  # center_path 是 Center 的 moq-lite 入口路径（moq_server.moq_lite_subpath）。
+  #
+  # 示例（Edge）：
+  #   mode: edge
+  #   protocol: moq
+  #   center_address: 127.0.0.1:4433
+  #   center_path: anon
+  mode: off
+  protocol: moq
+  center_address: ""
+  center_path: anon
+  # 出站连接重连退避（毫秒，指数增长，带 ±20% 抖动）。
+  reconnect_min_ms: 500
+  reconnect_max_ms: 10000
+  # moq-lite 订阅在本地缺流时最多挂起多久等 catalog（毫秒）。
+  subscribe_timeout_ms: 3000
+  # 回源连接建立后多久拿不到 catalog 就放弃（毫秒）。
+  pull_acquire_timeout_ms: 5000
+  # 回源流多久没有媒体帧就关闭（毫秒）。
+  pull_idle_timeout_ms: 30000
+  # 并发回源连接上限；未知流名的负缓存窗口。
+  max_pull_connections: 128
+  negative_cache_ms: 5000
+
 log:
   # info 就够验 moq-lite 的落地链路了：流 key、catalog 各轨、首帧形状、
   # "delivery started"、每 100 帧一条 delivered=N、以及会话关闭时的收尾摘要

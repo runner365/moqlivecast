@@ -10,6 +10,7 @@
 #include "utils/json.hpp"
 #include "utils/timeex.hpp"
 
+#include <algorithm>
 #include <cstdio>
 
 namespace cpp_streamer {
@@ -254,13 +255,18 @@ std::map<QuicConnection *, MoqLiteSession *> &MoqLiteSession::Registry() {
 MoqLiteSession::MoqLiteSession(QuicConnection *conn,
                                std::string alpn,
                                std::string remote_ip, int remote_port,
-                               OnRoute on_route, OnClose on_close)
+                               OnRoute on_route, OnClose on_close,
+                               OnStreamMissing on_stream_missing,
+                               int deferred_subscribe_ms)
     : conn_(conn),
       alpn_(std::move(alpn)),
       remote_ip_(std::move(remote_ip)),
       remote_port_(remote_port),
       on_route_(std::move(on_route)),
-      on_close_(std::move(on_close)) {
+      on_close_(std::move(on_close)),
+      on_stream_missing_(std::move(on_stream_missing)),
+      deferred_subscribe_ms_(deferred_subscribe_ms > 0 ? deferred_subscribe_ms
+                                                       : 3000) {
     /* owner id 在构造时就定下来：它标识「这条连接」，与路由、broadcast 无关，
      * 所以在任何回调之前生成最省心。 */
     char buf[64];
@@ -1973,16 +1979,39 @@ constexpr uint64_t kServeTimescale = 1000000;
 constexpr uint64_t kServeMaxAgeMs = 5000;
 constexpr uint8_t  kServePriority = 0;
 
-/* 把一条本地 key（`<路由路径>/<broadcast>`）还原成**线上**的 broadcast 名：
- * 剥掉**第一段**（app）即可。只剥第一段是因为 broadcast 名自己可以带 '/' ——
- * `anon/a/b.hang` 的对端可见名是 `a/b.hang`，不是 `b.hang`。 */
-std::string WireBroadcastOf(const std::string &local_key) {
-    const size_t pos = local_key.find('/');
-    if (pos == std::string::npos) return std::string();
-    return local_key.substr(pos + 1);
+/* ANNOUNCE_REQUEST 的 prefix 是**绝对**路径，ANNOUNCE_START 的 suffix 是相对它
+ * 的路径（publisher.rs:543-574 的 rebase）。不在 scope 内返回 false。 */
+bool AnnounceSuffixOf(const std::string &wire, const std::string &prefix,
+                      std::string *suffix) {
+    if (prefix.empty()) {
+        *suffix = wire;
+        return true;
+    }
+    if (wire == prefix) {
+        *suffix = std::string();
+        return true;
+    }
+    if (wire.size() > prefix.size() &&
+        wire.compare(0, prefix.size(), prefix) == 0 &&
+        wire[prefix.size()] == '/') {
+        *suffix = wire.substr(prefix.size() + 1);
+        return true;
+    }
+    return false;
 }
 
 } /* namespace */
+
+std::string MoqLiteSession::AnnounceWireOf(const std::string &stream_key) const {
+    if (!routed_path_.empty()) {
+        const std::string prefix = routed_path_ + "/";
+        if (stream_key.size() > prefix.size() &&
+            stream_key.compare(0, prefix.size(), prefix) == 0) {
+            return stream_key.substr(prefix.size());
+        }
+    }
+    return stream_key;
+}
 
 bool MoqLiteSession::ResolveServeTrack(const std::string &broadcast,
                                        const std::string &track,
@@ -1990,18 +2019,30 @@ bool MoqLiteSession::ResolveServeTrack(const std::string &broadcast,
                                        std::string *kind) {
     if (broadcast.empty() || track.empty()) return false;
 
-    /* 线上从来没有 app 段（发布端命名空间根在 ""，见 BuildStreamKey），所以
-     * 本地 key = 我们的入口路径 + "/" + 对端看到的那个名字。 */
+    /* 本地 key 有两种命名空间，按顺序试：
+     *   1) broadcast 本身 = <app>/<stream>：Edge 本地推流、Center 直接 ingest；
+     *   2) <本端路由>/<broadcast>：集群上推/回源落在本端的 key。
+     * 第 1 种优先：app-qualified 的广播先尝试直接命中本地 publisher；查不到
+     * 再按旧规则拼路由前缀。没有 '/' 的旧式 broadcast 直接走第 2 种。 */
     const std::string app = routed_path_.empty() ? kFallbackApp : routed_path_;
-    const std::string key = app + "/" + broadcast;
+    std::string key;
+    std::string json;
+    bool found = false;
+    if (broadcast.find('/') != std::string::npos) {
+        key = broadcast;
+        found = MediaStreamManager::GetCatalogJson(key, json);
+    }
+    if (!found) {
+        key = app + "/" + broadcast;
+        found = MediaStreamManager::GetCatalogJson(key, json);
+    }
 
     /* 没有 catalog 的流**不对外服务**：export flv 必须靠 catalog 才能解析出
      * rendition（codec 串 / description / clock 全在里面）。把它 announce 出去
      * 的话，对端会连上、解析出 broadcast、然后**静默什么都拿不到** —— 那是最糟
      * 的失败模式：看起来像我们的 bug，其实无处可查。RTMP 之类填不上 catalog 的
      * 来源本轮不支持导出。 */
-    std::string json;
-    if (!MediaStreamManager::GetCatalogJson(key, json)) return false;
+    if (!found) return false;
 
     if (track == kCatalogTrack) {
         if (local_key) *local_key = key;
@@ -2082,8 +2123,29 @@ void MoqLiteSession::ParsePeerTrack(uint64_t sid, RecvStream &st) {
     st.done = true;   /* Track 流是一次性的：答完就 FIN，后面不会再有消息 */
 
     std::string key;
+    bool known = ResolveServeTrack(broadcast, track, &key, nullptr);
+    if (!known) {
+        /* 本地没有这条广播：可能正在/可以回源。TRACK_INFO 先按本服务端的固定
+         * 参数回（timescale=1e6 是 legacy 线上的硬约定），真正的目录等拉回来
+         * 再通过 SUBSCRIBE（会被挂起）兑现。不回 TRACK_INFO 的话对端**连
+         * SUBSCRIBE 都不会发**，回源就永远触发不了。 */
+        const std::string app = routed_path_.empty() ? kFallbackApp
+                                                     : routed_path_;
+        key = app + "/" + broadcast;
+        /* wire = 对端订阅的 broadcast：远端广播带 app（live1/stream1），
+         * 必须原样带去 Center；不能从 key 反推（key 里那段 app 是本端路由）。 */
+        if (on_stream_missing_ && on_stream_missing_(key, broadcast)) {
+            LOG_INFO("[moq-lite] %s:%d TRACK_INFO for remote broadcast=\"%s\" "
+                     "track=\"%s\" key=\"%s\": replying with defaults, origin "
+                     "pull in flight",
+                     remote_ip_.c_str(), remote_port_, broadcast.c_str(),
+                     track.c_str(), key.c_str());
+            known = true;
+        }
+    }
+
     std::vector<uint8_t> out;
-    if (!ResolveServeTrack(broadcast, track, &key, nullptr) ||
+    if (!known ||
         !MlBuildTrackInfo(out, kServePriority, kServeMaxAgeMs, kServeTimescale)) {
         LOG_INFO("[moq-lite] %s:%d track request for unknown track: broadcast=\"%s\" "
                  "track=\"%s\"",
@@ -2188,38 +2250,37 @@ void MoqLiteSession::ParsePeerAnnounce(uint64_t sid, RecvStream &st) {
  * 数打出来，一次失败要盲查很久。 */
 bool MoqLiteSession::AnnounceGrid(uint64_t sid, RecvStream &st,
                                   const std::string &prefix) {
+    std::vector<std::string> wires;
     const std::vector<std::string> keys = MediaStreamManager::ListPublisherKeys();
-
-    struct Item { std::string suffix; };
-    std::vector<Item> items;
     std::string json;
     for (size_t i = 0; i < keys.size(); i++) {
-        const std::string wire = WireBroadcastOf(keys[i]);
+        const std::string wire = AnnounceWireOf(keys[i]);
         if (wire.empty()) continue;
         /* 没有 catalog 的流不公告（见 ResolveServeTrack 的说明） */
         if (!MediaStreamManager::GetCatalogJson(keys[i], json)) continue;
+        wires.push_back(wire);
+    }
+    /* 集群 edge：把 Center 公告过来的广播也报给本地客户端，否则它们连
+     * SUBSCRIBE 都不会发，按需回源就永远触发不了。 */
+    if (announce_provider_) announce_provider_(&wires);
+    std::sort(wires.begin(), wires.end());
+    wires.erase(std::unique(wires.begin(), wires.end()), wires.end());
 
+    struct Item { std::string wire; std::string suffix; };
+    std::vector<Item> items;
+    for (const std::string &wire : wires) {
         std::string suffix;
-        if (prefix.empty()) {
-            suffix = wire;
-        } else if (wire == prefix) {
-            suffix = std::string();
-            /* 这条就是 prefix 本身：suffix 空串，合法且最常见 */
-        } else if (wire.size() > prefix.size() && wire.compare(0, prefix.size(), prefix) == 0
-                   && wire[prefix.size()] == '/') {
-            suffix = wire.substr(prefix.size() + 1);
-        } else {
-            continue;   /* 不在这个 scope 里 */
-        }
+        if (!AnnounceSuffixOf(wire, prefix, &suffix)) continue;   /* 不在 scope 里 */
         Item it;
+        it.wire = wire;
         it.suffix = suffix;
         items.push_back(it);
     }
 
-    LOG_INFO("[moq-lite] %s:%d ANNOUNCE_REQUEST prefix=\"%s\": %zu of %zu publisher(s) "
+    LOG_INFO("[moq-lite] %s:%d ANNOUNCE_REQUEST prefix=\"%s\": %zu of %zu broadcast(s) "
              "in scope, replying active=%zu",
              remote_ip_.c_str(), remote_port_, prefix.c_str(), items.size(),
-             keys.size(), items.size());
+             wires.size(), items.size());
 
     std::vector<uint8_t> out;
     /* origin 发 0（= Hop::UNKNOWN，「没有身份」）。我们是内容的源头，没有上游
@@ -2238,6 +2299,16 @@ bool MoqLiteSession::AnnounceGrid(uint64_t sid, RecvStream &st,
         }
     }
 
+    /* -06 的 announce id 不带在线上：收侧按**同一条流上的出现顺序**从 0 数。
+     * 这里按同一顺序记账，后续 ANNOUNCE_END 要引用它。 */
+    PeerAnnounce &pa = peer_announces_[sid];
+    pa.prefix = prefix;
+    pa.next_id = 0;
+    pa.ids.clear();
+    for (size_t i = 0; i < items.size(); i++) {
+        pa.ids[items[i].wire] = pa.next_id++;
+    }
+
     /* fin=0：announce 流要一直开着，后面的 PUBLISH/UNPUBLISH 更新还走它。 */
     if (QuicConnectionStreamSend(conn_, sid, out.data(), out.size(), 0) < 0) {
         LOG_ERROR("[moq-lite] %s:%d cannot send announce reply on stream %llu",
@@ -2246,6 +2317,52 @@ bool MoqLiteSession::AnnounceGrid(uint64_t sid, RecvStream &st,
         return false;
     }
     return true;
+}
+
+void MoqLiteSession::SetAnnounceProvider(AnnounceProvider provider) {
+    announce_provider_ = std::move(provider);
+}
+
+void MoqLiteSession::AnnounceBroadcast(const std::string &wire, bool added) {
+    if (dead_ || wire.empty() || peer_announces_.empty()) return;
+
+    for (auto &kv : peer_announces_) {
+        const uint64_t sid = kv.first;
+        PeerAnnounce &pa = kv.second;
+        std::vector<uint8_t> out;
+
+        if (added) {
+            if (pa.ids.find(wire) != pa.ids.end()) continue;   /* 已经报过 */
+            std::string suffix;
+            if (!AnnounceSuffixOf(wire, pa.prefix, &suffix)) continue;
+            if (!MlAppendAnnounceStart(out, suffix, 0, 0)) continue;
+            if (QuicConnectionStreamSend(conn_, sid, out.data(), out.size(), 0) < 0) {
+                LOG_DEBUG("[moq-lite] %s:%d cannot push ANNOUNCE_START on %llu",
+                          remote_ip_.c_str(), remote_port_,
+                          static_cast<unsigned long long>(sid));
+                continue;
+            }
+            pa.ids[wire] = pa.next_id++;
+            LOG_INFO("[moq-lite] %s:%d ANNOUNCE_START pushed: broadcast=\"%s\" "
+                     "suffix=\"%s\" id=%llu",
+                     remote_ip_.c_str(), remote_port_, wire.c_str(),
+                     suffix.c_str(),
+                     static_cast<unsigned long long>(pa.ids[wire]));
+        } else {
+            auto it = pa.ids.find(wire);
+            if (it == pa.ids.end()) continue;
+            const uint64_t ann_id = it->second;
+            if (!MlAppendAnnounceEnd(out, ann_id)) continue;
+            if (QuicConnectionStreamSend(conn_, sid, out.data(), out.size(), 0) < 0) {
+                pa.ids.erase(it);
+                continue;
+            }
+            pa.ids.erase(it);
+            LOG_INFO("[moq-lite] %s:%d ANNOUNCE_END pushed: broadcast=\"%s\" id=%llu",
+                     remote_ip_.c_str(), remote_port_, wire.c_str(),
+                     static_cast<unsigned long long>(ann_id));
+        }
+    }
 }
 
 /* Subscribe 流（bidi 0x2）—— 对端要订某条 track。
@@ -2261,13 +2378,14 @@ bool MoqLiteSession::AnnounceGrid(uint64_t sid, RecvStream &st,
  * 发的）。所以它不走 MoqLiteEgress，这里一次性发完：
  *   SUBSCRIBE_START{0}  →  一条 uni 流：[STREAM_TYPE 0x0][GROUP 头][FRAME] + FIN
  *
- * ⚠️ 组号恒 0：本订阅的 catalog 只有这一组。将来 catalog 变了要**发下一组**
- * （seq=1），而不是重发组 0 —— 对端按组号去重，重发会被当成重复丢掉。
- * 目前 catalog 在推流会话里存一次就定了，这条路径还没接。 */
+ * ⚠️ 组号从 0 起。catalog 后续变化由 MediaStreamManager 的 catalog 回调转发进
+ * OnCatalogUpdated，补发**下一组**（seq=1、2…）—— 对端按组号去重，重发旧组
+ * 会被当成重复丢掉。 */
 void MoqLiteSession::ServeCatalog(uint64_t sid, uint64_t sub_id, RecvStream &st,
                                   const std::string &local_key) {
     std::string json;
-    if (!MediaStreamManager::GetCatalogJson(local_key, json)) {
+    uint64_t rev = 0;
+    if (!MediaStreamManager::GetCatalogJson(local_key, json, &rev)) {
         LOG_WARN("[moq-lite] %s:%d catalog subscribe %llu: no stored catalog for "
                  "key=\"%s\" (publisher gone?)",
                  remote_ip_.c_str(), remote_port_,
@@ -2285,39 +2403,99 @@ void MoqLiteSession::ServeCatalog(uint64_t sid, uint64_t sub_id, RecvStream &st,
         return;
     }
 
+    if (!SendCatalogGroup(sub_id, 0, json, local_key)) return;
+
+    /* 记录基线（组号 + catalog rev）：后续更新只补发对方还没收到的那一版。 */
+    auto it = serve_subs_.find(sub_id);
+    if (it != serve_subs_.end()) {
+        it->second.catalog_group = 0;
+        it->second.catalog_rev = rev;
+    }
+}
+
+bool MoqLiteSession::SendCatalogGroup(uint64_t sub_id, uint64_t group_seq,
+                                      const std::string &json,
+                                      const std::string &local_key) {
     const uint64_t usid = QuicConnectionStreamOpenUni(conn_);
     if (usid == UINT64_MAX) {
         /* 额度耗尽。catalog 这一组丢掉的话对端**整条流都解析不了**（没有
          * catalog 就不知道有哪些 rendition），所以这条不是「少一帧」而是致命
          * 的。只警告：不阻塞、不重试（重试需要一个定时器，而这条路径在唯一的
          * uv loop 上）。对端会看到 announce 里有这条广播但拉不出内容。 */
-        LOG_ERROR("[moq-lite] %s:%d no uni stream credit for the catalog group of "
-                  "subscribe %llu - peer will not be able to parse this broadcast",
+        LOG_ERROR("[moq-lite] %s:%d no uni stream credit for catalog group %llu of "
+                  "subscribe %llu - peer may mis-parse this broadcast",
                   remote_ip_.c_str(), remote_port_,
+                  static_cast<unsigned long long>(group_seq),
                   static_cast<unsigned long long>(sub_id));
-        return;
+        return false;
     }
 
     std::vector<uint8_t> body;
     MlAppendVarint(body, 0x0);                       /* STREAM_TYPE = Group */
-    if (!MlBuildGroupHeader(body, sub_id, 0, 0) ||    /* group=0, frame_start=0 */
+    if (!MlBuildGroupHeader(body, sub_id, group_seq, 0) ||   /* frame_start=0 */
         !MlAppendFrame(body, 0, reinterpret_cast<const uint8_t *>(json.data()),
                        json.size())) {
         QuicConnectionStreamReset(conn_, usid, 0x0);
-        return;
+        return false;
     }
-    /* 一次性发完并 FIN：catalog 这一组就一帧，没有后续。 */
+    /* 一次性发完并 FIN：catalog 一组就一帧，没有后续。 */
     if (QuicConnectionStreamSendEx(conn_, usid, body.data(), body.size(), 1,
                                    nullptr, nullptr, 0) < 0) {
         LOG_ERROR("[moq-lite] %s:%d cannot write catalog group on uni stream %llu",
                   remote_ip_.c_str(), remote_port_,
                   static_cast<unsigned long long>(usid));
-        return;
+        return false;
     }
-    LOG_INFO("[moq-lite] %s:%d catalog sent to subscribe %llu: key=\"%s\" bytes=%zu "
-             "(one group, one frame, raw JSON)",
+    LOG_INFO("[moq-lite] %s:%d catalog group sent: sub=%llu group=%llu key=\"%s\" "
+             "bytes=%zu (one frame, raw JSON, FIN)",
              remote_ip_.c_str(), remote_port_,
-             static_cast<unsigned long long>(sub_id), local_key.c_str(), json.size());
+             static_cast<unsigned long long>(sub_id),
+             static_cast<unsigned long long>(group_seq),
+             local_key.c_str(), json.size());
+    return true;
+}
+
+void MoqLiteSession::OnCatalogUpdated(const std::string &stream_key, uint64_t rev) {
+    if (dead_ || stream_key.empty()) return;
+
+    std::string json;
+    uint64_t cur_rev = 0;
+    if (!MediaStreamManager::GetCatalogJson(stream_key, json, &cur_rev)) return;
+    if (cur_rev < rev) rev = cur_rev;   /* 防御：调用方给的 rev 不应超前 */
+
+    /* 先收集目标再逐个写：写 QUIC 可能间接触发会话关闭 / serve_subs_ 变更，
+     * 不能边遍历边写。 */
+    std::vector<uint64_t> targets;
+    for (const auto &kv : serve_subs_) {
+        const ServeSub &s = kv.second;
+        if (s.track != kCatalogTrack) continue;
+        if (s.key != stream_key) continue;
+        if (s.catalog_rev >= rev) continue;   /* 这一版已经发给它了 */
+        targets.push_back(kv.first);
+    }
+
+    for (uint64_t sub_id : targets) {
+        auto it = serve_subs_.find(sub_id);
+        if (it == serve_subs_.end()) continue;
+        const uint64_t next_group = it->second.catalog_group + 1;
+        if (!SendCatalogGroup(sub_id, next_group, json, stream_key)) continue;
+        it->second.catalog_group = next_group;
+        it->second.catalog_rev = rev;
+    }
+
+    if (!targets.empty()) {
+        LOG_INFO("[moq-lite] %s:%d catalog update key=\"%s\" rev=%llu -> %zu "
+                 "subscriber(s) got a new group",
+                 remote_ip_.c_str(), remote_port_, stream_key.c_str(),
+                 (unsigned long long)rev, targets.size());
+    }
+
+    /* 广播变得可公告：向对端开着的 announce 流补发 START（幂等）。
+     * 这修的是「订阅方先连、推流端后起」那个缺口：以前只答快照。 */
+    AnnounceBroadcast(AnnounceWireOf(stream_key), true);
+
+    /* 回源挂起的订阅：catalog 到了就重试。放在最后，前面的补组逻辑先跑完。 */
+    RetryPendingPeerSubscribes(stream_key);
 }
 
 void MoqLiteSession::TeardownEgress(const char *why) {
@@ -2412,7 +2590,8 @@ void MoqLiteSession::ParsePeerSubscribe(uint64_t sid, RecvStream &st) {
      * （`lite/publisher.rs`）。这里曾经写成 `sub_id == 0 || …`，结果**每个会话
      * 的第一个订阅（永远是 id 0）都被我们当成撞号掐掉**，对端只能看到
      * 「duplicate subscribe id」。别再把它加回来。 */
-    if (serve_subs_.find(sub_id) != serve_subs_.end()) {
+    if (serve_subs_.find(sub_id) != serve_subs_.end() ||
+        pending_peer_subs_.find(sub_id) != pending_peer_subs_.end()) {
         LOG_ERROR("[moq-lite] %s:%d subscribe id %llu already used in this session",
                   remote_ip_.c_str(), remote_port_,
                   static_cast<unsigned long long>(sub_id));
@@ -2420,8 +2599,37 @@ void MoqLiteSession::ParsePeerSubscribe(uint64_t sid, RecvStream &st) {
         return;
     }
 
+    PendingPeerSub pending;
+    pending.sid           = sid;
+    pending.sub_id        = sub_id;
+    pending.broadcast     = broadcast;
+    pending.track         = track;
+    pending.priority      = priority;
+    pending.max_age_ms    = max_age;
+    pending.start_group   = start_group;
+    pending.end_group_raw = end_group_raw;
+    pending.start_frame   = start_frame;
+    pending.end_frame_raw = end_frame_raw;
+
     std::string key, kind;
     if (!ResolveServeTrack(broadcast, track, &key, &kind)) {
+        /* 本地没有这条流：如果集群层说「已发起回源」，先挂起 —— 对端那条
+         * Subscribe bidi 流保持开着，catalog 一到就重试。 */
+        const std::string app = routed_path_.empty() ? kFallbackApp
+                                                     : routed_path_;
+        pending.key = app + "/" + broadcast;
+        /* 同 TRACK_INFO 分支：wire 用对端订阅的 broadcast，保留源端 app。 */
+        if (on_stream_missing_ && on_stream_missing_(pending.key, broadcast)) {
+            pending.deadline_ms = now_millisec() + deferred_subscribe_ms_;
+            pending_peer_subs_[sub_id] = pending;
+            LOG_INFO("[moq-lite] %s:%d SUBSCRIBE id=%llu key=\"%s\" track=\"%s\": "
+                     "deferred %dms waiting for origin pull",
+                     remote_ip_.c_str(), remote_port_,
+                     static_cast<unsigned long long>(sub_id),
+                     pending.key.c_str(), track.c_str(), deferred_subscribe_ms_);
+            return;
+        }
+
         /* 拒绝订阅 = **直接 reset 那条流**，不是发一条消息（-06 没有
          * SUBSCRIBE_ERROR 这种东西）。 */
         LOG_INFO("[moq-lite] %s:%d subscribe %llu rejected: broadcast=\"%s\" "
@@ -2433,27 +2641,47 @@ void MoqLiteSession::ParsePeerSubscribe(uint64_t sid, RecvStream &st) {
         return;
     }
 
-    ServeSub sub;
-    sub.sid         = sid;
-    sub.broadcast   = broadcast;
-    sub.track       = track;
-    sub.priority    = priority;
-    sub.max_age_ms  = max_age;
-    sub.start_group = start_group;
+    pending.key = key;
+    AttachPeerSubscribe(pending);
+}
+
+bool MoqLiteSession::AttachPeerSubscribe(PendingPeerSub sub) {
+    auto sit = streams_.find(sub.sid);
+    if (sit == streams_.end() || sit->second.reset_sent) {
+        return false;
+    }
+    RecvStream &st = sit->second;
+
+    std::string key, kind;
+    if (!ResolveServeTrack(sub.broadcast, sub.track, &key, &kind)) {
+        return false;
+    }
+    sub.key = key;
+
+    ServeSub serve;
+    serve.sid         = sub.sid;
+    serve.broadcast   = sub.broadcast;
+    serve.key         = key;
+    serve.track       = sub.track;
+    serve.priority    = sub.priority;
+    serve.max_age_ms  = sub.max_age_ms;
+    serve.start_group = sub.start_group;
     /* N+1 形式还原成原值；0 表示「不限」，我们恒发到 live 尽头，所以只记不使用 */
-    sub.end_group   = end_group_raw == 0 ? 0 : end_group_raw - 1;
-    sub.start_frame = start_frame;
-    sub.end_frame   = end_frame_raw == 0 ? 0 : end_frame_raw - 1;
-    serve_subs_[sub_id] = sub;
+    serve.end_group   = sub.end_group_raw == 0 ? 0 : sub.end_group_raw - 1;
+    serve.start_frame = sub.start_frame;
+    serve.end_frame   = sub.end_frame_raw == 0 ? 0 : sub.end_frame_raw - 1;
+    serve_subs_[sub.sub_id] = serve;
 
     LOG_INFO("[moq-lite] %s:%d SUBSCRIBE id=%llu key=\"%s\" track=\"%s\" kind=%s "
              "prio=%llu max_age=%llums groups=[%llu,%llu) frames=[%llu,%llu)",
              remote_ip_.c_str(), remote_port_,
-             static_cast<unsigned long long>(sub_id), key.c_str(), track.c_str(),
-             kind.c_str(),
-             (unsigned long long)priority, (unsigned long long)max_age,
-             (unsigned long long)start_group, (unsigned long long)sub.end_group,
-             (unsigned long long)start_frame, (unsigned long long)sub.end_frame);
+             static_cast<unsigned long long>(sub.sub_id), key.c_str(),
+             sub.track.c_str(), kind.c_str(),
+             (unsigned long long)sub.priority, (unsigned long long)sub.max_age_ms,
+             (unsigned long long)sub.start_group,
+             (unsigned long long)serve.end_group,
+             (unsigned long long)sub.start_frame,
+             (unsigned long long)serve.end_frame);
 
     /* ── 接上下行 ──
      * catalog 不是媒体，单独发（见 ServeCatalog）；媒体轨造一个下行写入器，
@@ -2464,8 +2692,8 @@ void MoqLiteSession::ParsePeerSubscribe(uint64_t sid, RecvStream &st) {
      * Parse 尾部还有一句 `if (st.done) st.buf.clear();`。这里 st.done 已经
      * 置真，所以就算返回也安全。 */
     if (kind == "catalog") {
-        ServeCatalog(sid, sub_id, st, key);
-        return;
+        ServeCatalog(sub.sid, sub.sub_id, st, key);
+        return true;
     }
 
     const bool is_video = (kind == "video");
@@ -2475,12 +2703,12 @@ void MoqLiteSession::ParsePeerSubscribe(uint64_t sid, RecvStream &st) {
     /* writer id 必须**会话内唯一**：MediaStreamManager 按它摘牌，两个订阅共用
      * 一个 id 时后注册的把先注册的顶掉，先注册的那条订阅就永远收不到包。 */
     snprintf(writer_id, sizeof(writer_id), "%s#%llu", owner_id_.c_str(),
-             static_cast<unsigned long long>(sub_id));
+             static_cast<unsigned long long>(sub.sub_id));
 
     auto eg = std::unique_ptr<MoqLiteEgress>(
-        new MoqLiteEgress(conn_, key, writer_id, track, peer, is_video));
+        new MoqLiteEgress(conn_, key, writer_id, sub.track, peer, is_video));
     MoqLiteEgress *raw = eg.get();
-    egress_[sub_id] = std::move(eg);
+    egress_[sub.sub_id] = std::move(eg);
 
     /* 预置 init_flag_：绕开 AddPlayer 内建的 WriterGop 回放（GOP 由我们自己的
      * SendGop 发，见 MoqLiteEgress::Start）。与 MoqPushSession 同一套做法。 */
@@ -2488,7 +2716,65 @@ void MoqLiteSession::ParsePeerSubscribe(uint64_t sid, RecvStream &st) {
     MediaStreamManager::AddPlayer(raw);
     /* 两个号都要给：sub_id 是**对端选的订阅号**（GROUP 头里报的是它），sid 是
      * 对端开的那条 Subscribe bidi 流（SUBSCRIBE_START 写它、Stop 时 reset 它）。 */
-    raw->Start(sub_id, sid);
+    raw->Start(sub.sub_id, sub.sid);
+    return true;
+}
+
+void MoqLiteSession::RetryPendingPeerSubscribes(const std::string &stream_key) {
+    if (pending_peer_subs_.empty()) return;
+
+    std::vector<uint64_t> ids;
+    for (const auto &kv : pending_peer_subs_) {
+        if (kv.second.key == stream_key) ids.push_back(kv.first);
+    }
+    for (uint64_t id : ids) {
+        auto it = pending_peer_subs_.find(id);
+        if (it == pending_peer_subs_.end()) continue;
+        PendingPeerSub sub = it->second;
+
+        auto sit = streams_.find(sub.sid);
+        if (sit == streams_.end() || sit->second.reset_sent) {
+            pending_peer_subs_.erase(it);
+            continue;
+        }
+
+        std::string key, kind;
+        if (!ResolveServeTrack(sub.broadcast, sub.track, &key, &kind)) {
+            continue;   /* catalog 有了但这条轨还没有，继续等 */
+        }
+        pending_peer_subs_.erase(it);
+        LOG_INFO("[moq-lite] %s:%d deferred SUBSCRIBE id=%llu key=\"%s\" "
+                 "track=\"%s\": catalog ready, attaching",
+                 remote_ip_.c_str(), remote_port_,
+                 static_cast<unsigned long long>(sub.sub_id), key.c_str(),
+                 sub.track.c_str());
+        AttachPeerSubscribe(sub);
+    }
+}
+
+void MoqLiteSession::SweepPendingPeerSubscribes(int64_t now_ms) {
+    if (dead_ || pending_peer_subs_.empty()) return;
+
+    for (auto it = pending_peer_subs_.begin(); it != pending_peer_subs_.end();) {
+        if (now_ms < it->second.deadline_ms) {
+            ++it;
+            continue;
+        }
+        const uint64_t sid = it->second.sid;
+        auto sit = streams_.find(sid);
+        if (sit != streams_.end()) {
+            ResetStream(sid, kStreamCancelled, sit->second,
+                        "deferred subscribe timed out (origin pull)");
+        } else {
+            QuicConnectionStreamReset(conn_, sid, kStreamCancelled);
+        }
+        LOG_INFO("[moq-lite] %s:%d deferred SUBSCRIBE id=%llu key=\"%s\": "
+                 "timed out after %dms",
+                 remote_ip_.c_str(), remote_port_,
+                 static_cast<unsigned long long>(it->second.sub_id),
+                 it->second.key.c_str(), deferred_subscribe_ms_);
+        it = pending_peer_subs_.erase(it);
+    }
 }
 
 void MoqLiteSession::ParseBidiStream(uint64_t sid, RecvStream &st) {

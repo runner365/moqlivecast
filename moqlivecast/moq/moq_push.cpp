@@ -1041,6 +1041,8 @@ void MoqPushSession::OnLocObject(uint64_t alias, int64_t ts_ms, int64_t cts_ms,
             /* config 帧没有显示时间，CTS 恒 0 */
             EmitFlvVideo(ts_ms, true, true, cfg, cfg_len, 0);
             avc_seq_sent_ = true;
+            catalog_builder_.OnVideoAvcC(cfg, cfg_len);
+            PublishCatalog();
         }
         EmitFlvVideo(ts_ms, false, key, payload, payload_len, cts_ms);
         return;
@@ -1049,9 +1051,30 @@ void MoqPushSession::OnLocObject(uint64_t alias, int64_t ts_ms, int64_t cts_ms,
         if (cfg && cfg_len && !aac_seq_sent_) {
             EmitFlvAudio(ts_ms, true, cfg, cfg_len);
             aac_seq_sent_ = true;
+            catalog_builder_.OnAudioAsc(cfg, cfg_len);
+            PublishCatalog();
         }
         EmitFlvAudio(ts_ms, false, payload, payload_len);
     }
+}
+
+void MoqPushSession::PublishCatalog() {
+    /* LOC 的 config 属性就是 avcC / AudioSpecificConfig 原字节（与 FLV 序列头
+     * 剥掉 tag 头之后的载荷一致），所以直接复用 RTMP 那条 catalog 合成逻辑。
+     * 有了 catalog，这条流才会：① 被集群 ClusterPushLink 推到 Center；
+     * ② 能被本地 moq-lite / RTMP / HTTP-FLV 订阅方解析出轨道。 */
+    const std::string json = catalog_builder_.BuildJson();
+    if (json.empty()) return;
+    const std::string key = app_ + "/" + stream_;
+    if (!MediaStreamManager::SetCatalogJson(key, session_id_, json)) {
+        LOG_WARN("[moq-rfc] catalog store failed key=\"%s\" owner=%s (%zu bytes)",
+                 key.c_str(), session_id_.c_str(), json.size());
+        return;
+    }
+    LOG_INFO("[moq-rfc] catalog published key=\"%s\" owner=%s bytes=%zu "
+             "video=%d audio=%d", key.c_str(), session_id_.c_str(), json.size(),
+             catalog_builder_.HasVideo() ? 1 : 0,
+             catalog_builder_.HasAudio() ? 1 : 0);
 }
 
 void MoqPushSession::EmitFlvVideo(int64_t dts, bool seq, bool key,

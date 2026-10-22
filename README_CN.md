@@ -12,6 +12,7 @@
 - **MoQ 推流 / 拉流**（基于 WebTransport）
 - **WebTransport FLV** 推流 / 拉流
 - **HTTP-FLV 拉流**，与 WebTransport 共用同一端口（UDP + TCP）
+- **RTMP 推流 / 拉流**（TCP 1935）—— OBS / ffmpeg 推流，任意来源的流也能用 RTMP 拉
 - **Android 推流客户端** —— Camera2 + 麦克风 → H.264/AAC → moq-lite（裸 QUIC）
   （见 [Android 使用指南](tools/android/how_to_use_android_moqlit_push.md)）
 - 共享 `MediaStreamManager` + 每路流的 **GOP 缓存**：
@@ -143,6 +144,43 @@ https://<server-host>:4433/moq?app=anon&stream=android.hang
 完整构建选项、源码地图、必须遵守的不变量和排错表：
 **[tools/android/how_to_use_android_moqlit_push.md](tools/android/how_to_use_android_moqlit_push.md)**。
 
+### RTMP 推流
+
+RTMP 使用**独立的 TCP 端口**（[`moqlivecast/etc/config.yml`](moqlivecast/etc/config.yml)
+里的 `rtmp:` 节，缺省 1935），接入后写入同一份 `MediaStreamManager`，
+因此下面所有拉流路径都能直接播放。
+
+```bash
+# OBS：服务器 rtmp://<host>:1935/live，串流密钥 abc
+ffmpeg -re -i test.flv -c copy -f flv rtmp://<host>:1935/live/abc
+```
+
+像普通流一样拉：
+
+```
+https://<server-host>:4433/moq?app=live&stream=abc   # 浏览器 /moq-pull
+https://<server-host>:4433/live/abc.flv              # HTTP-FLV
+```
+
+RTMP server 同时是 egress：`MediaStreamManager` 里的任意流（不论来源）都能用
+RTMP 拉，并从缓存的 GOP 起步：
+
+```bash
+ffplay rtmp://<host>:1935/live/abc
+```
+
+RTMP → **moq-lite**（裸 QUIC，`moq-cli` / Android 客户端）支持 **H.264 + AAC**：
+服务端从 FLV 序列头合成 `catalog.json`。但 RTMP 的 **app 必须与 moq-lite
+入口路径一致**（缺省 `anon`），因为导出侧按 `<入口>/<broadcast>` 解析：
+
+```bash
+# app=anon 推流，然后用 moq-lite 拉
+ffmpeg -re -i test.flv -c copy -f flv rtmp://<host>:1935/anon/123456
+moq --connect "moql://<host>:4433/anon" --broadcast "123456" export flv | ffplay -
+```
+
+其它 codec 仍可走 HTTP-FLV / RTMP，但不会导出到 moq-lite。
+
 ## 线格式：我们的流与规范的对应关系
 
 我们跟随 **[draft-ietf-moq-transport](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/)
@@ -203,11 +241,17 @@ https://<server-host>:4433/moq?app=anon&stream=android.hang
 
 这是一个**早期公开版本**，不是完整的 IETF MoQ 实现。
 
-**已经可用**：MoQ 推流 / 拉流、WebTransport FLV 推流 / 拉流、HTTP-FLV 拉流，
-以及新订阅者的 GOP 追帧。
+**已经可用**：MoQ 推流 / 拉流、WebTransport FLV 推流 / 拉流、HTTP-FLV 拉流、
+新订阅者的 GOP 追帧，以及 **RTMP 推流 / 拉流**（OBS / ffmpeg，TCP 1935）。
+RTMP 推上来的 H.264 + AAC 流还会通过合成 catalog 导出到 **moq-lite**（裸 QUIC）；
+任意来源的流也能用 RTMP 拉。
 
-**尚未完成**：MoQ catalog / 控制平面的完整度（`GOAWAY` 等控制消息目前只解析、不处理），
-以及把仓库里已有的 RTMP 代码接入服务启动流程。
+**尚未完成**：MoQ catalog / 控制平面的完整度（`GOAWAY` 等控制消息目前只解析、不处理）；
+catalog 更新对已连接的 moq-lite 订阅方生效；RTMPS 与推流鉴权。
+
+RTMP 的发布端仲裁已与 moq-lite / MOQ 对齐：同一 `app/stream` 同时只有一个
+publisher，新连接顶替旧连接（带 10 秒内 3 次的防抖），旧会话停止写帧并被断开；
+关闭时只释放自己仍持有的 key。
 
 ## 路线图
 

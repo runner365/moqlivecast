@@ -263,6 +263,12 @@ std::string LHevcDecInfoDump(LHEVC_DEC_CONF_RECORD* hevc_dec_info);
 
 int ParseHevcSpsFinal(const uint8_t* nalu_data, int nalu_size, int* width, int* height, Logger* logger);
 
+/* H.264 SPS（含 1 字节 NAL header）→ 显示宽高。
+ * 已处理 emulation-prevention、high profile 的 scaling matrix、frame_cropping。
+ * 失败返回 <0，成功返回 0 并写出 width/height。 */
+int ParseH264SpsDimensions(const uint8_t* nalu_data, int nalu_size,
+                           int* width, int* height, Logger* logger);
+
 }
 #endif
 

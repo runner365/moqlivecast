@@ -27,6 +27,7 @@ namespace cpp_streamer
 
     std::unordered_map<std::string, MEDIA_STREAM_PTR> MediaStreamManager::media_streams_map_;
     std::vector<StreamManagerCallbackI*> MediaStreamManager::cb_vec_;
+    std::vector<MediaStreamManager::CatalogUpdatedFn> MediaStreamManager::catalog_updated_cbs_;
     AvWriterInterface* MediaStreamManager::hls_writer_ = nullptr;
     AvWriterInterface* MediaStreamManager::r2r_writer_ = nullptr;
 
@@ -138,6 +139,13 @@ namespace cpp_streamer
                      writerid.c_str(), key_str.c_str());
         }
         stream_ptr->writer_map_[writerid] = writer_p;
+
+        /* 没有 publisher 的 key 上来了播放器 = 本地缺流，可能是回源的机会。
+         * 触发点在**写入 writer_map_ 之后**：回调里启动的回源/推流不会丢。
+         * 新 key 的分支上面已经触发过一次，这里只覆盖「已有空壳」的情况。 */
+        if (!stream_ptr->publisher_exist_ && play_cb_) {
+            play_cb_(key_str);
+        }
 
         if (HasGopMedia(key_str) && !writer_p->IsInited()) {
             LogInfof(logger_, "add player replay gop key:%s hdr_v=%d hdr_a=%d pkts=%zu",
@@ -380,6 +388,18 @@ namespace cpp_streamer
         return !gop->Packets().empty();
     }
 
+    bool MediaStreamManager::HasPublisher(const std::string &stream_key) {
+        auto iter = media_streams_map_.find(stream_key);
+        return iter != media_streams_map_.end() && iter->second &&
+               iter->second->publisher_exist_;
+    }
+
+    size_t MediaStreamManager::PlayerCount(const std::string &stream_key) {
+        auto iter = media_streams_map_.find(stream_key);
+        if (iter == media_streams_map_.end() || !iter->second) return 0;
+        return iter->second->writer_map_.size();
+    }
+
     std::vector<std::string> MediaStreamManager::ListPublisherKeys() {
         std::vector<std::string> keys;
         /* 单线程假设：整个进程只有一个 uv loop（moq.cpp 的 uv_run），
@@ -418,16 +438,40 @@ namespace cpp_streamer
         LogInfof(logger_, "catalog stored key:%s bytes:%zu rev:%llu",
                  stream_key.c_str(), json.size(),
                  (unsigned long long)iter->second->catalog_rev_);
+
+        /* 通知订阅侧补发新的一组。回调可能写 QUIC（同一条 loop），所以放在
+         * 存储完成之后；回调用改回 SetCatalogJson 会导致递归，调用方自己保证。
+         * 用**拷贝**遍历：回调里注册/注销监听者（例如 cluster 收尾）不能让
+         * 这里拿着失效的迭代器。顺序 = 注册顺序（moq-lite 先于 cluster）。 */
+        const auto cbs = catalog_updated_cbs_;
+        const uint64_t rev = iter->second->catalog_rev_;
+        for (const auto &cb : cbs) {
+            if (cb) cb(stream_key, rev);
+        }
         return true;
     }
 
     bool MediaStreamManager::GetCatalogJson(const std::string &stream_key,
-                                            std::string &out) {
+                                            std::string &out, uint64_t *rev) {
         auto iter = media_streams_map_.find(stream_key);
         if (iter == media_streams_map_.end() || !iter->second) return false;
         if (iter->second->catalog_json_.empty()) return false;
         out = iter->second->catalog_json_;
+        if (rev) *rev = iter->second->catalog_rev_;
         return true;
+    }
+
+    void MediaStreamManager::SetCatalogUpdatedCallback(CatalogUpdatedFn fn) {
+        catalog_updated_cbs_.clear();
+        if (fn) catalog_updated_cbs_.push_back(std::move(fn));
+    }
+
+    void MediaStreamManager::AddCatalogUpdatedCallback(CatalogUpdatedFn fn) {
+        if (fn) catalog_updated_cbs_.push_back(std::move(fn));
+    }
+
+    void MediaStreamManager::ClearCatalogUpdatedCallbacks() {
+        catalog_updated_cbs_.clear();
     }
 
     int MediaStreamManager::WriterMediaPacket(Media_Packet_Ptr pkt_ptr) {

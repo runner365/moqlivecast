@@ -9,6 +9,8 @@ A live media stack built on a from-scratch C implementation of QUIC, HTTP/3, and
 - **MoQ Push / Pull** over WebTransport
 - **WebTransport FLV** Push / Pull
 - **HTTP-FLV Pull** on the same port as WebTransport (UDP + TCP)
+- **RTMP push / play** on TCP 1935 — OBS / ffmpeg can push, and any stream can
+  be pulled as RTMP
 - **Android push client** — Camera2 + mic → H.264/AAC → moq-lite over raw QUIC
   (see the [Android guide](tools/android/how_to_use_android_moqlit_push.md))
 - Shared `MediaStreamManager` with per-stream GOP cache, so a late subscriber can start from the last keyframe
@@ -131,6 +133,45 @@ https://<server-host>:4433/moq?app=anon&stream=android.hang
 Full build options, source map, invariants and troubleshooting:
 **[tools/android/how_to_use_android_moqlit_push.md](tools/android/how_to_use_android_moqlit_push.md)**.
 
+### RTMP push
+
+RTMP ingest listens on its own **TCP** port (`rtmp:` in
+[`moqlivecast/etc/config.yml`](moqlivecast/etc/config.yml), 1935 by default)
+and feeds the same `MediaStreamManager`, so every egress below can play it.
+
+```bash
+# OBS: Server = rtmp://<host>:1935/live, Stream Key = abc
+ffmpeg -re -i test.flv -c copy -f flv rtmp://<host>:1935/live/abc
+```
+
+Pull the result like any other stream:
+
+```
+https://<server-host>:4433/moq?app=live&stream=abc   # browser /moq-pull
+https://<server-host>:4433/live/abc.flv              # HTTP-FLV
+```
+
+The RTMP server is also an egress: any stream in `MediaStreamManager` (whatever
+its source) can be pulled as RTMP, and it starts from the cached GOP:
+
+```bash
+ffplay rtmp://<host>:1935/live/abc
+```
+
+RTMP → **moq-lite** (raw QUIC, `moq-cli` / the Android client) is supported for
+**H.264 + AAC**: the server synthesizes `catalog.json` from the FLV sequence
+headers. The RTMP **app must match the moq-lite entry path** (default `anon`),
+because the export resolves `<entry>/<broadcast>`:
+
+```bash
+# push with app=anon, then pull it as moq-lite
+ffmpeg -re -i test.flv -c copy -f flv rtmp://<host>:1935/anon/123456
+moq --connect "moql://<host>:4433/anon" --broadcast "123456" export flv | ffplay -
+```
+
+Other codecs are passed through to HTTP-FLV / RTMP but are not exported to
+moq-lite.
+
 ## Wire protocol: how our streams map to the spec
 
 We follow the stream taxonomy of **[draft-ietf-moq-transport](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/)
@@ -201,11 +242,14 @@ draft specifies and it will not interoperate.
 
 This is an early public snapshot, not a complete IETF MoQ implementation.
 
-Working today: publish and play over MoQ, WebTransport FLV, and HTTP-FLV, with GOP catch-up for new subscribers.
+Working today: publish and play over MoQ, WebTransport FLV, and HTTP-FLV, with
+GOP catch-up for new subscribers. **RTMP push / play** (OBS / ffmpeg) works on
+TCP 1935 in both directions, and H.264 + AAC RTMP streams are also exported to
+**moq-lite** (raw QUIC) via a synthesized catalog.
 
 Not finished: MoQ catalog / control-plane completeness (`GOAWAY` and other
-control messages are parsed but not acted on), and starting the existing RTMP
-code path from `moqlivecast`.
+control messages are parsed but not acted on); catalog updates for
+already-connected moq-lite subscribers; RTMPS and push authentication.
 
 ## Roadmap
 
