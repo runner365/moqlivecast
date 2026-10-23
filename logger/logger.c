@@ -37,7 +37,7 @@ static int             g_running = 0;   /* 0=未启动, 1=运行中, -1=退出�
  * 满了就丢**最旧**的：排障时真正要看的是最后那一段。 */
 #define LOG_QUEUE_MAX 20000
 static int             g_qlen    = 0;
-static uint64_t        g_dropped = 0;
+static int64_t        g_dropped = 0;
 
 /* 额外出口（见 logger.h）。**只设置一次**（启动前），日志线程只读。 */
 static log_sink_fn     g_sink      = NULL;
