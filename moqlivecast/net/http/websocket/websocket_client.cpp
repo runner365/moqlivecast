@@ -58,6 +58,13 @@ void WebSocketClient::AsyncConnect(const std::map<std::string, std::string>& inp
     client_ptr_->Get(subpath_, headers);
 }
 
+void WebSocketClient::Close() {
+    is_connected_ = false;
+    if (client_ptr_) {
+        client_ptr_->Close();
+    }
+}
+
 void WebSocketClient::SendWsFrame(const uint8_t* data, size_t len, uint8_t op_code) {
     WS_PACKET_HEADER* ws_header;
     uint8_t header_start[WS_MAX_HEADER_LEN];
@@ -214,6 +221,11 @@ void WebSocketClient::HandleHttpRespone(std::shared_ptr<HttpClientResponse> resp
         conn_cb_->OnConnection();
         http_ready_ = true;
         is_connected_ = true;
+        /* The 101 and the first WS frame can arrive in one TCP read.  Feed the
+         * leftover bytes to the frame parser before clearing the buffer. */
+        if (resp_ptr->data_.DataLen() > 0) {
+            HandleFrame(resp_ptr->data_);
+        }
         resp_ptr->data_.Reset();
     } catch(const std::exception& e) {
         std::stringstream excepion_ss;

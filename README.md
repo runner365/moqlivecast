@@ -82,11 +82,11 @@ The binary is `build/bin/moqlivecast`.
 ./build/bin/moqlivecast moqlivecast/etc/config.yml
 ```
 
-Leave `certfile` / `keyfile` empty in the YAML and export the PEM paths instead. If both YAML fields are empty, `moqlivecast` reads `SSL_CERT_FILE` and `SSL_KEY_FILE`. If they are still empty, it prints the reason and exits.
+Leave `certfile` / `keyfile` empty in the YAML and export the PEM paths instead. If both YAML fields are empty, `moqlivecast` reads `MOQ_SSL_CERT_FILE` and `MOQ_SSL_KEY_FILE`. If they are still empty, it prints the reason and exits. These names are deliberately `MOQ_`-prefixed so they do not collide with the standard `SSL_CERT_FILE` used by Python/OpenSSL clients. The legacy `SSL_CERT_FILE`/`SSL_KEY_FILE` variables are no longer read by `moqlivecast`.
 
 ```bash
-export SSL_CERT_FILE=/path/to/fullchain.pem
-export SSL_KEY_FILE=/path/to/privkey.pem
+export MOQ_SSL_CERT_FILE=/path/to/fullchain.pem
+export MOQ_SSL_KEY_FILE=/path/to/privkey.pem
 ./build/bin/moqlivecast moqlivecast/etc/config.yml
 ```
 
@@ -240,8 +240,8 @@ Run all three nodes on localhost with the shipped configs
 [`edge2.yml`](moqlivecast/etc/edge2.yml)):
 
 ```bash
-export SSL_CERT_FILE=/path/to/fullchain.pem
-export SSL_KEY_FILE=/path/to/privkey.pem
+export MOQ_SSL_CERT_FILE=/path/to/fullchain.pem
+export MOQ_SSL_KEY_FILE=/path/to/privkey.pem
 
 ./build/bin/moqlivecast moqlivecast/etc/config.yml  # center: UDP 4433, RTMP 1935, HTTP-FLV 4433
 ./build/bin/moqlivecast moqlivecast/etc/edge1.yml   # edge 1: UDP 4434, RTMP 1936, HTTP-FLV 8081
@@ -334,6 +334,8 @@ draft specifies and it will not interoperate.
 | `quic/` `http3/` | C protocol stack (QUIC, HTTP/3, WebTransport), built on libuv + OpenSSL |
 | `moqlivecast/` | C++ live server |
 | `moqlivecast/cluster/` | Edge-side cluster: discovery, upstream push, on-demand pull |
+| `wt2ws/` | WebTransport ↔ WebSocket relay for the last mile — **[guide](wt2ws/README.md)** (Vue test client + Python echo backend) |
+| `wt2ws/StreamVox/` | WebSocket voice agent (OpenAI Realtime-compatible) — **[guide](wt2ws/StreamVox/README.md)** |
 | `moqlite/` | moq-lite-06 C client library (bare QUIC) — **[guide: writing a push client](moqlite/how_to_use_moq_lite_c_api.md)** · [中文](moqlite/how_to_use_moq_lite_c_api_CN.md) |
 | `tools/moq_js_client/` | Browser publish / play demo |
 | `tools/android/` | Android push client (Camera2 + mic → moq-lite) — **[guide](tools/android/how_to_use_android_moqlit_push.md)** |

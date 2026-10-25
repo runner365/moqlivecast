@@ -510,3 +510,8 @@ add_subdirectory(tools/flv2moqlite_client)
 # Media over WebTransport（C++ 服务端）
 # ============================================
 add_subdirectory(moqlivecast)
+
+# ============================================
+# wt2ws_proxy（WebTransport <-> WebSocket relay）
+# ============================================
+add_subdirectory(wt2ws)

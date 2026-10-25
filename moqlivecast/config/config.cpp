@@ -310,12 +310,13 @@ bool Config::Load(const std::string &filename) {
         return false;
     }
     if (cert_file_.empty() && key_file_.empty()) {
-        cert_file_ = EnvOrEmpty("SSL_CERT_FILE");
-        key_file_ = EnvOrEmpty("SSL_KEY_FILE");
+        cert_file_ = EnvOrEmpty("MOQ_SSL_CERT_FILE");
+        key_file_ = EnvOrEmpty("MOQ_SSL_KEY_FILE");
     }
     if (cert_file_.empty() || key_file_.empty()) {
         ConfigFail("[config] certfile/keyfile are empty; set them in YAML "
-                   "or export SSL_CERT_FILE and SSL_KEY_FILE");
+                   "or export MOQ_SSL_CERT_FILE and MOQ_SSL_KEY_FILE "
+                   "(legacy SSL_CERT_FILE/SSL_KEY_FILE are no longer used)");
         return false;
     }
     if (httpflv_listen_ip_.empty() || httpflv_port_ <= 0 || httpflv_port_ > 65535) {

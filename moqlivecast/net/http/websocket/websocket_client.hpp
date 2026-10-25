@@ -20,6 +20,8 @@ public:
 
 public:
     void AsyncConnect(const std::map<std::string, std::string>& input_headers);
+    /* Close the underlying TCP connection; callbacks may fire afterwards. */
+    void Close();
 
 protected:
     virtual void OnHttpRead(int ret, std::shared_ptr<HttpClientResponse> resp_ptr) override;

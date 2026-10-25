@@ -85,17 +85,19 @@ int WebSocketSessionBase::HandleFrame(DataBuffer& data) {
                 break;
             }
             case WS_OP_CONTINUE_TYPE:
-            {
-                for (auto item : recv_buffer_vec_) {
-                    HandleWsData((uint8_t*)item->Data(), item->DataLen(), last_op_code_);
-                }
-                break;
-            }
             case WS_OP_TEXT_TYPE:
             case WS_OP_BIN_TYPE:
             {
-                for (auto item : recv_buffer_vec_) {
-                    HandleWsData((uint8_t*)item->Data(), item->DataLen(), frame_->GetOperCode());
+                /* A fragmented WebSocket message is several frames; dispatch it
+                 * once, reassembled, so the relay keeps the message boundary. */
+                const int op = frame_->GetOperCode() == WS_OP_CONTINUE_TYPE
+                                   ? last_op_code_ : frame_->GetOperCode();
+                std::string assembled;
+                for (auto &item : recv_buffer_vec_) {
+                    assembled.append(item->Data(), item->DataLen());
+                }
+                if (!assembled.empty()) {
+                    HandleWsData((uint8_t*)assembled.data(), assembled.size(), op);
                 }
                 break;
             }

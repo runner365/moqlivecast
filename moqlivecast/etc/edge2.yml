@@ -36,7 +36,7 @@ moq_server:
   moq_lite_subpath:
     - desc: moq-lite anonymous entry
       path: anon
-  # 留空 = 从环境变量 SSL_CERT_FILE / SSL_KEY_FILE 读取（与 Center 共用即可）。
+  # 留空 = 从环境变量 MOQ_SSL_CERT_FILE / MOQ_SSL_KEY_FILE 读取（与 Center 共用即可）。
   certfile: ""
   keyfile: ""
 

@@ -107,8 +107,8 @@ Source + prebuilt libs are only ~29 MB.
 
 ```bash
 cmake --build build --target moqlivecast
-export SSL_CERT_FILE=/path/to/fullchain.pem
-export SSL_KEY_FILE=/path/to/privkey.pem
+export MOQ_SSL_CERT_FILE=/path/to/fullchain.pem
+export MOQ_SSL_KEY_FILE=/path/to/privkey.pem
 ./build/bin/moqlivecast moqlivecast/etc/config.yml
 ```
 

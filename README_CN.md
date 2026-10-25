@@ -86,11 +86,11 @@ cmake --build build --target moqlivecast
 
 如果不方便把证书路径写进 YAML，可以把 `certfile` / `keyfile` 留空，
 改用环境变量传入。两个字段都为空时，`moqlivecast` 会读取
-`SSL_CERT_FILE` 和 `SSL_KEY_FILE`；如果仍然为空，会打印原因并退出。
+`MOQ_SSL_CERT_FILE` 和 `MOQ_SSL_KEY_FILE`；如果仍然为空，会打印原因并退出。这两个变量带 `MOQ_` 前缀，避免和 Python/OpenSSL 客户端使用的标准 `SSL_CERT_FILE` 冲突；旧的 `SSL_CERT_FILE`/`SSL_KEY_FILE` 不再读取。
 
 ```bash
-export SSL_CERT_FILE=/path/to/fullchain.pem
-export SSL_KEY_FILE=/path/to/privkey.pem
+export MOQ_SSL_CERT_FILE=/path/to/fullchain.pem
+export MOQ_SSL_KEY_FILE=/path/to/privkey.pem
 ./build/bin/moqlivecast moqlivecast/etc/config.yml
 ```
 
@@ -241,8 +241,8 @@ Edge 具体做四件事：
 [`edge2.yml`](moqlivecast/etc/edge2.yml)）：
 
 ```bash
-export SSL_CERT_FILE=/path/to/fullchain.pem
-export SSL_KEY_FILE=/path/to/privkey.pem
+export MOQ_SSL_CERT_FILE=/path/to/fullchain.pem
+export MOQ_SSL_KEY_FILE=/path/to/privkey.pem
 
 ./build/bin/moqlivecast moqlivecast/etc/config.yml  # Center：UDP 4433、RTMP 1935、HTTP-FLV 4433
 ./build/bin/moqlivecast moqlivecast/etc/edge1.yml   # Edge 1：UDP 4434、RTMP 1936、HTTP-FLV 8081
@@ -323,6 +323,8 @@ Center 不需要任何集群配置：它只是一台恰好会收到 Edge 连接�
 | `quic/` `http3/` | C 协议栈（QUIC、HTTP/3、WebTransport），直接构建在 libuv + OpenSSL 之上 |
 | `moqlivecast/` | C++ 直播服务端 |
 | `moqlivecast/cluster/` | Edge 侧集群：发现、上推、按需回源 |
+| `wt2ws/` | WebTransport ↔ WebSocket 中继（最后一公里）—— **[说明](wt2ws/README.md)**（Vue 测试客户端 + Python echo 后端） |
+| `wt2ws/StreamVox/` | WebSocket 语音 Agent（兼容 OpenAI Realtime 事件）—— **[说明](wt2ws/StreamVox/README.md)** |
 | `moqlite/` | moq-lite-06 客户端 C 库（裸 QUIC）—— **[推流客户端开发指南](moqlite/how_to_use_moq_lite_c_api_CN.md)** · [English](moqlite/how_to_use_moq_lite_c_api.md) |
 | `tools/moq_js_client/` | 浏览器推流 / 拉流 Demo |
 | `tools/android/` | Android 推流客户端（Camera2 + 麦克风 → moq-lite）—— **[使用指南](tools/android/how_to_use_android_moqlit_push.md)** |
