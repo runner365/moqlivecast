@@ -33,40 +33,38 @@ mock 模式下：
 
 ## Web 客户端：WebSocket / WebTransport
 
-页面顶部可以二选一：
+页面顶部二选一：
 
 | 方式 | 地址 | 说明 |
 |---|---|---|
 | WebSocket 直连 | `ws://127.0.0.1:8000/ws` | 默认，浏览器直接连 StreamVox |
 | WebTransport（经 proxy） | `https://127.0.0.1:5433/wt2ws` | 浏览器 → wt2ws_proxy → StreamVox |
 
-WT 模式要先启动代理：
+WT 模式先启动 `wt2ws_proxy`（独立 C++ 代理，StreamVox 协议不用改）：
 
 ```bash
 cd /Users/wei.shi/Documents/code/cc_code/moq
 ./build/wt2ws/wt2ws_proxy \
     --listen 0.0.0.0:5433 \
     --path /wt2ws \
-    --backend ws://127.0.0.1:8000/ws \
-    --cert cert/server_cert.pem --key cert/server_key.pem \
-    --console
+    --backend ws://127.0.0.1:8000/ws
 ```
 
-上面的命令显式用 `cert/server_cert.pem`（mkcert，SAN `localhost` / `127.0.0.1`）。如果
-`.zshrc` 里为 moqlivecast 设了 `MOQ_SSL_CERT_FILE`（通常是域名证书），proxy 默认会优先用
-它；本地 `https://127.0.0.1:5433` 会证书不匹配，所以这里用 `--cert/--key` 强制 mkcert。
-浏览器不信任 mkcert CA 时先执行 `mkcert -install`，或换成已信任的证书。
+配置要点：
 
-WT 客户端每 15 秒发 `{"type":"ping"}`，服务端回 `{"type":"pong"}`，用来重置
-`wt2ws_proxy` 的应用层 idle（默认 5 分钟）；QUIC 层本身还有约 10 秒的 PING 保活。
+- `--backend` 指向 StreamVox 的 `/ws`；
+- 证书默认读 `MOQ_SSL_CERT_FILE` / `MOQ_SSL_KEY_FILE`，未设置则用仓库自带 mkcert；
+- 如果环境里配的是域名证书，本地 `https://127.0.0.1:5433` 会不匹配：临时加
+  `--cert cert/server_cert.pem --key cert/server_key.pem`，或 unset 这两个变量；
+- 浏览器不信任 mkcert CA 时执行 `mkcert -install`；
+- 5433 与 moqlivecast 的 4433 分开，可同时运行。
 
-注意：
+WT 客户端自带 15 秒 ping 保活，不需要额外配置。更多代理参数见
+[wt2ws README](../README.md)。本机回环测不出弱网收益，要测弱网把 proxy 放到远端，
+或在浏览器到 proxy 之间加 NLC。
 
-- 5433 是 wt2ws 专用端口，和 moqlivecast 的 4433 分开，可以同时跑；
-- 本机浏览器 + 本机 proxy + 本机 StreamVox 都是回环，WT 不会比 WS 快；要测弱网收益，
-  需要把 proxy 放到远端，或在浏览器到 proxy 之间加 NLC / `udp_jitter_proxy`；
-- 调试时可以直接打开：
-  `http://127.0.0.1:5173/?transport=wt&endpoint=https://127.0.0.1:5433/wt2ws`。
+调试深链：
+`http://127.0.0.1:5173/?transport=wt&endpoint=https://127.0.0.1:5433/wt2ws`
 
 ## 接入真实服务
 
