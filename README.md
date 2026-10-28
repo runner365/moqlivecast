@@ -6,12 +6,12 @@ A live media stack built on a from-scratch C implementation of QUIC, HTTP/3, and
 
 ## Features
 
-- **MoQ Push / Pull** over WebTransport
+- **MoQ Transport (draft-ietf-moq-transport-22) Push / Pull** over WebTransport
 - **WebTransport FLV** Push / Pull
 - **HTTP-FLV Pull** on the same port as WebTransport (UDP + TCP)
 - **RTMP push / play** on TCP 1935 — OBS / ffmpeg can push, and any stream can
   be pulled as RTMP
-- **Android push client** — Camera2 + mic → H.264/AAC → moq-lite over raw QUIC
+- **Android push client** — Camera2 + mic → H.264/AAC → moq-lite-06 over raw QUIC
   (see the [Android guide](tools/android/how_to_use_android_moqlit_push.md))
 - **Cluster (edge / origin)** — an edge pushes its local streams to a plain
   center node and pulls missing streams back on demand; every playback protocol
@@ -24,17 +24,29 @@ A live media stack built on a from-scratch C implementation of QUIC, HTTP/3, and
    Ingest                                        Server                     Playback
 
    Browser                          ┌──────────────────────┐      Browser
-   WebTransport / HTTPS ───────────>│     moqlivecast      │─────> WebTransport / HTTPS
+   moq-transport ──────────────────>│     moqlivecast      │─────> moq-transport
                                     │          │           │
    ffmpeg ──FLV──> moq ────────────>│          v           │─────> moq ──> ffmpeg
-   (libmoq, moq-lite-06)            │ MediaStreamManager   │      (libmoq, moq-lite-06)
+   (moq-transport)                  │ MediaStreamManager   │      (moq-transport)
                                     │      + GOP cache     │
                                     └──────────────────────┘─────> HTTP-FLV pull
 ```
 
-The browser path and the `ffmpeg + moq` path **share one UDP port**: the server
-splits them by handshake ALPN (`h3` → WebTransport, `moq-lite-06` → raw QUIC).
-Both carry push and pull.
+The browser path uses **h3 / WebTransport carrying moq-transport**; the
+`ffmpeg + moq` path shares the same UDP port. That port also accepts raw QUIC
+with ALPN `moq-lite-06` for Android, the cluster link, and `flv2moqlite_client`.
+Both transports carry push and pull.
+
+This repo speaks **two different MoQ dialects**. They share `MediaStreamManager`
+and the GOP cache, but not the wire format:
+
+- **moq-transport** — `draft-ietf-moq-transport-22`, over WebTransport/HTTP3
+  (`h3` ALPN): browser `/moq` and `/moq-pull`, and `flv2moq_client`.
+- **moq-lite-06** — over raw QUIC (`moq-lite-06` ALPN): Android, the
+  edge↔center cluster link, `flv2moqlite_client`, and the `moqlite/` C API.
+
+When this README says **MoQ push / pull** without qualification, it means
+**moq-transport draft-22**. Anything `moq-lite-06` is marked explicitly.
 
 The protocol stack (QUIC, HTTP/3, WebTransport) lives under `quic/` and `http3/`, built directly on libuv and OpenSSL — no third-party QUIC library is used. Live ingest, GOP cache, and per-protocol writers live under `moqlivecast/`.
 
@@ -47,12 +59,12 @@ its own players asks for it:
 
 ```text
    Edge 1                                      Center
-   ┌──────────────────┐   push (moq-lite)    ┌──────────────────────┐
+   ┌──────────────────┐   push (moq-lite-06)    ┌──────────────────────┐
    │ local ingest     │ ───────────────────> │  MediaStreamManager  │
    │ + local players  │ <─────────────────── │  (plain server)      │
    └──────────────────┘   pull (on demand)   └──────────────────────┘
                                                         ^
-                                               push / pull (moq-lite)
+                                               push / pull (moq-lite-06)
                                                         │
    Edge 2 ──────────────────────────────────────────────┘
 ```
@@ -128,8 +140,8 @@ Vite listens on `http://127.0.0.1:5174`.
 
 | Path | Role |
 |---|---|
-| `/moq` | MoQ Push |
-| `/moq-pull` | MoQ Pull |
+| `/moq` | MoQ Transport (draft-22) Push |
+| `/moq-pull` | MoQ Transport (draft-22) Pull |
 | `/flv` | WebTransport FLV Push |
 | `/pull` | WebTransport FLV Pull |
 | `/http-flv` | HTTP-FLV Pull |
@@ -184,19 +196,19 @@ its source) can be pulled as RTMP, and it starts from the cached GOP:
 ffplay rtmp://<host>:1935/live/abc
 ```
 
-RTMP → **moq-lite** (raw QUIC, `moq-cli` / the Android client) is supported for
+RTMP → **moq-lite-06** (raw QUIC, `moq-cli` / the Android client) is supported for
 **H.264 + AAC**: the server synthesizes `catalog.json` from the FLV sequence
-headers. The RTMP **app must match the moq-lite entry path** (default `anon`),
+headers. The RTMP **app must match the moq-lite-06 entry path** (default `anon`),
 because the export resolves `<entry>/<broadcast>`:
 
 ```bash
-# push with app=anon, then pull it as moq-lite
+# push with app=anon, then pull it as moq-lite-06 (not moq-transport)
 ffmpeg -re -i test.flv -c copy -f flv rtmp://<host>:1935/anon/123456
 moq --connect "moql://<host>:4433/anon" --broadcast "123456" export flv | ffplay -
 ```
 
 Other codecs are passed through to HTTP-FLV / RTMP but are not exported to
-moq-lite.
+moq-lite-06.
 
 ### Cluster (edge / origin)
 
@@ -211,7 +223,7 @@ Two roles, one binary:
 cluster:
   mode: edge                     # off (default) = standalone; the center stays off
   protocol: moq                  # phase 1: moq-lite-06 over raw QUIC only
-  center_address: 10.0.0.1:4433  # center's moq-lite UDP port, not RTMP/HTTP-FLV
+  center_address: 10.0.0.1:4433  # center's moq-lite-06 UDP port, not RTMP/HTTP-FLV
   center_path: anon              # center's moq_lite_subpath entry
 ```
 
@@ -224,7 +236,7 @@ What an edge does:
 - **Pull** — when a local player asks for a stream the edge does not have, the
   edge opens one `moq-lite-06` connection, subscribes to the catalog and tracks,
   and writes the frames into its own `MediaStreamManager`. Playback then takes
-  the normal local path, so **any** egress on the edge works: moq-lite,
+  the normal local path, so **any** egress on the edge works: moq-lite-06,
   WebTransport, HTTP-FLV, RTMP.
 - **Discovery** — a read-only connection subscribes to the center's announce
   stream, so local clients can see remote broadcasts. Without it they would never
@@ -232,8 +244,8 @@ What an edge does:
 - **Loop prevention** — a pulled stream is never pushed back upstream, and a
   local publisher always wins over a pull (the pull is abandoned).
 
-Only streams with a moq-lite catalog travel over the link — today that means
-H.264 + AAC, the same rule as the RTMP → moq-lite export.
+Only streams with a moq-lite-06 catalog travel over the link — today that means
+H.264 + AAC, the same rule as the RTMP → moq-lite-06 export.
 
 Run all three nodes on localhost with the shipped configs
 ([`config.yml`](moqlivecast/etc/config.yml), [`edge1.yml`](moqlivecast/etc/edge1.yml),
@@ -254,10 +266,10 @@ Push into edge 1, play from edge 2 (which pulls the stream from the center):
 ffmpeg -re -i test.flv -c copy -f flv rtmp://127.0.0.1:1936/anon/123456
 ffplay rtmp://127.0.0.1:1937/anon/123456               # edge 2 pulls on demand
 ffplay https://127.0.0.1:8082/anon/123456.flv          # same stream, HTTP-FLV
-moq --connect "moql://127.0.0.1:4435/anon" --broadcast 123456 export flv | ffplay -
+moq --connect "moql://127.0.0.1:4435/anon" --broadcast 123456 export flv | ffplay -  # moq-lite-06 pull
 ```
 
-The RTMP `app` must match the moq-lite entry path (`anon`), as in the RTMP
+The RTMP `app` must match the moq-lite-06 entry path (`anon`), as in the RTMP
 section above: the key on the wire is `<app>/<stream>`.
 
 Knobs, all under `cluster:` in
@@ -266,7 +278,7 @@ Knobs, all under `cluster:` in
 | Key | Default | Meaning |
 |---|---|---|
 | `reconnect_min_ms` / `reconnect_max_ms` | 500 / 10000 | Outbound reconnect backoff range (exponential, ±20 % jitter) |
-| `subscribe_timeout_ms` | 3000 | How long a local moq-lite SUBSCRIBE waits for a pull to produce a catalog |
+| `subscribe_timeout_ms` | 3000 | How long a local moq-lite-06 SUBSCRIBE waits for a pull to produce a catalog |
 | `pull_acquire_timeout_ms` | 5000 | Give up a pull if no catalog arrives within this budget (across reconnects) |
 | `pull_idle_timeout_ms` | 30000 | Close a pull if no media frame arrives for this long |
 | `max_pull_connections` | 128 | Concurrent pulls per edge |
@@ -275,7 +287,10 @@ Knobs, all under `cluster:` in
 The center needs no cluster config at all; it is a plain server that happens to
 receive edge connections.
 
-## Wire protocol: how our streams map to the spec
+## Wire protocol: moq-transport (draft-ietf-moq-transport-22)
+
+This section is about **moq-transport**, not `moqlite/`. `moqlite/` implements
+the separate moq-lite-06 wire format over raw QUIC.
 
 We follow the stream taxonomy of **[draft-ietf-moq-transport](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/)
 §3.3** (the numbering below is from the draft currently tracked here —
@@ -336,10 +351,11 @@ draft specifies and it will not interoperate.
 | `moqlivecast/cluster/` | Edge-side cluster: discovery, upstream push, on-demand pull |
 | `wt2ws/` | WebTransport ↔ WebSocket relay for the last mile — **[guide](wt2ws/README.md)** (Vue test client + Python echo backend) |
 | `wt2ws/StreamVox/` | WebSocket voice agent (OpenAI Realtime-compatible) — **[guide](wt2ws/StreamVox/README.md)** |
-| `moqlite/` | moq-lite-06 C client library (bare QUIC) — **[guide: writing a push client](moqlite/how_to_use_moq_lite_c_api.md)** · [中文](moqlite/how_to_use_moq_lite_c_api_CN.md) |
-| `tools/moq_js_client/` | Browser publish / play demo |
-| `tools/android/` | Android push client (Camera2 + mic → moq-lite) — **[guide](tools/android/how_to_use_android_moqlit_push.md)** |
-| `tools/flv2moqlite_client/` | FLV file → moq-lite push (C++, uses the `moqlite/` C API) |
+| `moqlite/` | **separate** moq-lite-06 C client library (bare QUIC, not moq-transport) — **[guide: writing a push client](moqlite/how_to_use_moq_lite_c_api.md)** · [中文](moqlite/how_to_use_moq_lite_c_api_CN.md) |
+| `tools/moq_js_client/` | Browser publish / play demo (moq-transport over WebTransport) |
+| `tools/android/` | Android push client (Camera2 + mic → moq-lite-06) — **[guide](tools/android/how_to_use_android_moqlit_push.md)** |
+| `tools/flv2moq_client/` | FLV file → **moq-transport (draft-22) over WebTransport** push (C++) |
+| `tools/flv2moqlite_client/` | FLV file → **moq-lite-06** push (C++, uses the `moqlite/` C API) |
 | `http3/wt_chat_js_client/` | WebTransport signaling demo (with `wt_chat_server`) |
 | `udp/` `tls/` | Standalone UDP / TLS echo samples (not on the server's main path) |
 | `3rdparty/` | libuv, OpenSSL, yaml-cpp |
@@ -348,19 +364,19 @@ draft specifies and it will not interoperate.
 
 This is an early public snapshot, not a complete IETF MoQ implementation.
 
-Working today: publish and play over MoQ, WebTransport FLV, and HTTP-FLV, with
-GOP catch-up for new subscribers. **RTMP push / play** (OBS / ffmpeg) works on
+Working today: publish and play over **moq-transport (draft-22)**, WebTransport
+FLV, and HTTP-FLV, with GOP catch-up for new subscribers. **RTMP push / play** (OBS / ffmpeg) works on
 TCP 1935 in both directions, and H.264 + AAC RTMP streams are also exported to
-**moq-lite** (raw QUIC) via a synthesized catalog.
+**moq-lite-06** (raw QUIC) via a synthesized catalog.
 
 **Cluster** (two-tier edge / origin) works: an edge pushes its local streams to a
 plain center, announces the center's broadcasts to its local clients, and pulls a
-missing stream on demand — playback on the edge works over moq-lite, WebTransport,
-HTTP-FLV and RTMP. See [Cluster (edge / origin)](#cluster-edge--origin).
+missing stream on demand — playback on the edge works over moq-lite-06,
+moq-transport over WebTransport, HTTP-FLV and RTMP. See [Cluster (edge / origin)](#cluster-edge--origin).
 
 Not finished: MoQ catalog / control-plane completeness (`GOAWAY` and other
 control messages are parsed but not acted on); catalog updates for
-already-connected moq-lite subscribers; RTMPS and push authentication.
+already-connected moq-lite-06 subscribers; RTMPS and push authentication.
 
 ## Roadmap
 
@@ -372,11 +388,11 @@ has room to grow:
   network yet.
 - One QUIC connection per stream per direction. Multiplexing many streams onto
   one connection would cut handshake and NAT-state overhead on large edges.
-- Only the moq-lite link protocol is implemented (`cluster.protocol: rtmp` is
+- Only the moq-lite-06 link protocol is implemented (`cluster.protocol: rtmp` is
   rejected), and there is no multi-level or mesh topology yet.
 
 After that: catalog and control-plane completeness, live catalog updates for
-connected moq-lite subscribers, RTMPS and push authentication.
+connected moq-lite-06 subscribers, RTMPS and push authentication.
 
 ## License
 

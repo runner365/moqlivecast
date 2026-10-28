@@ -9,11 +9,11 @@
 
 ## 功能
 
-- **MoQ 推流 / 拉流**（基于 WebTransport）
+- **MoQ Transport（draft-ietf-moq-transport-22）推流 / 拉流**（基于 WebTransport）
 - **WebTransport FLV** 推流 / 拉流
 - **HTTP-FLV 拉流**，与 WebTransport 共用同一端口（UDP + TCP）
 - **RTMP 推流 / 拉流**（TCP 1935）—— OBS / ffmpeg 推流，任意来源的流也能用 RTMP 拉
-- **Android 推流客户端** —— Camera2 + 麦克风 → H.264/AAC → moq-lite（裸 QUIC）
+- **Android 推流客户端** —— Camera2 + 麦克风 → H.264/AAC → moq-lite-06（裸 QUIC）
   （见 [Android 使用指南](tools/android/how_to_use_android_moqlit_push.md)）
 - **集群（Edge / Center）** —— Edge 把本地流上推到普通 Center 节点，
   本地缺流时按需回源；Edge 上任意播放协议都能播放回源来的流
@@ -26,16 +26,28 @@
    推流端                                    服务端                       拉流端
 
    浏览器                          ┌──────────────────────┐      浏览器
-   WebTransport / HTTPS ──────────>│      moqlivecast     │─────> WebTransport / HTTPS
+   moq-transport ─────────────────>│      moqlivecast     │─────> moq-transport
                                    │          │           │
    ffmpeg ──FLV──> moq ───────────>│          v           │─────> moq ──> ffmpeg
-   (libmoq, moq-lite-06)           │ MediaStreamManager   │      (libmoq, moq-lite-06)
+   (moq-transport)                 │ MediaStreamManager   │      (moq-transport)
                                    │      + GOP 缓存      │
                                    └──────────────────────┘─────> HTTP-FLV 拉流
 ```
 
-浏览器那条路与 `ffmpeg + moq` 那条路**共用同一个 UDP 端口**：服务端在握手时按
-ALPN 分流（`h3` → WebTransport，`moq-lite-06` → 裸 QUIC）。两条路都既能推流也能拉流。
+浏览器这条路走 **h3 / WebTransport，承载 moq-transport**；`ffmpeg + moq`
+那条路共用同一个 UDP 端口。该端口也接受裸 QUIC（ALPN `moq-lite-06`），供
+Android、集群链路和 `flv2moqlite_client` 使用。两种传输都既能推流也能拉流。
+
+本仓库同时实现**两套不同的 MoQ 线协议**，它们共用 `MediaStreamManager` 和
+GOP 缓存，但线格式不同：
+
+- **moq-transport** —— `draft-ietf-moq-transport-22`，跑在 WebTransport/HTTP3
+  （`h3` ALPN）：浏览器 `/moq`、`/moq-pull`，以及 `flv2moq_client`。
+- **moq-lite-06** —— 裸 QUIC（`moq-lite-06` ALPN）：Android、Edge↔Center
+  集群链路、`flv2moqlite_client`、`moqlite/` C API。
+
+本文没有特别说明的 **MoQ 推流 / 拉流**都指 **moq-transport draft-22**；
+凡是 `moq-lite-06` 都会明确标出，避免和 `moqlite/` 混淆。
 
 协议栈（QUIC / HTTP/3 / WebTransport）位于 `quic/` 和 `http3/`，
 **直接构建在 libuv 与 OpenSSL 之上**——没有依赖任何现成的 QUIC 库。
@@ -49,12 +61,12 @@ Edge 把每路本地流上推到 Center（其他 Edge 才能发现它），只�
 
 ```text
    Edge 1                                      Center
-   ┌──────────────────┐  上推（moq-lite）    ┌──────────────────────┐
+   ┌──────────────────┐  上推（moq-lite-06）    ┌──────────────────────┐
    │ 本地推流         │ ───────────────────> │  MediaStreamManager  │
    │ + 本地播放器     │ <─────────────────── │  （普通服务端）      │
    └──────────────────┘  按需回源            └──────────────────────┘
                                                         ^
-                                               上推 / 回源（moq-lite）
+                                               上推 / 回源（moq-lite-06）
                                                         │
    Edge 2 ──────────────────────────────────────────────┘
 ```
@@ -134,8 +146,8 @@ Vite 默认监听 `http://127.0.0.1:5174`。
 
 | 路径 | 用途 |
 |---|---|
-| `/moq` | MoQ 推流 |
-| `/moq-pull` | MoQ 拉流 |
+| `/moq` | MoQ Transport（draft-22）推流 |
+| `/moq-pull` | MoQ Transport（draft-22）拉流 |
 | `/flv` | WebTransport FLV 推流 |
 | `/pull` | WebTransport FLV 拉流 |
 | `/http-flv` | HTTP-FLV 拉流 |
@@ -191,17 +203,17 @@ RTMP 拉，并从缓存的 GOP 起步：
 ffplay rtmp://<host>:1935/live/abc
 ```
 
-RTMP → **moq-lite**（裸 QUIC，`moq-cli` / Android 客户端）支持 **H.264 + AAC**：
-服务端从 FLV 序列头合成 `catalog.json`。但 RTMP 的 **app 必须与 moq-lite
+RTMP → **moq-lite-06**（裸 QUIC，`moq-cli` / Android 客户端）支持 **H.264 + AAC**：
+服务端从 FLV 序列头合成 `catalog.json`。但 RTMP 的 **app 必须与 moq-lite-06
 入口路径一致**（缺省 `anon`），因为导出侧按 `<入口>/<broadcast>` 解析：
 
 ```bash
-# app=anon 推流，然后用 moq-lite 拉
+# app=anon 推流，然后用 moq-lite-06 拉（不是 moq-transport）
 ffmpeg -re -i test.flv -c copy -f flv rtmp://<host>:1935/anon/123456
 moq --connect "moql://<host>:4433/anon" --broadcast "123456" export flv | ffplay -
 ```
 
-其它 codec 仍可走 HTTP-FLV / RTMP，但不会导出到 moq-lite。
+其它 codec 仍可走 HTTP-FLV / RTMP，但不会导出到 moq-lite-06。
 
 ### 集群（Edge / Center）
 
@@ -216,7 +228,7 @@ moq --connect "moql://<host>:4433/anon" --broadcast "123456" export flv | ffplay
 cluster:
   mode: edge                     # off（缺省）= 单机；Center 保持 off
   protocol: moq                  # 第一期只支持 moq-lite-06（裸 QUIC）
-  center_address: 10.0.0.1:4433  # Center 的 moq-lite UDP 端口，不是 RTMP/HTTP-FLV
+  center_address: 10.0.0.1:4433  # Center 的 moq-lite-06 UDP 端口，不是 RTMP/HTTP-FLV
   center_path: anon              # Center 的 moq_lite_subpath 入口
 ```
 
@@ -227,14 +239,14 @@ Edge 具体做四件事：
   宽限期结束才关闭。
 - **回源** —— 本地播放器请求一条本地没有的流时，Edge 建一条 `moq-lite-06` 连接，
   订阅 catalog 与各轨，把帧写回本机的 `MediaStreamManager`。之后播放走正常本地路径，
-  因此 Edge 上**任意**出口都能用：moq-lite、WebTransport、HTTP-FLV、RTMP。
+  因此 Edge 上**任意**出口都能用：moq-lite-06、WebTransport、HTTP-FLV、RTMP。
 - **发现** —— 一条只读连接订阅 Center 的 announce 流，让本地客户端看得见远端广播。
   没有它，客户端不会发 SUBSCRIBE，也就永远没有回源的触发点。
 - **防环** —— 回源来的流不会反向再上推；本地推流优先，一旦本地出现同 key 的
   publisher，回源直接放弃。
 
-只有带 moq-lite catalog 的流才会走这条链路 —— 目前就是 H.264 + AAC，
-与 RTMP → moq-lite 导出的规则相同。
+只有带 moq-lite-06 catalog 的流才会走这条链路 —— 目前就是 H.264 + AAC，
+与 RTMP → moq-lite-06 导出的规则相同。
 
 用仓库里现成的配置在本机起三个进程
 （[`config.yml`](moqlivecast/etc/config.yml)、[`edge1.yml`](moqlivecast/etc/edge1.yml)、
@@ -255,10 +267,10 @@ export MOQ_SSL_KEY_FILE=/path/to/privkey.pem
 ffmpeg -re -i test.flv -c copy -f flv rtmp://127.0.0.1:1936/anon/123456
 ffplay rtmp://127.0.0.1:1937/anon/123456               # Edge 2 按需回源
 ffplay https://127.0.0.1:8082/anon/123456.flv          # 同一路流，HTTP-FLV
-moq --connect "moql://127.0.0.1:4435/anon" --broadcast 123456 export flv | ffplay -
+moq --connect "moql://127.0.0.1:4435/anon" --broadcast 123456 export flv | ffplay -  # moq-lite-06 pull
 ```
 
-和上面的 RTMP 一节一样，RTMP 的 `app` 必须等于 moq-lite 入口路径（`anon`）：
+和上面的 RTMP 一节一样，RTMP 的 `app` 必须等于 moq-lite-06 入口路径（`anon`）：
 线上 key 是 `<app>/<stream>`。
 
 所有旋钮都在 [`config.yml`](moqlivecast/etc/config.yml) 的 `cluster:` 节下：
@@ -266,7 +278,7 @@ moq --connect "moql://127.0.0.1:4435/anon" --broadcast 123456 export flv | ffpla
 | 配置项 | 缺省 | 含义 |
 |---|---|---|
 | `reconnect_min_ms` / `reconnect_max_ms` | 500 / 10000 | 出站连接重连退避区间（指数增长，±20% 抖动） |
-| `subscribe_timeout_ms` | 3000 | 本地 moq-lite SUBSCRIBE 等待回源出 catalog 的最长时间 |
+| `subscribe_timeout_ms` | 3000 | 本地 moq-lite-06 SUBSCRIBE 等待回源出 catalog 的最长时间 |
 | `pull_acquire_timeout_ms` | 5000 | 回源拿不到 catalog 的总预算（跨重连不重置） |
 | `pull_idle_timeout_ms` | 30000 | 回源多久没有媒体帧就关闭 |
 | `max_pull_connections` | 128 | 单 Edge 并发回源上限 |
@@ -274,7 +286,10 @@ moq --connect "moql://127.0.0.1:4435/anon" --broadcast 123456 export flv | ffpla
 
 Center 不需要任何集群配置：它只是一台恰好会收到 Edge 连接的普通服务端。
 
-## 线格式：我们的流与规范的对应关系
+## 线格式：moq-transport（draft-ietf-moq-transport-22）
+
+这一节讲的是 **moq-transport**，不是 `moqlite/`。`moqlite/` 实现的是另一套
+moq-lite-06 裸 QUIC 线格式。
 
 我们跟随 **[draft-ietf-moq-transport](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/)
 §3.3** 的流分类（下面引用的编号来自本仓库当前跟踪的草案版本，控制流的拆分就建立在该版本描述的布局之上）。
@@ -325,10 +340,11 @@ Center 不需要任何集群配置：它只是一台恰好会收到 Edge 连接�
 | `moqlivecast/cluster/` | Edge 侧集群：发现、上推、按需回源 |
 | `wt2ws/` | WebTransport ↔ WebSocket 中继（最后一公里）—— **[说明](wt2ws/README.md)**（Vue 测试客户端 + Python echo 后端） |
 | `wt2ws/StreamVox/` | WebSocket 语音 Agent（兼容 OpenAI Realtime 事件）—— **[说明](wt2ws/StreamVox/README.md)** |
-| `moqlite/` | moq-lite-06 客户端 C 库（裸 QUIC）—— **[推流客户端开发指南](moqlite/how_to_use_moq_lite_c_api_CN.md)** · [English](moqlite/how_to_use_moq_lite_c_api.md) |
-| `tools/moq_js_client/` | 浏览器推流 / 拉流 Demo |
-| `tools/android/` | Android 推流客户端（Camera2 + 麦克风 → moq-lite）—— **[使用指南](tools/android/how_to_use_android_moqlit_push.md)** |
-| `tools/flv2moqlite_client/` | FLV 文件 → moq-lite 推流（C++，用的就是 `moqlite/` 的 C API）|
+| `moqlite/` | **独立的** moq-lite-06 客户端 C 库（裸 QUIC，不是 moq-transport）—— **[推流客户端开发指南](moqlite/how_to_use_moq_lite_c_api_CN.md)** · [English](moqlite/how_to_use_moq_lite_c_api.md) |
+| `tools/moq_js_client/` | 浏览器推流 / 拉流 Demo（moq-transport over WebTransport） |
+| `tools/android/` | Android 推流客户端（Camera2 + 麦克风 → moq-lite-06）—— **[使用指南](tools/android/how_to_use_android_moqlit_push.md)** |
+| `tools/flv2moq_client/` | FLV 文件 → **moq-transport（draft-22）over WebTransport** 推流（C++） |
+| `tools/flv2moqlite_client/` | FLV 文件 → **moq-lite-06** 推流（C++，用的就是 `moqlite/` 的 C API）|
 | `http3/wt_chat_js_client/` | WebTransport 信令 Demo（配套 `wt_chat_server`） |
 | `udp/` `tls/` | 独立的 UDP / TLS echo 示例（不在服务端主路径上） |
 | `3rdparty/` | libuv、OpenSSL、yaml-cpp |
@@ -337,20 +353,21 @@ Center 不需要任何集群配置：它只是一台恰好会收到 Edge 连接�
 
 这是一个**早期公开版本**，不是完整的 IETF MoQ 实现。
 
-**已经可用**：MoQ 推流 / 拉流、WebTransport FLV 推流 / 拉流、HTTP-FLV 拉流、
-新订阅者的 GOP 追帧，以及 **RTMP 推流 / 拉流**（OBS / ffmpeg，TCP 1935）。
-RTMP 推上来的 H.264 + AAC 流还会通过合成 catalog 导出到 **moq-lite**（裸 QUIC）；
+**已经可用**：**moq-transport（draft-22）** 推流 / 拉流、WebTransport FLV
+推流 / 拉流、HTTP-FLV 拉流、新订阅者的 GOP 追帧，以及 **RTMP 推流 / 拉流**
+（OBS / ffmpeg，TCP 1935）。
+RTMP 推上来的 H.264 + AAC 流还会通过合成 catalog 导出到 **moq-lite-06**（裸 QUIC）；
 任意来源的流也能用 RTMP 拉。
 
 **集群**（两级 Edge / Center）已可用：Edge 把本地流上推到普通 Center，
-把 Center 的广播公告给本地客户端，并在缺流时按需回源 —— Edge 上的 moq-lite、
-WebTransport、HTTP-FLV、RTMP 都能播放回源来的流。见
+把 Center 的广播公告给本地客户端，并在缺流时按需回源 —— Edge 上的 moq-lite-06、
+moq-transport over WebTransport、HTTP-FLV、RTMP 都能播放回源来的流。见
 [集群（Edge / Center）](#集群edge--center)。
 
 **尚未完成**：MoQ catalog / 控制平面的完整度（`GOAWAY` 等控制消息目前只解析、不处理）；
-catalog 更新对已连接的 moq-lite 订阅方生效；RTMPS 与推流鉴权。
+catalog 更新对已连接的 moq-lite-06 订阅方生效；RTMPS 与推流鉴权。
 
-RTMP 的发布端仲裁已与 moq-lite / MOQ 对齐：同一 `app/stream` 同时只有一个
+RTMP 的发布端仲裁已与 moq-lite-06 / MOQ 对齐：同一 `app/stream` 同时只有一个
 publisher，新连接顶替旧连接（带 10 秒内 3 次的防抖），旧会话停止写帧并被断开；
 关闭时只释放自己仍持有的 key。
 
@@ -362,10 +379,10 @@ publisher，新连接顶替旧连接（带 10 秒内 3 次的防抖），旧会�
   链路上也没有鉴权；暂时不要把回源端口暴露到不可信网络。
 - 每路流、每个方向一条 QUIC 连接。把多路流复用到一个连接上，可以省掉大量
   握手与 NAT 状态开销，适合大规模 Edge。
-- 链路协议只实现了 moq-lite（`cluster.protocol: rtmp` 会被拒绝），
+- 链路协议只实现了 moq-lite-06（`cluster.protocol: rtmp` 会被拒绝），
   也还没有多级 / mesh 拓扑。
 
-之后是：catalog 与控制平面的完整度、对已连接 moq-lite 订阅方的 catalog 实时更新、
+之后是：catalog 与控制平面的完整度、对已连接 moq-lite-06 订阅方的 catalog 实时更新、
 RTMPS 与推流鉴权。
 
 ## License
