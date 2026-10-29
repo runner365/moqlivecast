@@ -62,6 +62,15 @@ void wt_client_connect(wt_client_t *cli, const char *host, int port);
 void wt_client_connect_path(wt_client_t *cli, const char *host, int port,
                             const char *path);
 
+/* 同上，但把「CONNECT :authority 用的名字」和「实际建 QUIC 的 IPv4」分开。
+ * authority_host 可以是域名（用于 :authority / 后续 TLS server name），
+ * connect_ip 必须是 IPv4 字面量，通常由 uv_getaddrinfo(AF_INET) 得到。
+ * wt_client_connect_path(cli,h,p,path) == _ex(cli,h,h,p,path)。 */
+void wt_client_connect_path_ex(wt_client_t *cli,
+                               const char *authority_host,
+                               const char *connect_ip,
+                               int port, const char *path);
+
 /* 关闭客户端 */
 void wt_client_close(wt_client_t *cli);
 

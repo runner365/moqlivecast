@@ -7,6 +7,8 @@ A live media stack built on a from-scratch C implementation of QUIC, HTTP/3, and
 ## Features
 
 - **MoQ Transport (draft-ietf-moq-transport-22) Push / Pull** over WebTransport
+- **C SDK** — H.264 + AAC publish/subscribe with app/stream names, codec config,
+  and per-object DTS/PTS
 - **WebTransport FLV** Push / Pull
 - **HTTP-FLV Pull** on the same port as WebTransport (UDP + TCP)
 - **RTMP push / play** on TCP 1935 — OBS / ffmpeg can push, and any stream can
@@ -351,9 +353,12 @@ draft specifies and it will not interoperate.
 | `moqlivecast/cluster/` | Edge-side cluster: discovery, upstream push, on-demand pull |
 | `wt2ws/` | WebTransport ↔ WebSocket relay for the last mile — **[guide](wt2ws/README.md)** (Vue test client + Python echo backend) |
 | `wt2ws/StreamVox/` | WebSocket voice agent (OpenAI Realtime-compatible) — **[guide](wt2ws/StreamVox/README.md)** |
+| `moq_transport_client/` | C SDK for **moq-transport draft-22** (H.264 + AAC publish/subscribe over WebTransport) — **[guide](moq_transport_client/README.md)** |
 | `moqlite/` | **separate** moq-lite-06 C client library (bare QUIC, not moq-transport) — **[guide: writing a push client](moqlite/how_to_use_moq_lite_c_api.md)** · [中文](moqlite/how_to_use_moq_lite_c_api_CN.md) |
 | `tools/moq_js_client/` | Browser publish / play demo (moq-transport over WebTransport) |
 | `tools/android/` | Android push client (Camera2 + mic → moq-lite-06) — **[guide](tools/android/how_to_use_android_moqlit_push.md)** |
+| `tools/moqtransport2flv_client/` | **moq-transport draft-22** pull → H.264/AAC FLV file, using the C SDK |
+| `tools/flv2moqtransport_client/` | FLV file → **moq-transport draft-22** publish using the C SDK |
 | `tools/flv2moq_client/` | FLV file → **moq-transport (draft-22) over WebTransport** push (C++) |
 | `tools/flv2moqlite_client/` | FLV file → **moq-lite-06** push (C++, uses the `moqlite/` C API) |
 | `http3/wt_chat_js_client/` | WebTransport signaling demo (with `wt_chat_server`) |

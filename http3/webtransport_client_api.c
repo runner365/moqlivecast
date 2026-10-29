@@ -51,7 +51,8 @@ typedef struct wt_task {
     struct wt_task *next;
     int             type;
     /* CONNECT */
-    char   *host;
+    char   *host;        /* :authority / server name */
+    char   *connect_ip;  /* actual IPv4 for QUIC */
     int     port;
     char   *path;
     /* STREAM_WRITE / STREAM_CLOSE */
@@ -176,16 +177,24 @@ wt_client_t *wt_client_new(uv_loop_t *loop, wt_callbacks_t *cb) {
     return cli;
 }
 
-void wt_client_connect_path(wt_client_t *cli, const char *host, int port,
-                            const char *path) {
-    if (!cli || !host) return;
+void wt_client_connect_path_ex(wt_client_t *cli,
+                               const char *authority_host,
+                               const char *connect_ip,
+                               int port, const char *path) {
+    if (!cli || !authority_host || !connect_ip) return;
     wt_task_t *t = (wt_task_t*)calloc(1, sizeof(*t));
     t->type = WT_TASK_CONNECT;
-    t->host = strdup(host);
+    t->host = strdup(authority_host);
+    t->connect_ip = strdup(connect_ip);
     t->port = port;
     t->path = strdup(path && path[0] ? path : "/");
     task_push(cli, t);
     uv_async_send(&cli->async);
+}
+
+void wt_client_connect_path(wt_client_t *cli, const char *host, int port,
+                            const char *path) {
+    wt_client_connect_path_ex(cli, host, host, port, path);
 }
 
 void wt_client_connect(wt_client_t *cli, const char *host, int port) {
@@ -278,8 +287,11 @@ static void async_cb(uv_async_t *h) {
                 QuicConnectionSetOnConnected(cli->qc, on_quic_connected);
                 QuicConnectionSetOnStreamData(cli->qc, on_quic_stream);
                 QuicConnectionSetOnClose(cli->qc, on_quic_close);
-                QuicConnectionConnect(cli->qc, t->host, t->port);
-                LOG_DEBUG("[wt-api] connecting to %s:%d", t->host, t->port);
+                const char *connect_ip = t->connect_ip ? t->connect_ip
+                                                       : t->host;
+                QuicConnectionConnect(cli->qc, connect_ip, t->port);
+                LOG_DEBUG("[wt-api] connecting to %s:%d (authority=%s)",
+                          connect_ip, t->port, t->host);
             }
             break;
         case WT_TASK_OPEN_STREAM:
@@ -313,6 +325,7 @@ static void async_cb(uv_async_t *h) {
 static void free_task(wt_task_t *t) {
     if (!t) return;
     free(t->host);
+    free(t->connect_ip);
     free(t->path);
     free(t->data);
     free(t);
@@ -471,7 +484,10 @@ static void on_quic_stream(QuicConnection *qc, uint64_t sid,
      *
      * 正确做法：只截 server uni，且仅当首字节是 H3 控制流类型时才
      * 按 SETTINGS 解析；其余 server uni 流继续走下面的 WT 数据路径。 */
-    if ((sid & 0x3) == 0x3) {
+    /* Only classify a server-initiated uni stream on its FIRST chunk.  Once
+     * the WT data header has been stripped, later chunks start with arbitrary
+     * object bytes (often 0x00) and must not be mistaken for H3 CONTROL. */
+    if ((sid & 0x3) == 0x3 && !find_stream(cli, sid)) {
         /* 先按 H3 流类型分流。四种内建类型都必须拦下，只放行 0x54：
          *   0x00 control / 0x01 push / 0x02 QPACK enc / 0x03 QPACK dec
          * 遗漏任何一个都会把 H3 内部字节泄露给应用层 —— 例如服务端开

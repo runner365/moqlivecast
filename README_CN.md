@@ -10,6 +10,7 @@
 ## 功能
 
 - **MoQ Transport（draft-ietf-moq-transport-22）推流 / 拉流**（基于 WebTransport）
+- **C SDK** —— H.264 + AAC 推流/拉流，带 app/stream、codec 配置和每帧 DTS/PTS
 - **WebTransport FLV** 推流 / 拉流
 - **HTTP-FLV 拉流**，与 WebTransport 共用同一端口（UDP + TCP）
 - **RTMP 推流 / 拉流**（TCP 1935）—— OBS / ffmpeg 推流，任意来源的流也能用 RTMP 拉
@@ -340,9 +341,12 @@ moq-lite-06 裸 QUIC 线格式。
 | `moqlivecast/cluster/` | Edge 侧集群：发现、上推、按需回源 |
 | `wt2ws/` | WebTransport ↔ WebSocket 中继（最后一公里）—— **[说明](wt2ws/README.md)**（Vue 测试客户端 + Python echo 后端） |
 | `wt2ws/StreamVox/` | WebSocket 语音 Agent（兼容 OpenAI Realtime 事件）—— **[说明](wt2ws/StreamVox/README.md)** |
+| `moq_transport_client/` | C SDK：**moq-transport draft-22**，H.264 + AAC 推流/拉流（WebTransport）—— **[说明](moq_transport_client/README.md)** |
 | `moqlite/` | **独立的** moq-lite-06 客户端 C 库（裸 QUIC，不是 moq-transport）—— **[推流客户端开发指南](moqlite/how_to_use_moq_lite_c_api_CN.md)** · [English](moqlite/how_to_use_moq_lite_c_api.md) |
 | `tools/moq_js_client/` | 浏览器推流 / 拉流 Demo（moq-transport over WebTransport） |
 | `tools/android/` | Android 推流客户端（Camera2 + 麦克风 → moq-lite-06）—— **[使用指南](tools/android/how_to_use_android_moqlit_push.md)** |
+| `tools/moqtransport2flv_client/` | **moq-transport draft-22** 拉流 → H.264/AAC FLV 文件（使用 C SDK） |
+| `tools/flv2moqtransport_client/` | FLV 文件 → **moq-transport draft-22** 推流（使用 C SDK） |
 | `tools/flv2moq_client/` | FLV 文件 → **moq-transport（draft-22）over WebTransport** 推流（C++） |
 | `tools/flv2moqlite_client/` | FLV 文件 → **moq-lite-06** 推流（C++，用的就是 `moqlite/` 的 C API）|
 | `http3/wt_chat_js_client/` | WebTransport 信令 Demo（配套 `wt_chat_server`） |

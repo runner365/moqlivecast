@@ -495,10 +495,25 @@ target_include_directories(udp_jitter_proxy PRIVATE
 )
 
 # ============================================
+# moq_transport_client（C SDK：H.264 + AAC 推流/拉流）
+# ============================================
+add_subdirectory(moq_transport_client)
+
+# ============================================
 # flv2moq_client（FLV 文件 → MOQT 推流工具）
 # 依赖上面的 webtransport_client 静态库
 # ============================================
 add_subdirectory(tools/flv2moq_client)
+
+# ============================================
+# flv2moqtransport_client（FLV 文件 → moq-transport 推流，使用 C SDK）
+# ============================================
+add_subdirectory(tools/flv2moqtransport_client)
+
+# ============================================
+# moqtransport2flv_client（moq-transport 拉流 → FLV 文件）
+# ============================================
+add_subdirectory(tools/moqtransport2flv_client)
 
 # ============================================
 # flv2moqlite_client（FLV 文件 → moq-lite-06 推流）
