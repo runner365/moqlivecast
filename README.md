@@ -11,6 +11,8 @@ A live media stack built on a from-scratch C implementation of QUIC, HTTP/3, and
   and per-object DTS/PTS
 - **WebTransport FLV** Push / Pull
 - **HTTP-FLV Pull** on the same port as WebTransport (UDP + TCP)
+- **WebSocket-FLV Pull** — WS/WSS binary FLV tags on a dedicated TCP port
+  (`/wsflv?app=...&stream=...`), integrated with `MediaStreamManager`
 - **RTMP push / play** on TCP 1935 — OBS / ffmpeg can push, and any stream can
   be pulled as RTMP
 - **Android push client** — Camera2 + mic → H.264/AAC → moq-lite-06 over raw QUIC
@@ -124,6 +126,11 @@ httpflv:
   listenip: 0.0.0.0
   port: 4433
 
+websocket_flv:
+  enable: true
+  listenip: 0.0.0.0
+  port: 4434
+
 log:
   level: info
   filename: /tmp/moqlivecast.log
@@ -147,6 +154,7 @@ Vite listens on `http://127.0.0.1:5174`.
 | `/flv` | WebTransport FLV Push |
 | `/pull` | WebTransport FLV Pull |
 | `/http-flv` | HTTP-FLV Pull |
+| `/ws-flv` | WebSocket-FLV Pull |
 
 After changing C++ code, rebuild and restart `moqlivecast`. The browser demo does not pick up a new server by itself.
 
@@ -189,6 +197,9 @@ Pull the result like any other stream:
 ```
 https://<server-host>:4433/moq?app=live&stream=abc   # browser /moq-pull
 https://<server-host>:4433/live/abc.flv              # HTTP-FLV
+wss://<server-host>:4434/wsflv?app=live&stream=abc   # WebSocket-FLV (center)
+wss://<server-host>:8084/wsflv?app=anon&stream=abc   # WebSocket-FLV (edge1)
+wss://<server-host>:8085/wsflv?app=anon&stream=abc   # WebSocket-FLV (edge2)
 ```
 
 The RTMP server is also an egress: any stream in `MediaStreamManager` (whatever
@@ -257,9 +268,9 @@ Run all three nodes on localhost with the shipped configs
 export MOQ_SSL_CERT_FILE=/path/to/fullchain.pem
 export MOQ_SSL_KEY_FILE=/path/to/privkey.pem
 
-./build/bin/moqlivecast moqlivecast/etc/config.yml  # center: UDP 4433, RTMP 1935, HTTP-FLV 4433
-./build/bin/moqlivecast moqlivecast/etc/edge1.yml   # edge 1: UDP 4434, RTMP 1936, HTTP-FLV 8081
-./build/bin/moqlivecast moqlivecast/etc/edge2.yml   # edge 2: UDP 4435, RTMP 1937, HTTP-FLV 8082
+./build/bin/moqlivecast moqlivecast/etc/config.yml  # center: UDP 4433, RTMP 1935, HTTP-FLV 4433, WS-FLV 4434
+./build/bin/moqlivecast moqlivecast/etc/edge1.yml   # edge 1: UDP 4434, RTMP 1936, HTTP-FLV 8081, WS-FLV 8084
+./build/bin/moqlivecast moqlivecast/etc/edge2.yml   # edge 2: UDP 4435, RTMP 1937, HTTP-FLV 8082, WS-FLV 8085
 ```
 
 Push into edge 1, play from edge 2 (which pulls the stream from the center):

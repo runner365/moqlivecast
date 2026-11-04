@@ -52,6 +52,16 @@ public:
     const std::string &HttpFlvListenIp() const { return httpflv_listen_ip_; }
     int HttpFlvPort() const { return httpflv_port_; }
 
+    /* ── WebSocket-FLV downlink ──
+     * 独立 TCP listener（默认关闭），WSS endpoint:
+     *   /wsflv?app=live&stream=NAME
+     * 每个 FLV tag 作为一个 WebSocket binary message 下发。 */
+    bool WebSocketFlvEnabled() const { return websocket_flv_enabled_; }
+    const std::string &WebSocketFlvListenIp() const {
+        return websocket_flv_listen_ip_;
+    }
+    int WebSocketFlvPort() const { return websocket_flv_port_; }
+
     /* ── RTMP server ──
      * 与 QUIC/HTTP-FLV 分开的 TCP 端口（惯例 1935）。缺省**关闭**：不写
      * `rtmp` 这一节、或写了但不给 `enable: true`，都不会监听 —— 新增端口
@@ -105,6 +115,10 @@ private:
 
     std::string httpflv_listen_ip_ = "0.0.0.0";
     int httpflv_port_ = 4433;
+
+    bool websocket_flv_enabled_ = false;
+    std::string websocket_flv_listen_ip_ = "0.0.0.0";
+    int websocket_flv_port_ = 4434;
 
     /* RTMP：TCP，独立端口。缺省关闭（见 RtmpEnabled 的说明）。 */
     bool rtmp_enabled_ = false;

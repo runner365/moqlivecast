@@ -188,6 +188,19 @@ bool Config::Load(const std::string &filename) {
             }
         }
 
+        YAML::Node wsflv = root["websocket_flv"];
+        if (wsflv && wsflv.IsMap()) {
+            if (wsflv["enable"]) {
+                websocket_flv_enabled_ = wsflv["enable"].as<bool>();
+            }
+            if (wsflv["listenip"]) {
+                websocket_flv_listen_ip_ = wsflv["listenip"].as<std::string>();
+            }
+            if (wsflv["port"]) {
+                websocket_flv_port_ = wsflv["port"].as<int>();
+            }
+        }
+
         /* ── RTMP ──
          * 缺省关闭：不写这一节、或写了但不给 `enable: true`，都不监听。
          * 字段即使关闭也会被解析 —— 这样可以先提交配置，等 listener 接入
@@ -323,6 +336,33 @@ bool Config::Load(const std::string &filename) {
         LOG_ERROR("[config] invalid httpflv listen %s:%d",
                   httpflv_listen_ip_.c_str(), httpflv_port_);
         return false;
+    }
+
+    if (websocket_flv_enabled_) {
+        if (websocket_flv_listen_ip_.empty() ||
+            websocket_flv_port_ <= 0 || websocket_flv_port_ > 65535) {
+            LOG_ERROR("[config] invalid websocket_flv listen %s:%d",
+                      websocket_flv_listen_ip_.c_str(), websocket_flv_port_);
+            return false;
+        }
+        const bool same_ip = (websocket_flv_listen_ip_ == httpflv_listen_ip_);
+        const bool wildcard = (websocket_flv_listen_ip_ == "0.0.0.0") ||
+                              (httpflv_listen_ip_ == "0.0.0.0");
+        if (websocket_flv_port_ == httpflv_port_ && (same_ip || wildcard)) {
+            LOG_ERROR("[config] websocket_flv and httpflv both listen on tcp port %d",
+                      websocket_flv_port_);
+            return false;
+        }
+        if (rtmp_enabled_ && websocket_flv_port_ == rtmp_port_) {
+            const bool rtmp_same = (websocket_flv_listen_ip_ == rtmp_listen_ip_);
+            const bool rtmp_wild = (websocket_flv_listen_ip_ == "0.0.0.0") ||
+                                   (rtmp_listen_ip_ == "0.0.0.0");
+            if (rtmp_same || rtmp_wild) {
+                LOG_ERROR("[config] websocket_flv and rtmp both listen on tcp port %d",
+                          websocket_flv_port_);
+                return false;
+            }
+        }
     }
 
     /* ── RTMP ──

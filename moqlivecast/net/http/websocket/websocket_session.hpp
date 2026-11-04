@@ -18,7 +18,10 @@
 namespace cpp_streamer
 {
 class WebSocketServer;
-class WebSocketSession : public TcpSessionCallbackI, public WebSocketSessionBase, public TimerInterface
+class WebSocketSession : public TcpSessionCallbackI,
+                         public WebSocketSessionBase,
+                         public TimerInterface,
+                         public std::enable_shared_from_this<WebSocketSession>
 {
 public:
     WebSocketSession(bool is_client, uv_loop_t* loop, uv_stream_t* handle, WebSocketServer* server, Logger* logger);

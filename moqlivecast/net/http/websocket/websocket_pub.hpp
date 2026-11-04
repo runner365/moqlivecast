@@ -1,6 +1,7 @@
 #ifndef WEBSOCKET_PUB_HPP
 #define WEBSOCKET_PUB_HPP
 #include <stdint.h>
+#include <functional>
 #include <string>
 
 namespace cpp_streamer
@@ -45,7 +46,8 @@ public:
 };
 
 class WebSocketSession;
-using HandleWebSocketPtr = void(*)(const std::string& uri, WebSocketSession* session);
+using HandleWebSocketPtr =
+    std::function<void(const std::string& uri, WebSocketSession* session)>;
 
 }
 

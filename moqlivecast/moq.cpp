@@ -3,6 +3,7 @@
 #include "moq/moq_lite_server.hpp"
 #include "moq_handler.hpp"
 #include "httpflv_server.hpp"
+#include "websocket_flv_server.hpp"
 #include "net/rtmp/rtmp_server.hpp"
 #include "cluster/cluster_manager.hpp"
 #include "media_stream_manager.hpp"
@@ -22,6 +23,7 @@ std::unique_ptr<cpp_streamer::WTServer> g_srv;
 std::unique_ptr<cpp_streamer::MoqLiteServer> g_moq_lite;
 std::unique_ptr<cpp_streamer::Logger> g_cxx_log;
 std::unique_ptr<cpp_streamer::HttpFlvServer> g_httpflv;
+std::unique_ptr<cpp_streamer::WebSocketFlvServer> g_wsflv;
 std::unique_ptr<cpp_streamer::RtmpServer> g_rtmp;
 std::unique_ptr<cpp_streamer::ClusterManager> g_cluster;
 uv_signal_t g_sig;
@@ -38,6 +40,7 @@ void OnSignal(uv_signal_t *sig, int signum) {
     g_srv.reset();
     g_moq_lite.reset();
     g_rtmp.reset();
+    g_wsflv.reset();
     g_httpflv.reset();
     cpp_streamer::MetaLog::Instance().Shutdown();
     uv_stop(sig->loop);
@@ -85,6 +88,15 @@ int main(int argc, char *argv[]) {
         cfg.KeyFile(), cfg.CertFile(), g_cxx_log.get());
     LOG_INFO("[moq] http-flv https://%s:%d/{app}/{stream}.flv",
              cfg.HttpFlvListenIp().c_str(), cfg.HttpFlvPort());
+
+    if (cfg.WebSocketFlvEnabled()) {
+        g_wsflv = std::make_unique<cpp_streamer::WebSocketFlvServer>(
+            loop, cfg.WebSocketFlvListenIp(),
+            static_cast<uint16_t>(cfg.WebSocketFlvPort()),
+            cfg.KeyFile(), cfg.CertFile(), g_cxx_log.get());
+        LOG_INFO("[moq] websocket-flv wss://%s:%d/wsflv?app={app}&stream={stream}",
+                 cfg.WebSocketFlvListenIp().c_str(), cfg.WebSocketFlvPort());
+    }
 
     /* ── RTMP server（TCP，独立端口）──
      * 可选组件：只有 rtmp.enable: true 才创建。必须放在
@@ -268,6 +280,7 @@ int main(int argc, char *argv[]) {
     g_srv.reset();
     g_moq_lite.reset();
     g_rtmp.reset();
+    g_wsflv.reset();
     g_httpflv.reset();
     cpp_streamer::MetaLog::Instance().Shutdown();
     g_cxx_log.reset();

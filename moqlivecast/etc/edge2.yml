@@ -16,6 +16,7 @@
 # 从本 Edge 拉流（RTMP / HTTP-FLV）：
 #   ffplay rtmp://127.0.0.1:1937/anon/123456
 #   ffplay https://127.0.0.1:8082/anon/123456.flv
+#   wss://127.0.0.1:8085/wsflv?app=anon&stream=123456
 
 moq_server:
   listenip: 0.0.0.0
@@ -44,6 +45,13 @@ httpflv:
   listenip: 0.0.0.0
   # 与 Center、Edge1 的 HTTP-FLV 端口区分开。
   port: 8082
+
+websocket_flv:
+  # 下行 WebSocket-FLV（WSS），与 HTTP-FLV 分开的 TCP 端口。
+  enable: true
+  listenip: 0.0.0.0
+  # 与 Center（4434）、Edge1（8084）区分开。
+  port: 8085
 
 rtmp:
   enable: true

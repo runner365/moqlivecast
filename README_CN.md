@@ -13,6 +13,8 @@
 - **C SDK** —— H.264 + AAC 推流/拉流，带 app/stream、codec 配置和每帧 DTS/PTS
 - **WebTransport FLV** 推流 / 拉流
 - **HTTP-FLV 拉流**，与 WebTransport 共用同一端口（UDP + TCP）
+- **WebSocket-FLV 拉流** —— 独立 TCP 端口上的 WS/WSS 二进制 FLV tag，
+  endpoint `/wsflv?app=...&stream=...`，接入 `MediaStreamManager`
 - **RTMP 推流 / 拉流**（TCP 1935）—— OBS / ffmpeg 推流，任意来源的流也能用 RTMP 拉
 - **Android 推流客户端** —— Camera2 + 麦克风 → H.264/AAC → moq-lite-06（裸 QUIC）
   （见 [Android 使用指南](tools/android/how_to_use_android_moqlit_push.md)）
@@ -129,6 +131,11 @@ httpflv:
   listenip: 0.0.0.0
   port: 4433
 
+websocket_flv:
+  enable: true
+  listenip: 0.0.0.0
+  port: 4434
+
 log:
   level: info
   filename: /tmp/moqlivecast.log
@@ -152,6 +159,7 @@ Vite 默认监听 `http://127.0.0.1:5174`。
 | `/flv` | WebTransport FLV 推流 |
 | `/pull` | WebTransport FLV 拉流 |
 | `/http-flv` | HTTP-FLV 拉流 |
+| `/ws-flv` | WebSocket-FLV 拉流 |
 
 > 修改 C++ 代码后需要重新编译并重启 `moqlivecast`；
 > 浏览器 Demo 不会自动连接新启动的服务端。
@@ -195,6 +203,9 @@ ffmpeg -re -i test.flv -c copy -f flv rtmp://<host>:1935/live/abc
 ```
 https://<server-host>:4433/moq?app=live&stream=abc   # 浏览器 /moq-pull
 https://<server-host>:4433/live/abc.flv              # HTTP-FLV
+wss://<server-host>:4434/wsflv?app=live&stream=abc   # WebSocket-FLV（Center）
+wss://<server-host>:8084/wsflv?app=anon&stream=abc   # WebSocket-FLV（Edge1）
+wss://<server-host>:8085/wsflv?app=anon&stream=abc   # WebSocket-FLV（Edge2）
 ```
 
 RTMP server 同时是 egress：`MediaStreamManager` 里的任意流（不论来源）都能用
@@ -257,9 +268,9 @@ Edge 具体做四件事：
 export MOQ_SSL_CERT_FILE=/path/to/fullchain.pem
 export MOQ_SSL_KEY_FILE=/path/to/privkey.pem
 
-./build/bin/moqlivecast moqlivecast/etc/config.yml  # Center：UDP 4433、RTMP 1935、HTTP-FLV 4433
-./build/bin/moqlivecast moqlivecast/etc/edge1.yml   # Edge 1：UDP 4434、RTMP 1936、HTTP-FLV 8081
-./build/bin/moqlivecast moqlivecast/etc/edge2.yml   # Edge 2：UDP 4435、RTMP 1937、HTTP-FLV 8082
+./build/bin/moqlivecast moqlivecast/etc/config.yml  # Center：UDP 4433、RTMP 1935、HTTP-FLV 4433、WS-FLV 4434
+./build/bin/moqlivecast moqlivecast/etc/edge1.yml   # Edge 1：UDP 4434、RTMP 1936、HTTP-FLV 8081、WS-FLV 8084
+./build/bin/moqlivecast moqlivecast/etc/edge2.yml   # Edge 2：UDP 4435、RTMP 1937、HTTP-FLV 8082、WS-FLV 8085
 ```
 
 往 Edge 1 推流，从 Edge 2 播放（Edge 2 会从 Center 回源）：

@@ -87,6 +87,16 @@ export function defaultHttpFlvPullUrl(): string {
   return `${DEFAULT_ORIGIN}/live/${sessionStream()}.flv`
 }
 
+export function defaultWsFlvPullUrl(): string {
+  /* 与 HTTP-FLV 分开的 WSS 端口；endpoint 见 moqlivecast websocket_flv 配置。 */
+  const u = new URL(DEFAULT_ORIGIN)
+  u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:'
+  u.port = '4434'
+  u.pathname = '/wsflv'
+  u.search = `?app=live&stream=${sessionStream()}`
+  return u.toString()
+}
+
 export function pathFromUrl(url: string): string {
   try {
     return new URL(url).pathname.replace(/^\/+/, '') || defaultMediaPath()

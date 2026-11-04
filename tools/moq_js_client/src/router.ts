@@ -4,6 +4,7 @@ import PullView from './views/PullView.vue'
 import MoqPushView from './views/MoqPushView.vue'
 import MoqPullView from './views/MoqPullView.vue'
 import HttpFlvPullView from './views/HttpFlvPullView.vue'
+import WsFlvPullView from './views/WsFlvPullView.vue'
 
 export const router = createRouter({
   history: createWebHistory(),
@@ -14,5 +15,6 @@ export const router = createRouter({
     { path: '/flv', component: PushView },
     { path: '/pull', component: PullView },
     { path: '/http-flv', component: HttpFlvPullView },
+    { path: '/ws-flv', component: WsFlvPullView },
   ],
 })

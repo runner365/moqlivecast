@@ -28,6 +28,7 @@
             <RouterLink to="/moq-pull" class="proto">MoQ</RouterLink>
             <RouterLink to="/pull" class="proto">WT FLV</RouterLink>
             <RouterLink to="/http-flv" class="proto">HTTP-FLV</RouterLink>
+            <RouterLink to="/ws-flv" class="proto">WS-FLV</RouterLink>
           </template>
         </div>
       </div>
@@ -56,6 +57,7 @@ const pullHome = computed(() => {
   if (route.path === '/flv') return '/pull'
   if (route.path === '/moq') return '/moq-pull'
   if (route.path === '/http-flv') return '/http-flv'
+  if (route.path === '/ws-flv') return '/ws-flv'
   return route.path === '/pull' ? '/pull' : '/moq-pull'
 })
 </script>
