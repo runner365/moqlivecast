@@ -19,6 +19,7 @@
  * IN THE SOFTWARE.
  */
 
+#include "uv.h"
 #include "internal.h"
 #include <sys/ioctl.h>
 #include <net/if.h>
@@ -30,6 +31,7 @@
 #include <sys/msg.h>
 #include <sys/resource.h>
 #include "zos-base.h"
+#include "zos-sys-info.h"
 #if defined(__clang__)
 #include "csrsic.h"
 #else
@@ -65,9 +67,6 @@
 
 /* Total number of frames currently on all available frame queues. */
 #define RCEAFC_OFFSET     0x088
-
-/* CPC model length from the CSRSI Service. */
-#define CPCMODEL_LENGTH   16
 
 /* Pointer to the home (current) ASCB. */
 #define PSAAOLD           0x224
@@ -258,9 +257,12 @@ int uv_cpu_info(uv_cpu_info_t** cpu_infos, int* count) {
   idx = 0;
   while (idx < *count) {
     cpu_info->speed = *(int*)(info.siv1v2si22v1.si22v1cpucapability);
-    cpu_info->model = uv__malloc(CPCMODEL_LENGTH + 1);
-    memset(cpu_info->model, '\0', CPCMODEL_LENGTH + 1);
-    memcpy(cpu_info->model, info.siv1v2si11v1.si11v1cpcmodel, CPCMODEL_LENGTH);
+    cpu_info->model = uv__malloc(ZOSCPU_MODEL_LENGTH + 1);
+    if (cpu_info->model == NULL) {
+      uv_free_cpu_info(*cpu_infos, idx);
+      return UV_ENOMEM; 
+    }
+    __get_cpu_model(cpu_info->model, ZOSCPU_MODEL_LENGTH + 1);
     cpu_info->cpu_times.user = cpu_usage_avg;
     /* TODO: implement the following */
     cpu_info->cpu_times.sys = 0;
@@ -815,7 +817,7 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
   uv__os390_epoll* ep;
   int have_signals;
   int real_timeout;
-  QUEUE* q;
+  struct uv__queue* q;
   uv__io_t* w;
   uint64_t base;
   int count;
@@ -827,19 +829,19 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
   int reset_timeout;
 
   if (loop->nfds == 0) {
-    assert(QUEUE_EMPTY(&loop->watcher_queue));
+    assert(uv__queue_empty(&loop->watcher_queue));
     return;
   }
 
   lfields = uv__get_internal_fields(loop);
 
-  while (!QUEUE_EMPTY(&loop->watcher_queue)) {
+  while (!uv__queue_empty(&loop->watcher_queue)) {
     uv_stream_t* stream;
 
-    q = QUEUE_HEAD(&loop->watcher_queue);
-    QUEUE_REMOVE(q);
-    QUEUE_INIT(q);
-    w = QUEUE_DATA(q, uv__io_t, watcher_queue);
+    q = uv__queue_head(&loop->watcher_queue);
+    uv__queue_remove(q);
+    uv__queue_init(q);
+    w = uv__queue_data(q, uv__io_t, watcher_queue);
 
     assert(w->pevents != 0);
     assert(w->fd >= 0);

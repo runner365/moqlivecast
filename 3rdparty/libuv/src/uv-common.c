@@ -514,6 +514,25 @@ int uv_udp_try_send(uv_udp_t* handle,
 }
 
 
+int uv_udp_try_send2(uv_udp_t* handle,
+                     unsigned int count,
+                     uv_buf_t* bufs[/*count*/],
+                     unsigned int nbufs[/*count*/],
+                     struct sockaddr* addrs[/*count*/],
+                     unsigned int flags) {
+  if (count < 1)
+    return UV_EINVAL;
+
+  if (flags != 0)
+    return UV_EINVAL;
+
+  if (handle->send_queue_count > 0)
+    return UV_EAGAIN;
+
+  return uv__udp_try_send2(handle, count, bufs, nbufs, addrs);
+}
+
+
 int uv_udp_recv_start(uv_udp_t* handle,
                       uv_alloc_cb alloc_cb,
                       uv_udp_recv_cb recv_cb) {
@@ -533,17 +552,17 @@ int uv_udp_recv_stop(uv_udp_t* handle) {
 
 
 void uv_walk(uv_loop_t* loop, uv_walk_cb walk_cb, void* arg) {
-  QUEUE queue;
-  QUEUE* q;
+  struct uv__queue queue;
+  struct uv__queue* q;
   uv_handle_t* h;
 
-  QUEUE_MOVE(&loop->handle_queue, &queue);
-  while (!QUEUE_EMPTY(&queue)) {
-    q = QUEUE_HEAD(&queue);
-    h = QUEUE_DATA(q, uv_handle_t, handle_queue);
+  uv__queue_move(&loop->handle_queue, &queue);
+  while (!uv__queue_empty(&queue)) {
+    q = uv__queue_head(&queue);
+    h = uv__queue_data(q, uv_handle_t, handle_queue);
 
-    QUEUE_REMOVE(q);
-    QUEUE_INSERT_TAIL(&loop->handle_queue, q);
+    uv__queue_remove(q);
+    uv__queue_insert_tail(&loop->handle_queue, q);
 
     if (h->flags & UV_HANDLE_INTERNAL) continue;
     walk_cb(h, arg);
@@ -553,14 +572,17 @@ void uv_walk(uv_loop_t* loop, uv_walk_cb walk_cb, void* arg) {
 
 static void uv__print_handles(uv_loop_t* loop, int only_active, FILE* stream) {
   const char* type;
-  QUEUE* q;
+  struct uv__queue* q;
   uv_handle_t* h;
 
   if (loop == NULL)
     loop = uv_default_loop();
 
-  QUEUE_FOREACH(q, &loop->handle_queue) {
-    h = QUEUE_DATA(q, uv_handle_t, handle_queue);
+  if (stream == NULL)
+    stream = stderr;
+
+  uv__queue_foreach(q, &loop->handle_queue) {
+    h = uv__queue_data(q, uv_handle_t, handle_queue);
 
     if (only_active && !uv__is_active(h))
       continue;
@@ -640,6 +662,9 @@ int uv_send_buffer_size(uv_handle_t* handle, int *value) {
 
 int uv_fs_event_getpath(uv_fs_event_t* handle, char* buffer, size_t* size) {
   size_t required_len;
+
+  if (buffer == NULL || size == NULL || *size == 0)
+    return UV_EINVAL;
 
   if (!uv__is_active(handle)) {
     *size = 0;
@@ -846,7 +871,7 @@ uv_loop_t* uv_loop_new(void) {
 
 
 int uv_loop_close(uv_loop_t* loop) {
-  QUEUE* q;
+  struct uv__queue* q;
   uv_handle_t* h;
 #ifndef NDEBUG
   void* saved_data;
@@ -855,8 +880,8 @@ int uv_loop_close(uv_loop_t* loop) {
   if (uv__has_active_reqs(loop))
     return UV_EBUSY;
 
-  QUEUE_FOREACH(q, &loop->handle_queue) {
-    h = QUEUE_DATA(q, uv_handle_t, handle_queue);
+  uv__queue_foreach(q, &loop->handle_queue) {
+    h = uv__queue_data(q, uv_handle_t, handle_queue);
     if (!(h->flags & UV_HANDLE_INTERNAL))
       return UV_EBUSY;
   }
