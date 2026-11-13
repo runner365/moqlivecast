@@ -396,9 +396,28 @@ static void mark_pn_acked(QuicRecoveryCtx *ctx, uint64_t pn, int level,
 /* ── Compact ────────────────────────────────────── */
 
 static void compact_sent_packets(QuicRecoveryCtx *ctx) {
-    QuicRecoverySentPacket tmp[QUIC_RECOVERY_MAX_SENT_PACKETS];
+    /* 原来这里是
+     *     QuicRecoverySentPacket tmp[QUIC_RECOVERY_MAX_SENT_PACKETS];
+     * 即 4096 × 64B = 262,144 B（256KB）的**栈**数组。本函数是 static 且被
+     * 内联到 on_pto_timer 与 quic_recovery_on_packet_sent 两处，而这两个函数
+     * 恰好在同一条 PTO 重传调用链上：
+     *     on_pto_timer(262,288B) → send_quic_packet(2,272B)
+     *                            → quic_recovery_on_packet_sent(262,304B)
+     * 合计 526,864 B，超过 macOS 非主线程默认 512KB 栈，直接踩 guard page
+     * （___chkstk_darwin 崩溃）。改成按实际条目数堆分配，栈上不再有大数组。 */
+    const int count = ctx->sent_count_;
+    if (count <= 0) return;
+
+    QuicRecoverySentPacket *tmp =
+        (QuicRecoverySentPacket *)malloc((size_t)count * sizeof(*tmp));
+    if (!tmp) {
+        /* 压缩失败不影响正确性：调用方 on_packet_sent 会走溢出分支淘汰最旧条目 */
+        LOG_WARN("[quic-recovery] compact: malloc(%d 条) 失败，跳过本轮压缩", count);
+        return;
+    }
+
     int new_count = 0;
-    for (int i = 0; i < ctx->sent_count_; i++) {
+    for (int i = 0; i < count; i++) {
         int idx = slot_oldest_to_newest(ctx, i);
         QuicRecoverySentPacket *p = &ctx->sent_packets_[idx];
         if (p->acknowledged) {
@@ -417,11 +436,12 @@ static void compact_sent_packets(QuicRecoveryCtx *ctx) {
          * 而且比「一变成 lost 就丢」多给了 ACK 一整个环深度的机会去匹配上。 */
         tmp[new_count++] = *p;
     }
-    if (new_count < ctx->sent_count_) {
+    if (new_count < count) {
         memcpy(ctx->sent_packets_, tmp, (size_t)new_count * sizeof(QuicRecoverySentPacket));
         ctx->sent_count_ = new_count;
         ctx->sent_head_  = new_count;
     }
+    free(tmp);
 }
 
 /* ── ACK 范围 ───────────────────────────────────── */
