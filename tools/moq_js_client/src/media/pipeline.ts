@@ -5,6 +5,7 @@ import { FlvDemuxer } from './flvdemuxer'
 import { MediaStats, type MediaStatsSnapshot } from './mediaStats'
 import { MoqPublisher } from './moqPublisher'
 import type { SessionPhase, SessionPhaseHooks } from './sessionPhase'
+import type { VideoCodecChoice } from './codecSupport'
 import { WtPusher } from './wtPusher'
 
 export type PushFormat = 'flv' | 'moq'
@@ -48,6 +49,7 @@ export class PushPipeline {
     videoEl: HTMLVideoElement,
     cb: PushCallbacks = {},
     format: PushFormat = 'flv',
+    videoCodec: VideoCodecChoice = 'h264',
   ) {
     await this.stop()
     this.videoEl = videoEl
@@ -86,15 +88,15 @@ export class PushPipeline {
       const publisher = new MoqPublisher()
       this.publisher = publisher
       this.encoder = new AvcAacEncoder(publisher)
-      const status = await this.encoder.start(width, height)
+      const status = await this.encoder.start(width, height, videoCodec)
       log_info(
         'push',
         `encoder video=${status.videoCodec} audio=${status.audioOk ? status.audioCodec : 'none'}`,
       )
       cb.onStatus?.(status)
       if (!status.audioOk) {
-        log_warn('push', 'WebCodecs has no AAC, video-only H.264')
-        cb.onError?.('This browser cannot encode AAC with WebCodecs; publishing H.264 only')
+        log_warn('push', 'WebCodecs has no AAC, video-only output')
+        cb.onError?.('This browser cannot encode AAC with WebCodecs; publishing video only')
       }
       await publisher.connect(url, status, {
         onStats: (s) => cb.onStats?.(s),
@@ -113,15 +115,15 @@ export class PushPipeline {
         this.pusher.push(buf)
       })
       this.encoder = new AvcAacEncoder(muxer)
-      const status = await this.encoder.start(width, height)
+      const status = await this.encoder.start(width, height, videoCodec)
       log_info(
         'push',
         `encoder video=${status.videoCodec} audio=${status.audioOk ? status.audioCodec : 'none'}`,
       )
       cb.onStatus?.(status)
       if (!status.audioOk) {
-        log_warn('push', 'WebCodecs has no AAC, video-only H.264')
-        cb.onError?.('This browser cannot encode AAC with WebCodecs; publishing H.264 only')
+        log_warn('push', 'WebCodecs has no AAC, video-only output')
+        cb.onError?.('This browser cannot encode AAC with WebCodecs; publishing video only')
       }
     }
 

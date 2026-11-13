@@ -1,6 +1,7 @@
 import { hex_preview, log_debug, log_error, log_info, log_warn } from '../logger'
 import type { AvSink } from './avSink'
 import { aacLc48kStereoAsc } from './flvMuxer'
+import { H265_CODEC, type VideoCodecChoice } from './codecSupport'
 
 const SAMPLE_RATE = 48000
 const CHANNELS = 2
@@ -15,6 +16,7 @@ const KEYFRAME_INTERVAL_US = 4_000_000
  * isConfigSupported 返回 false 时静默退到 Main/Baseline，
  * 导致「以为在测 High，实际跑的是别的档位」。 */
 const VIDEO_CODEC = 'avc1.64001f'
+const VIDEO_CODEC_H265 = H265_CODEC
 
 /* latencyMode：直播推流取 'realtime'（低延迟优先）。
  *
@@ -51,7 +53,30 @@ function asU8(src: AllowSharedBufferSource): Uint8Array {
   return new Uint8Array(src)
 }
 
-async function pickVideoCodec(width: number, height: number): Promise<VideoEncoderConfig> {
+async function pickVideoCodec(
+  width: number,
+  height: number,
+  choice: VideoCodecChoice,
+): Promise<VideoEncoderConfig> {
+  if (choice === 'h265') {
+    const h265 = {
+      codec: VIDEO_CODEC_H265,
+      width,
+      height,
+      bitrate: VIDEO_BITRATE,
+      framerate: VIDEO_FPS,
+      latencyMode: VIDEO_LATENCY_MODE,
+      hardwareAcceleration: 'prefer-hardware',
+      hevc: { format: 'hevc' },
+    } as VideoEncoderConfig & { hevc?: { format: string } }
+    const r265 = await VideoEncoder.isConfigSupported(h265)
+    log_info('encoder', `probe HEVC ${VIDEO_CODEC_H265} ${width}x${height}: supported=${r265.supported}`)
+    if (!r265.supported) {
+      throw new Error(`WebCodecs 不支持 H.265 (${VIDEO_CODEC_H265}) @ ${width}x${height}`)
+    }
+    return (r265.config ?? h265) as VideoEncoderConfig
+  }
+
   const config: VideoEncoderConfig = {
     codec: VIDEO_CODEC,
     width,
@@ -140,8 +165,12 @@ export class AvcAacEncoder {
     this.muxer = muxer
   }
 
-  async start(width: number, height: number): Promise<EncoderStatus> {
-    const vcfg = await pickVideoCodec(width, height)
+  async start(
+    width: number,
+    height: number,
+    videoCodec: VideoCodecChoice = 'h264',
+  ): Promise<EncoderStatus> {
+    const vcfg = await pickVideoCodec(width, height, videoCodec)
     const acfg = await pickAudioCodec()
 
     this.status.width = width
@@ -225,7 +254,7 @@ export class AvcAacEncoder {
       this.avcC = asU8(desc)
       log_info(
         'encoder',
-        `AVC seq header ${this.avcC.byteLength}B pts=${ptsMs} hex=${hex_preview(this.avcC)}`,
+        `video seq header ${this.avcC.byteLength}B pts=${ptsMs} codec=${this.status.videoCodec} hex=${hex_preview(this.avcC)}`,
       )
       this.muxer.writeAvcSeq(this.avcC, ptsMs)
     }

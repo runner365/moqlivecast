@@ -4,7 +4,7 @@
 /* ============================================================
  * moq-transport client SDK
  *
- * Scope: live H.264 + AAC over moq-transport (draft-22) carried by
+ * Scope: live H.264/H.265 + AAC over moq-transport (draft-22) carried by
  * WebTransport/HTTP3.  One client = one broadcast (app/stream) and one
  * direction: publish or subscribe.
  *
@@ -14,6 +14,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <netinet/in.h>
 #include <uv.h>
 
 #ifdef __cplusplus
@@ -37,7 +38,8 @@ typedef enum {
 
 typedef enum {
     MOQT_CODEC_H264 = 0,
-    MOQT_CODEC_AAC  = 1
+    MOQT_CODEC_AAC  = 1,
+    MOQT_CODEC_H265 = 2
 } moqt_codec_t;
 
 typedef enum {
@@ -46,12 +48,13 @@ typedef enum {
 } moqt_direction_t;
 
 /* Publisher: one entry per track (video + audio).  `config` is avcC for
- * H.264 and AudioSpecificConfig for AAC; it is copied by add_stream(). */
+ * H.264 avcC / H.265 hvcC and AudioSpecificConfig for AAC; it is copied by
+ * add_stream(). */
 typedef struct {
     moqt_codec_t  codec;
     const uint8_t *config;
     size_t         config_len;
-    const char    *codec_name;   /* optional, e.g. "avc1.64001f" */
+    const char    *codec_name;   /* optional, e.g. "avc1.64001f" / "hvc1.1.6.L93.B0" */
 } moqt_stream_config_t;
 
 /* Passed to on_stream_ready().  Pointers are owned by the SDK and only
@@ -75,7 +78,8 @@ typedef struct {
     void (*on_stream_ready)(moqt_client_t *c, moqt_stream_t *s,
                             const moqt_stream_info_t *info, void *user);
 
-    /* Subscriber only.  `data` is AVCC H.264 / raw AAC; dts/pts are in ms.
+    /* Subscriber only.  `data` is AVCC H.264, HEVC access unit / raw AAC;
+     * dts/pts are in ms.
      * The buffer is only valid during the callback. */
     void (*on_data)(moqt_client_t *c, moqt_stream_t *s,
                     const uint8_t *data, size_t len,

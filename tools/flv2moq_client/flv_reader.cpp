@@ -77,18 +77,19 @@ struct FlvReader::Sink : public cpp_streamer::CppStreamerInterface {
         if (pkt->av_type_ == cpp_streamer::MEDIA_VIDEO_TYPE) {
             /* 服务端 EmitFlvVideo 写死 H.264（codec_id 固定 7）。
              * HEVC 送过去会被解成 H.264 而乱码，这里直接拦下。 */
-            if (pkt->codec_type_ != cpp_streamer::MEDIA_CODEC_H264) {
+            if (pkt->codec_type_ != cpp_streamer::MEDIA_CODEC_H264 &&
+                pkt->codec_type_ != cpp_streamer::MEDIA_CODEC_H265) {
                 owner->dropped_codec_++;
                 if (!owner->warned_codec_) {
                     owner->warned_codec_ = true;
-                    LOG_WARN("[flv2moq] only H.264 video is supported "
-                             "(codec_type=%d); further non-H.264 video frames "
-                             "will be dropped",
+                    LOG_WARN("[flv2moq] only H.264/H.265 video is supported "
+                             "(codec_type=%d); further frames will be dropped",
                             static_cast<int>(pkt->codec_type_));
                 }
                 return 0;
             }
             f.is_video = true;
+            f.is_h265 = (pkt->codec_type_ == cpp_streamer::MEDIA_CODEC_H265);
             off = static_cast<size_t>(pkt->flv_offset_);
             if (off == 0) off = kVideoHeaderLen;  /* 兜底 */
         } else if (pkt->av_type_ == cpp_streamer::MEDIA_AUDIO_TYPE) {

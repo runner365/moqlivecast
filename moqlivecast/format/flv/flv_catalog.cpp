@@ -1,5 +1,6 @@
 #include "flv_catalog.hpp"
 #include "h264_h265_header.hpp"
+#include "flv_h265.hpp"
 
 #include <cstdio>
 
@@ -36,6 +37,7 @@ bool FlvCatalogBuilder::OnVideoAvcC(const uint8_t* avcc, size_t len) {
              (unsigned)avcc[1], (unsigned)avcc[2], (unsigned)avcc[3]);
     video_codec_ = codec;
     video_desc_hex_ = ToHex(avcc, len);
+    video_track_ = "0.h264";
 
     int w = 0;
     int h = 0;
@@ -49,6 +51,19 @@ bool FlvCatalogBuilder::OnVideoAvcC(const uint8_t* avcc, size_t len) {
     }
     video_width_ = w;
     video_height_ = h;
+    have_video_ = true;
+    return true;
+}
+
+bool FlvCatalogBuilder::OnVideoHvcC(const uint8_t* hvcc, size_t len) {
+    if (!IsHevcDecoderConfig(hvcc, len)) return false;
+    video_codec_ = HevcCodecString(hvcc, len);
+    video_desc_hex_ = ToHex(hvcc, len);
+    video_track_ = "0.h265";
+    /* Width/height are optional in catalog; the decoder gets them from hvcC.
+     * Parsing HEVC SPS is intentionally not required for the first version. */
+    video_width_ = 0;
+    video_height_ = 0;
     have_video_ = true;
     return true;
 }

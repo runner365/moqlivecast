@@ -7,8 +7,12 @@ A live media stack built on a from-scratch C implementation of QUIC, HTTP/3, and
 ## Features
 
 - **MoQ Transport (draft-ietf-moq-transport-22) Push / Pull** over WebTransport
-- **C SDK** — H.264 + AAC publish/subscribe with app/stream names, codec config,
-  and per-object DTS/PTS
+- **C SDK** — H.264/H.265 + AAC publish/subscribe with app/stream names,
+  codec config, and per-object DTS/PTS
+- **H.265 / HEVC** — enhanced-RTMP `hvc1` in FLV/RTMP/HTTP-FLV/WebSocket-FLV;
+  legacy `CodecID=0x0C` is accepted on ingest and normalised to enhanced hvc1.
+  Browser H.265 publishing is offered only when Chrome WebCodecs reports HEVC
+  encode support; cluster/moq-lite H.265 is not included in this version.
 - **WebTransport FLV** Push / Pull
 - **HTTP-FLV Pull** on the same port as WebTransport (UDP + TCP)
 - **WebSocket-FLV Pull** — WS/WSS binary FLV tags on a dedicated TCP port

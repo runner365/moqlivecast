@@ -17,7 +17,9 @@ Example:
 - `host` may be an IPv4 literal or a domain with an IPv4 A record; the tool
   resolves it with `uv_getaddrinfo(AF_INET)` and keeps the domain as the
   WebTransport `:authority`. The QUIC stack itself is IPv4-only.
-- The FLV must contain H.264 video (`avcC`) and AAC audio (`AudioSpecificConfig`).
+- The FLV may contain H.264 (`avcC`) or H.265/HEVC (`hvcC`) video, plus AAC
+  audio (`AudioSpecificConfig`).  H.265 is sent with `MOQT_CODEC_H265` and the
+  hvcC record as the MoQ video config.
 - Frames are sent in file DTS order; `--speed 2` sends twice as fast.
 - The tool prints sent/ACK counts and exits non-zero if any write fails.
 

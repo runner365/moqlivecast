@@ -17,6 +17,7 @@ add_executable(flv2moq_client
     # FlvDemuxer 及其直接依赖（header-only 的 logger/data_buffer/av 等无需列出）
     ${MOQLIVECAST_DIR}/format/flv/flv_demux.cpp
     ${MOQLIVECAST_DIR}/format/flv/flv_pub.cpp
+    ${MOQLIVECAST_DIR}/format/flv/flv_h265.cpp
     ${MOQLIVECAST_DIR}/format/h264_h265_header.cpp
     ${MOQLIVECAST_DIR}/format/audio_header.cpp
 )

@@ -22,6 +22,7 @@ add_executable(flv2moqlite_client
     # FlvDemuxer 及其直接依赖（与 flv2moq_client/CMakeLists.txt 同一批）
     ${MOQLIVECAST_DIR}/format/flv/flv_demux.cpp
     ${MOQLIVECAST_DIR}/format/flv/flv_pub.cpp
+    ${MOQLIVECAST_DIR}/format/flv/flv_h265.cpp
     ${MOQLIVECAST_DIR}/format/h264_h265_header.cpp
     ${MOQLIVECAST_DIR}/format/audio_header.cpp
 )

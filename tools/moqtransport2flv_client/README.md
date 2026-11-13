@@ -24,7 +24,8 @@ Example:
 - `host` may be an IPv4 literal or a domain with an IPv4 A record; the tool
   resolves it with `uv_getaddrinfo(AF_INET)` and keeps the domain as the
   WebTransport `:authority`. The QUIC stack itself is IPv4-only.
-- Output is H.264 + AAC FLV; no other codecs.
+- Output is H.264/H.265 + AAC FLV.  H.265 is written using enhanced-RTMP
+  `hvc1` FourCC tags; legacy `CodecID=0x0C` is not emitted.
 - `--duration 0` (default) runs until Ctrl-C or the publisher closes the stream.
 - The file contains the GOP available at subscribe time plus live objects.
 - Timestamps are the server's pull timeline (the server may rebase a GOP to

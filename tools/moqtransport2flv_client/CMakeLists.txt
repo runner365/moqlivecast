@@ -9,6 +9,7 @@ add_executable(moqtransport2flv_client
     main.cpp
     ${MOQLIVECAST_DIR}/format/flv/flv_mux.cpp
     ${MOQLIVECAST_DIR}/format/flv/flv_pub.cpp
+    ${MOQLIVECAST_DIR}/format/flv/flv_h265.cpp
     ${MOQLIVECAST_DIR}/format/h264_h265_header.cpp
 )
 

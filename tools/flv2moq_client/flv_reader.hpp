@@ -33,7 +33,8 @@ bool CheckFlvMagic(const std::string &path, std::string &err);
 /* 解出的一个帧 */
 struct FlvFrame {
     bool is_video = false;
-    bool is_seq_hdr = false;   /* 视频 avcC / 音频 ASC */
+    bool is_h265 = false;      /* 视频 hvcC / HEVC，而不是 H.264 */
+    bool is_seq_hdr = false;   /* 视频 avcC/hvcC / 音频 ASC */
     bool key = false;
     int64_t dts = 0;           /* ms，作为 LOC timestamp（解码时间） */
     /* pts - dts，即 FLV 的 CompositionTime。

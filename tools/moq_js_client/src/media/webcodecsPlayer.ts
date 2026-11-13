@@ -158,13 +158,20 @@ export class WebCodecsPlayer {
   /** avcC 原始字节 → 推导 codec 字符串并建 VideoDecoder */
   configureVideo(avcC: Uint8Array) {
     log_info('wc-player', `configureVideo ENTER avcC=${avcC.byteLength}B hex=${hex(avcC, 8)}`)
-    this.avcC = avcC.slice()
-    const codec = codecFromAvcC(avcC)
+    const hvcC = isHvcC(avcC)
+    this.avcC = hvcC ? sanitizeHvcC(avcC) : avcC.slice()
+    const codec = codecFromVideoConfig(avcC)
     if (!codec) {
-      log_error('wc-player', `configureVideo: bad avcC len=${avcC.byteLength}`)
+      log_error('wc-player', `configureVideo: bad codec config len=${avcC.byteLength}`)
       return
     }
     this.videoCodec = codec
+    /* H.265 的 hvcC 常带 SEI 等非 VPS/SPS/PPS array。Chrome 的 HEVC
+     * decoder 对这类 array 兼容性不一致，配置只保留解码必需的 32/33/34。 */
+    if (hvcC) {
+      log_info('wc-player',
+        `hvcC normalized ${avcC.byteLength}B -> ${this.avcC.byteLength}B codec=${codec}`)
+    }
     this.buildDecoder()
     /* 配置就绪 → 下一帧开始解码；若之前因丢帧等关键帧，这里保持 needKey 不动 */
     log_info(
@@ -185,6 +192,22 @@ export class WebCodecsPlayer {
       codec: this.videoCodec,
       description: avcC.slice(),
       optimizeForLatency: true,
+    }
+    /* Chrome's HEVC WebCodecs decoder is hardware-only.  Without an explicit
+     * preference the platform may hand out a decoder that closes immediately
+     * on the first H.265 access unit. */
+    if (this.videoCodec.startsWith('hvc1.') || this.videoCodec.startsWith('hev1.')) {
+      cfg.hardwareAcceleration = 'prefer-hardware'
+    }
+    if (typeof VideoDecoder.isConfigSupported === 'function') {
+      void VideoDecoder.isConfigSupported(cfg).then((r) => {
+        log_info(
+          'wc-player',
+          `VideoDecoder.isConfigSupported codec=${cfg.codec} supported=${r.supported}`,
+        )
+      }).catch((e) => {
+        log_warn('wc-player', `VideoDecoder.isConfigSupported failed: ${errMsg(e)}`)
+      })
     }
     const dec = new VideoDecoder({
       output: (frame) => this.onVideoFrame(frame),
@@ -612,6 +635,102 @@ function codecFromAvcC(avcC: Uint8Array): string | null {
   if (avcC.byteLength < 4 || avcC[0] !== 1) return null
   const b = (n: number) => n.toString(16).padStart(2, '0')
   return `avc1.${b(avcC[1])}${b(avcC[2])}${b(avcC[3])}`
+}
+
+function strictHvcC(cfg: Uint8Array): boolean {
+  if (cfg.byteLength < 23 || cfg[0] !== 1) return false
+  const arrays = cfg[22]
+  if (arrays === 0) return false
+  let off = 23
+  for (let i = 0; i < arrays; i++) {
+    if (off + 3 > cfg.byteLength) return false
+    const count = (cfg[off + 1] << 8) | cfg[off + 2]
+    off += 3
+    if (count === 0) return false
+    for (let j = 0; j < count; j++) {
+      if (off + 2 > cfg.byteLength) return false
+      const n = (cfg[off] << 8) | cfg[off + 1]
+      off += 2
+      if (n === 0 || off + n > cfg.byteLength) return false
+      off += n
+    }
+  }
+  return off === cfg.byteLength
+}
+
+function isHvcC(cfg: Uint8Array): boolean {
+  if (cfg.byteLength < 23 || cfg[0] !== 1) return false
+  if (strictHvcC(cfg)) return true
+  /* Some packagers append clock/VUI bytes after the last NAL array, so the
+   * strict end==length check fails even though this is a valid hvcC.  H.265
+   * Main/Main10 use general_profile_idc 1/2; AVC profiles are 66/77/100, so
+   * this discriminator is safe. */
+  const profile = cfg[1] & 0x1f
+  return (profile === 1 || profile === 2) && cfg[12] > 0
+}
+
+/** Keep only VPS/SPS/PPS arrays in an hvcC record.  The field/header bytes
+ * are copied unchanged; the array list is rebuilt. */
+function sanitizeHvcC(cfg: Uint8Array): Uint8Array {
+  if (cfg.byteLength < 23 || cfg[0] !== 1) return cfg.slice()
+  const arrays = cfg[22]
+  if (arrays === 0) return cfg.slice()
+  let off = 23
+  const kept: Uint8Array[] = []
+  for (let i = 0; i < arrays; i++) {
+    if (off + 3 > cfg.byteLength) return cfg.slice()
+    const start = off
+    const type = cfg[off] & 0x3f
+    const count = (cfg[off + 1] << 8) | cfg[off + 2]
+    off += 3
+    if (count === 0) return cfg.slice()
+    let end = off
+    for (let j = 0; j < count; j++) {
+      if (off + 2 > cfg.byteLength) return cfg.slice()
+      const n = (cfg[off] << 8) | cfg[off + 1]
+      off += 2
+      if (n === 0 || off + n > cfg.byteLength) return cfg.slice()
+      off += n
+      end = off
+    }
+    if (type === 32 || type === 33 || type === 34) {
+      kept.push(cfg.slice(start, end))
+    }
+  }
+  if (kept.length === 0) return cfg.slice()
+  const out = new Uint8Array(23 + kept.reduce((n, a) => n + a.byteLength, 0))
+  out.set(cfg.slice(0, 23), 0)
+  out[22] = kept.length
+  let p = 23
+  for (const a of kept) {
+    out.set(a, p)
+    p += a.byteLength
+  }
+  return out
+}
+
+function codecFromHvcC(hvcC: Uint8Array): string {
+  const space = (hvcC[1] >> 6) & 3
+  const tier = (hvcC[1] >> 5) & 1
+  const profile = hvcC[1] & 0x1f
+  const compat =
+    ((hvcC[2] << 24) | (hvcC[3] << 16) | (hvcC[4] << 8) | hvcC[5]) >>> 0
+  const level = hvcC[12]
+  const prefix = ['', 'A', 'B', 'C'][space]
+  if (profile === 1 && space === 0 && compat === 0x60000000) {
+    /* Some encoders emit Level 2.1 (63) for 640x360 even though the
+     * frame size exceeds it.  Advertise at least Level 3.1 so Chrome
+     * selects a decoder able to handle the picture size. */
+    const effectiveLevel = Math.max(level, 93)
+    return `hvc1.1.6.${tier ? 'H' : 'L'}${effectiveLevel}.B0`
+  }
+  return `hvc1.${prefix}${profile}.${compat.toString(16)}.${tier ? 'H' : 'L'}${level}`
+}
+
+/** avcC or hvcC → WebCodecs codec string. */
+function codecFromVideoConfig(cfg: Uint8Array): string | null {
+  if (isHvcC(cfg)) return codecFromHvcC(cfg)
+  return codecFromAvcC(cfg)
 }
 
 /** AAC 采样率表（AudioSpecificConfig 的 samplingFrequencyIndex） */

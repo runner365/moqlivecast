@@ -1,7 +1,7 @@
 # moq_transport_client
 
 C SDK for **moq-transport (draft-ietf-moq-transport-22) over WebTransport**,
-focused on live H.264 + AAC publish / subscribe.
+focused on live H.264/H.265 + AAC publish / subscribe.
 
 One client instance represents one broadcast:
 
@@ -18,7 +18,7 @@ moqt_client_t *c = moqt_client_new(loop, &callbacks, user);
 
 /* Publisher: add video + audio before connect. */
 moqt_client_add_stream(c, &(moqt_stream_config_t){
-    .codec = MOQT_CODEC_H264,
+    .codec = MOQT_CODEC_H264,             /* or MOQT_CODEC_H265 */
     .config = avcC, .config_len = avcC_len,
     .codec_name = "avc1.64001f",
 });
@@ -45,7 +45,10 @@ moqt_client_connect(c, host, port, "/moq", app, stream,
 /* on_data(stream, data, len, dts_ms, pts_ms, keyframe) is called per object. */
 ```
 
-- H.264 payload is **AVCC** (length-prefixed NAL units), AAC is a raw frame.
+- H.264 payload is **AVCC**; H.265 payload is a length-prefixed HEVC access unit
+  and `config` is the **hvcC** record.  AAC is a raw frame.
+- H.265 catalog/codec naming uses `hvc1.*`; the server accepts the legacy FLV
+  `CodecID=0x0C` only as ingest and emits enhanced-RTMP `hvc1` on every egress.
 - `dts_ms` / `pts_ms` are milliseconds. `pts - dts` is sent as
   `LOC_COMPOSITION_TIME` when non-zero.
 - `avcC` / AAC `AudioSpecificConfig` are attached to the first object as
@@ -77,6 +80,9 @@ moqt_client_connect(c, host, port, "/moq", app, stream,
   near 0); subscribers should treat timestamps as a continuous timeline,
   not as the publisher's absolute DTS.
 - Only draft-22 LOC; no moq-lite compatibility.
+- H.265 in cluster/moq-lite is not part of this version.
+- Browser H.265 is offered only when `VideoEncoder.isConfigSupported` reports
+  true; availability depends on Chrome/OS/GPU.
 
 ## Build
 

@@ -10,7 +10,11 @@
 ## 功能
 
 - **MoQ Transport（draft-ietf-moq-transport-22）推流 / 拉流**（基于 WebTransport）
-- **C SDK** —— H.264 + AAC 推流/拉流，带 app/stream、codec 配置和每帧 DTS/PTS
+- **C SDK** —— H.264/H.265 + AAC 推流/拉流，带 app/stream、codec 配置和每帧 DTS/PTS
+- **H.265 / HEVC** —— FLV/RTMP/HTTP-FLV/WebSocket-FLV 使用 enhanced-RTMP `hvc1`；
+  入口兼容旧 `CodecID=0x0C`，统一归一化为 enhanced hvc1。
+  浏览器 H.265 推流仅在 Chrome WebCodecs 报告支持 HEVC 编码时显示选项；
+  本版本不包含集群/moq-lite 的 H.265。
 - **WebTransport FLV** 推流 / 拉流
 - **HTTP-FLV 拉流**，与 WebTransport 共用同一端口（UDP + TCP）
 - **WebSocket-FLV 拉流** —— 独立 TCP 端口上的 WS/WSS 二进制 FLV tag，

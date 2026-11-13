@@ -5,6 +5,7 @@
 #include "media_stream_manager.hpp"
 #include "av.hpp"
 #include "flv_pub.hpp"
+#include "flv_h265.hpp"
 #include "utils/meta_log.hpp"
 #include "logger.h"
 #include "utils/timeex.hpp"
@@ -848,8 +849,28 @@ void MoqPushSession::DrainSendQueue(Downlink &dl) {
 void MoqPushSession::EmitLoc(Downlink &dl, uint64_t alias, Media_Packet_Ptr pkt) {
     if (!dl.st || !pkt || !pkt->buffer_ptr_) return;
     const auto *body = reinterpret_cast<const uint8_t *>(pkt->buffer_ptr_->Data());
-    const size_t body_len = pkt->buffer_ptr_->DataLen();
+    size_t body_len = pkt->buffer_ptr_->DataLen();
     if (!body || body_len == 0) return;
+
+    std::vector<uint8_t> h265_body;
+    size_t h265_off = 0;
+    bool h265_seq = false;
+    int64_t h265_cts = 0;
+    if (alias == kAliasVideo && pkt->codec_type_ == MEDIA_CODEC_H265) {
+        if (!NormalizeH265FlvVideoBody(body, body_len, &h265_body, &h265_off))
+            return;
+        body = h265_body.data();
+        body_len = h265_body.size();
+        const uint8_t packet_type = body[0] & 0x0f;
+        h265_seq = (packet_type == 0);
+        if (packet_type == 1 && body_len >= 8) {
+            int32_t c = (static_cast<int32_t>(body[5]) << 16) |
+                        (static_cast<int32_t>(body[6]) << 8) |
+                        static_cast<int32_t>(body[7]);
+            if (c & 0x800000) c -= 0x1000000;
+            h265_cts = c;
+        }
+    }
 
     const uint8_t *cfg = nullptr;
     size_t cfg_len = 0;
@@ -864,16 +885,19 @@ void MoqPushSession::EmitLoc(Downlink &dl, uint64_t alias, Media_Packet_Ptr pkt)
      * 有 B 帧的流在 MSE 上会前后跳。 */
     int64_t cts_ms = 0;
     if (alias == kAliasVideo) {
-        if (body_len < 5) return;
-        {
+        const size_t off = (pkt->codec_type_ == MEDIA_CODEC_H265) ? h265_off : 5;
+        if (body_len < off) return;
+        if (pkt->codec_type_ == MEDIA_CODEC_H265) {
+            cts_ms = h265_seq ? 0 : h265_cts;
+        } else {
             int32_t c = (static_cast<int32_t>(body[2]) << 16) |
                         (static_cast<int32_t>(body[3]) << 8) |
                         static_cast<int32_t>(body[4]);
-            if (c & 0x800000) c -= 0x1000000;   /* 24 位补码 → 有符号 */
-            cts_ms = pkt->is_seq_hdr_ ? 0 : c;  /* config 帧无显示时间 */
+            if (c & 0x800000) c -= 0x1000000;
+            cts_ms = pkt->is_seq_hdr_ ? 0 : c;
         }
-        payload = body + 5;
-        payload_len = body_len - 5;
+        payload = body + off;
+        payload_len = body_len - off;
         if (pkt->is_seq_hdr_) {
             cfg = payload;
             cfg_len = payload_len;
@@ -1047,9 +1071,15 @@ void MoqPushSession::OnLocObject(uint64_t alias, int64_t ts_ms, int64_t cts_ms,
     if (alias == kAliasVideo) {
         if (cfg && cfg_len && !avc_seq_sent_) {
             /* config 帧没有显示时间，CTS 恒 0 */
+            if (IsHevcDecoderConfig(cfg, cfg_len)) {
+                video_codec_ = MEDIA_CODEC_H265;
+                catalog_builder_.OnVideoHvcC(cfg, cfg_len);
+            } else {
+                video_codec_ = MEDIA_CODEC_H264;
+                catalog_builder_.OnVideoAvcC(cfg, cfg_len);
+            }
             EmitFlvVideo(ts_ms, true, true, cfg, cfg_len, 0);
             avc_seq_sent_ = true;
-            catalog_builder_.OnVideoAvcC(cfg, cfg_len);
             PublishCatalog();
         }
         EmitFlvVideo(ts_ms, false, key, payload, payload_len, cts_ms);
@@ -1088,10 +1118,10 @@ void MoqPushSession::PublishCatalog() {
 void MoqPushSession::EmitFlvVideo(int64_t dts, bool seq, bool key,
                                   const uint8_t *data, size_t len,
                                   int64_t cts_ms) {
-    const size_t body_len = 5 + len;
-    auto pkt = std::make_shared<Media_Packet>(body_len);
+    const int64_t cts = seq ? 0 : cts_ms;
+    auto pkt = std::make_shared<Media_Packet>(16 + len);
     pkt->av_type_ = MEDIA_VIDEO_TYPE;
-    pkt->codec_type_ = MEDIA_CODEC_H264;
+    pkt->codec_type_ = video_codec_;
     pkt->fmt_type_ = MEDIA_FORMAT_FLV;
     pkt->dts_ = dts;
     pkt->is_seq_hdr_ = seq;
@@ -1099,28 +1129,47 @@ void MoqPushSession::EmitFlvVideo(int64_t dts, bool seq, bool key,
     pkt->app_ = app_;
     pkt->streamname_ = stream_;
     pkt->key_ = app_ + "/" + stream_;
-    /* CompositionTime 是 24 位有符号，写 DTS 与 PTS 的差。
-     * 写 0（旧行为）会让播放端认为 pts == dts：有 B 帧的流解码顺序
-     * 与显示顺序不一致，MSE/flv.js 严格按容器时间戳渲染 → 画面前后跳。
-     * 负数在 FLV 里是合法值（B 帧需要），按 24 位补码写入。 */
-    const int64_t cts = seq ? 0 : cts_ms;
-    const uint32_t cts_u = static_cast<uint32_t>(cts) & 0xffffffu;
-    uint8_t hdr[5] = {
-        static_cast<uint8_t>((seq || key) ? (FLV_VIDEO_KEY_FLAG | FLV_VIDEO_H264_CODEC)
-                                          : (FLV_VIDEO_INTER_FLAG | FLV_VIDEO_H264_CODEC)),
-        static_cast<uint8_t>(seq ? FLV_VIDEO_AVC_SEQHDR : FLV_VIDEO_AVC_NALU),
-        static_cast<uint8_t>((cts_u >> 16) & 0xff),
-        static_cast<uint8_t>((cts_u >> 8) & 0xff),
-        static_cast<uint8_t>(cts_u & 0xff),
-    };
-    pkt->buffer_ptr_->AppendData(reinterpret_cast<const char *>(hdr), 5);
-    pkt->buffer_ptr_->AppendData(reinterpret_cast<const char *>(data), len);
-    /* pts = dts + cts。NormalizeDts 之后会平移 dts 但保留两者之差，
-     * 所以这个偏移能一路活到写 FLV tag 的时候。 */
+
+    if (video_codec_ == MEDIA_CODEC_H265) {
+        std::vector<uint8_t> body = MakeH265ExVideoBody(seq, key, cts, data, len);
+        pkt->buffer_ptr_->AppendData(reinterpret_cast<const char *>(body.data()),
+                                     body.size());
+    } else {
+        const size_t body_len = 5 + len;
+        auto pkt2 = std::make_shared<Media_Packet>(body_len);
+        pkt2->av_type_ = MEDIA_VIDEO_TYPE;
+        pkt2->codec_type_ = MEDIA_CODEC_H264;
+        pkt2->fmt_type_ = MEDIA_FORMAT_FLV;
+        pkt2->dts_ = dts;
+        pkt2->is_seq_hdr_ = seq;
+        pkt2->is_key_frame_ = !seq && key;
+        pkt2->app_ = app_;
+        pkt2->streamname_ = stream_;
+        pkt2->key_ = app_ + "/" + stream_;
+        const uint32_t cts_u = static_cast<uint32_t>(cts) & 0xffffffu;
+        uint8_t hdr[5] = {
+            static_cast<uint8_t>((seq || key) ? (FLV_VIDEO_KEY_FLAG | FLV_VIDEO_H264_CODEC)
+                                              : (FLV_VIDEO_INTER_FLAG | FLV_VIDEO_H264_CODEC)),
+            static_cast<uint8_t>(seq ? FLV_VIDEO_AVC_SEQHDR : FLV_VIDEO_AVC_NALU),
+            static_cast<uint8_t>((cts_u >> 16) & 0xff),
+            static_cast<uint8_t>((cts_u >> 8) & 0xff),
+            static_cast<uint8_t>(cts_u & 0xff),
+        };
+        pkt2->buffer_ptr_->AppendData(reinterpret_cast<const char *>(hdr), 5);
+        pkt2->buffer_ptr_->AppendData(reinterpret_cast<const char *>(data), len);
+        pkt2->pts_ = dts + cts;
+        if (!IsPublisherOwner()) return;
+        MediaStreamManager::WriterMediaPacket(pkt2);
+        if (cts != 0) {
+            LOG_DEBUG("[moq-rfc] flv video %s dts=%lld cts=%lld pts=%lld size=%zu key=%d",
+                     seq ? "seq" : "nalu", (long long)dts, (long long)cts,
+                     (long long)(dts + cts), len, key ? 1 : 0);
+        }
+        return;
+    }
+
     pkt->pts_ = dts + cts;
     if (!IsPublisherOwner()) {
-        /* 本会话已被别的 publisher 顶掉：在途对象丢掉，别把两条时间线
-         * 混进同一条流。丢包日志按秒限流。 */
         const int64_t now_s = now_millisec() / 1000;
         if (last_owner_drop_dbg_ts_s_ != now_s) {
             last_owner_drop_dbg_ts_s_ = now_s;

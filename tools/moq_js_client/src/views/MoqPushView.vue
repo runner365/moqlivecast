@@ -2,7 +2,7 @@
   <div class="page">
     <header class="top">
       <h1>MoQ Push</h1>
-      <p class="sub">Camera + mic → H.264 / AAC → MOQT PUBLISH + LOC → WebTransport</p>
+      <p class="sub">Camera + mic → H.264/H.265 + AAC → MOQT PUBLISH + LOC → WebTransport</p>
     </header>
 
     <section class="bar">
@@ -14,6 +14,16 @@
         :disabled="busy"
         placeholder="https://host:4433/moq?app=live&amp;stream=<stream>"
       />
+      <select
+        v-if="h265Supported"
+        v-model="videoCodec"
+        class="sel"
+        :disabled="busy"
+        title="视频编码"
+      >
+        <option value="h264">H.264</option>
+        <option value="h265">H.265</option>
+      </select>
       <button class="btn" :class="{ stop: connected }" :disabled="busy" @click="onClick">
         {{ btnText }}
       </button>
@@ -34,13 +44,14 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import PhaseOverlay from '../components/PhaseOverlay.vue'
 import StatsOverlay from '../components/StatsOverlay.vue'
 import { defaultMoqPushUrl } from '../config'
 import { log_error, log_info } from '../logger'
 import { EMPTY_STATS, type MediaStatsSnapshot } from '../media/mediaStats'
 import { PushPipeline } from '../media/pipeline'
+import { probeH265Encode, type VideoCodecChoice } from '../media/codecSupport'
 import type { SessionPhase } from '../media/sessionPhase'
 import { connectButtonLabel } from '../media/sessionUi'
 
@@ -53,6 +64,8 @@ const error = ref('')
 const hint = ref('')
 const phase = ref<SessionPhase>('init')
 const stats = ref<MediaStatsSnapshot>({ ...EMPTY_STATS })
+const videoCodec = ref<VideoCodecChoice>('h264')
+const h265Supported = ref(false)
 
 const pipeline = new PushPipeline()
 
@@ -96,7 +109,7 @@ async function connect() {
       onPhase(p) {
         phase.value = p
       },
-    }, 'moq')
+    }, 'moq', videoCodec.value)
     connected.value = true
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
@@ -123,6 +136,12 @@ async function disconnect() {
     phase.value = 'disconnected'
   }
 }
+
+onMounted(async () => {
+  h265Supported.value = await probeH265Encode()
+  if (!h265Supported.value) videoCodec.value = 'h264'
+  log_info('ui-moq-push', `H.265 WebCodecs encode supported=${h265Supported.value}`)
+})
 
 onUnmounted(() => {
   void pipeline.stop()
@@ -176,6 +195,17 @@ onUnmounted(() => {
 .input:focus {
   outline: none;
   border-color: #388bfd;
+}
+
+.sel {
+  flex: none;
+  height: 40px;
+  padding: 0 10px;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  background: #161b22;
+  color: #e6edf3;
+  font-size: 14px;
 }
 
 .btn {

@@ -2,7 +2,7 @@
   <div class="page">
     <header class="top">
       <h1>MoQ Pull</h1>
-      <p class="sub">SUBSCRIBE → LOC → FLV → flv.js playback</p>
+      <p class="sub">SUBSCRIBE → LOC → WebCodecs (H.264/H.265) / flv.js (H.264)</p>
     </header>
 
     <section class="bar">

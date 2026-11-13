@@ -30,3 +30,13 @@ set_target_properties(moq_transport_client_smoke PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 target_link_libraries(moq_transport_client_smoke PRIVATE moq_transport_client)
+
+add_executable(moq_transport_client_h265_smoke
+    tests/moq_transport_client_h265_smoke.c
+)
+set_target_properties(moq_transport_client_h265_smoke PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+target_link_libraries(moq_transport_client_h265_smoke PRIVATE moq_transport_client)

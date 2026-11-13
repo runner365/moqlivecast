@@ -123,6 +123,7 @@ private:
     bool writer_closed_ = false;
     bool avc_seq_sent_ = false;
     bool aac_seq_sent_ = false;
+    MEDIA_CODEC_TYPE video_codec_ = MEDIA_CODEC_H264;
     /* 从 LOC config 帧合成 catalog（与 RTMP 同一套逻辑）。 */
     FlvCatalogBuilder catalog_builder_;
     /* 对端的控制单向流（只读，承载 SETUP）。 */

@@ -107,9 +107,14 @@ void RtmpSession::UpdateCatalogFromSeqHdr(const Media_Packet_Ptr& pkt) {
                          payload_len, catalog_.VideoWidth(),
                          catalog_.VideoHeight());
             }
+        } else if (pkt->codec_type_ == MEDIA_CODEC_H265) {
+            updated = catalog_.OnVideoHvcC(payload, payload_len);
+            if (updated) {
+                LogInfof(logger_, "RTMP catalog: video hvcC %zu B track=%s",
+                         payload_len, catalog_.VideoTrack().c_str());
+            }
         } else {
-            LogWarnf(logger_, "RTMP catalog: video codec %d is not H.264 — "
-                     "moq-lite export will skip the video track",
+            LogWarnf(logger_, "RTMP catalog: unsupported video codec %d",
                      (int)pkt->codec_type_);
         }
     } else if (pkt->av_type_ == MEDIA_AUDIO_TYPE) {

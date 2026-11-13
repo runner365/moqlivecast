@@ -1,6 +1,7 @@
 #include "rtmp_session_base.hpp"
 #include "rtmp_pub.hpp"
 #include "flv_pub.hpp"
+#include "flv_h265.hpp"
 #include "format/h264_h265_header.hpp"
 #include <map>
 
@@ -126,8 +127,23 @@ Media_Packet_Ptr RtmpSessionBase::GetMediaPacket(CHUNK_STREAM_PTR cs_ptr) {
 		LogErrorf(logger_, "Failed to get flv media packet from rtmp chunk stream, type_id: %d", cs_ptr->type_id_);
 		return nullptr;
     }
+    std::vector<uint8_t> h265_ex;
+    size_t h265_payload_off = 0;
+    const bool h265_normalized =
+        pkt_ptr->codec_type_ == MEDIA_CODEC_H265 &&
+        NormalizeH265FlvVideoBody(
+            reinterpret_cast<const uint8_t *>(cs_ptr->chunk_data_ptr_->Data()),
+            cs_ptr->chunk_data_ptr_->DataLen(), &h265_ex, &h265_payload_off);
+
     pkt_ptr->buffer_ptr_->Reset();
-    pkt_ptr->buffer_ptr_->AppendData(cs_ptr->chunk_data_ptr_->Data(), cs_ptr->chunk_data_ptr_->DataLen());
+    if (h265_normalized) {
+        pkt_ptr->flv_offset_ = h265_payload_off;
+        pkt_ptr->buffer_ptr_->AppendData(
+            reinterpret_cast<const char *>(h265_ex.data()), h265_ex.size());
+    } else {
+        pkt_ptr->buffer_ptr_->AppendData(cs_ptr->chunk_data_ptr_->Data(),
+                                         cs_ptr->chunk_data_ptr_->DataLen());
+    }
 
     pkt_ptr->app_ = req_.app_;
     pkt_ptr->streamname_ = req_.stream_name_;

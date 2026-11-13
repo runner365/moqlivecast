@@ -53,6 +53,7 @@ struct App {
 
     std::vector<uint8_t> vcfg;
     std::vector<uint8_t> acfg;
+    bool video_h265 = false;
 
     bool video_ready = false;
     bool audio_ready = false;
@@ -114,11 +115,13 @@ void on_connected(moqt_client_t *, moqt_result_t status,
 void on_stream_ready(moqt_client_t *, moqt_stream_t *s,
                      const moqt_stream_info_t *info, void *user) {
     App *a = (App *)user;
-    if (info->codec == MOQT_CODEC_H264) a->video_ready = true;
+    if (info->codec == MOQT_CODEC_H264 || info->codec == MOQT_CODEC_H265)
+        a->video_ready = true;
     if (info->codec == MOQT_CODEC_AAC) a->audio_ready = true;
     printf("[flv2moqtransport] stream %s ready codec=%s cfg=%zu\n",
            info->track_name,
-           info->codec == MOQT_CODEC_H264 ? "H264" : "AAC",
+           info->codec == MOQT_CODEC_H264 ? "H264" :
+           (info->codec == MOQT_CODEC_H265 ? "H265" : "AAC"),
            info->config_len);
     if (a->video_ready && a->audio_ready && !a->started) {
         a->started = true;
@@ -159,8 +162,12 @@ void fill_pending(App *a) {
     while (!a->reader.Empty()) {
         flv2moq::FlvFrame f = a->reader.TakeFront();
         if (f.is_seq_hdr) {
-            if (f.is_video) a->vcfg = std::move(f.payload);
-            else a->acfg = std::move(f.payload);
+            if (f.is_video) {
+                a->vcfg = std::move(f.payload);
+                a->video_h265 = f.is_h265;
+            } else {
+                a->acfg = std::move(f.payload);
+            }
             continue;
         }
         a->pending.push_back(std::move(f));
@@ -176,8 +183,12 @@ void fill_pending(App *a) {
     while (!a->reader.Empty()) {
         flv2moq::FlvFrame f = a->reader.TakeFront();
         if (f.is_seq_hdr) {
-            if (f.is_video) a->vcfg = std::move(f.payload);
-            else a->acfg = std::move(f.payload);
+            if (f.is_video) {
+                a->vcfg = std::move(f.payload);
+                a->video_h265 = f.is_h265;
+            } else {
+                a->acfg = std::move(f.payload);
+            }
             continue;
         }
         a->pending.push_back(std::move(f));
@@ -366,8 +377,12 @@ int main(int argc, char **argv) {
         while (!a.reader.Empty()) {
             flv2moq::FlvFrame f = a.reader.TakeFront();
             if (f.is_seq_hdr) {
-                if (f.is_video) a.vcfg = std::move(f.payload);
-                else a.acfg = std::move(f.payload);
+                if (f.is_video) {
+                    a.vcfg = std::move(f.payload);
+                    a.video_h265 = f.is_h265;
+                } else {
+                    a.acfg = std::move(f.payload);
+                }
             } else {
                 a.pending.push_back(std::move(f));
             }
@@ -393,10 +408,10 @@ int main(int argc, char **argv) {
     }
 
     moqt_stream_config_t v = {
-        .codec = MOQT_CODEC_H264,
+        .codec = a.video_h265 ? MOQT_CODEC_H265 : MOQT_CODEC_H264,
         .config = a.vcfg.data(),
         .config_len = a.vcfg.size(),
-        .codec_name = "avc1.64001f",
+        .codec_name = a.video_h265 ? "hvc1.1.6.L93.B0" : "avc1.64001f",
     };
     moqt_stream_config_t au = {
         .codec = MOQT_CODEC_AAC,

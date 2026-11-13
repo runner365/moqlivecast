@@ -401,6 +401,48 @@ static moqt_stream_t *find_stream_wt(moqt_client_t *c, wt_stream_t *wt) {
     return NULL;
 }
 
+static int sdk_is_hevc_config(const uint8_t *cfg, size_t len) {
+    if (!cfg || len < 23 || cfg[0] != 1) return 0;
+    size_t off = 23;
+    const size_t arrays = cfg[22];
+    if (arrays == 0) return 0;
+    for (size_t i = 0; i < arrays; i++) {
+        if (off + 3 > len) return 0;
+        const size_t count = ((size_t)cfg[off + 1] << 8) | cfg[off + 2];
+        off += 3;
+        if (count == 0) return 0;
+        for (size_t j = 0; j < count; j++) {
+            if (off + 2 > len) return 0;
+            const size_t n = ((size_t)cfg[off] << 8) | cfg[off + 1];
+            off += 2;
+            if (n == 0 || off + n > len) return 0;
+            off += n;
+        }
+    }
+    return off == len;
+}
+
+static void sdk_hevc_codec_name(const uint8_t *cfg, size_t len,
+                                char *out, size_t out_len) {
+    if (!cfg || len < 13 || !out || out_len == 0) {
+        if (out && out_len) snprintf(out, out_len, "%s", "hvc1.1.6.L93.B0");
+        return;
+    }
+    const unsigned space = (cfg[1] >> 6) & 0x03;
+    const unsigned tier = (cfg[1] >> 5) & 0x01;
+    const unsigned profile = cfg[1] & 0x1f;
+    const uint32_t compat = ((uint32_t)cfg[2] << 24) | ((uint32_t)cfg[3] << 16) |
+                            ((uint32_t)cfg[4] << 8) | cfg[5];
+    const unsigned level = cfg[12];
+    static const char *names[] = {"", "A", "B", "C"};
+    if (profile == 1 && space == 0 && compat == 0x60000000u) {
+        snprintf(out, out_len, "hvc1.1.6.%c%u.B0", tier ? 'H' : 'L', level);
+    } else {
+        snprintf(out, out_len, "hvc1.%s%u.%x.%c%u", names[space], profile,
+                 compat, tier ? 'H' : 'L', level);
+    }
+}
+
 static moqt_stream_t *new_stream(moqt_client_t *c) {
     moqt_stream_t *s = (moqt_stream_t *)xcalloc(1, sizeof(*s));
     if (!s) return NULL;
@@ -701,6 +743,13 @@ static void sub_parse_stream(moqt_stream_t *s) {
                     s->config_len = o.acfg_len;
                 }
             }
+            if (o.vcfg && o.vcfg_len && sdk_is_hevc_config(o.vcfg, o.vcfg_len)) {
+                s->codec = MOQT_CODEC_H265;
+                sdk_hevc_codec_name(o.vcfg, o.vcfg_len,
+                                    s->codec_name, sizeof(s->codec_name));
+            } else if (o.acfg && o.acfg_len) {
+                s->codec = MOQT_CODEC_AAC;
+            }
             s->announced = 1;
             notify_stream_ready(c, s);
         } else {
@@ -884,19 +933,23 @@ moqt_client_t *moqt_client_new(uv_loop_t *loop,
 moqt_stream_t *moqt_client_add_stream(moqt_client_t *c,
                                       const moqt_stream_config_t *cfg) {
     if (!c || !cfg || c->state != C_IDLE) return NULL;
-    if (cfg->codec != MOQT_CODEC_H264 && cfg->codec != MOQT_CODEC_AAC)
+    if (cfg->codec != MOQT_CODEC_H264 && cfg->codec != MOQT_CODEC_H265 &&
+        cfg->codec != MOQT_CODEC_AAC)
         return NULL;
-    if (cfg->codec == MOQT_CODEC_H264 && c->video) return NULL;
+    if ((cfg->codec == MOQT_CODEC_H264 || cfg->codec == MOQT_CODEC_H265) &&
+        c->video) return NULL;
     if (cfg->codec == MOQT_CODEC_AAC && c->audio) return NULL;
     if (cfg->config_len > 0 && !cfg->config) return NULL;
 
     moqt_stream_t *s = new_stream(c);
     if (!s) return NULL;
     s->codec = cfg->codec;
-    if (cfg->codec == MOQT_CODEC_H264) {
+    if (cfg->codec == MOQT_CODEC_H264 || cfg->codec == MOQT_CODEC_H265) {
         strncpy(s->track, "video", sizeof(s->track) - 1);
         strncpy(s->codec_name,
-                cfg->codec_name ? cfg->codec_name : "avc1.64001f",
+                cfg->codec_name ? cfg->codec_name :
+                    (cfg->codec == MOQT_CODEC_H265 ? "hvc1.1.6.L93.B0"
+                                                   : "avc1.64001f"),
                 sizeof(s->codec_name) - 1);
         s->alias = ALIAS_VIDEO;
         c->video = s;
@@ -982,12 +1035,13 @@ moqt_result_t moqt_stream_write_ex(moqt_stream_t *s,
 
     int64_t cts = pts_ms - dts_ms;
     if (cts < 0) cts = 0;
-    int key = (s->codec == MOQT_CODEC_H264) ? (keyframe ? 1 : 0) : 0;
+    int key = (s->codec == MOQT_CODEC_H264 || s->codec == MOQT_CODEC_H265)
+                  ? (keyframe ? 1 : 0) : 0;
 
     const uint8_t *vcfg = NULL, *acfg = NULL;
     size_t vcfg_len = 0, acfg_len = 0;
     if (!s->config_sent && s->config_len) {
-        if (s->codec == MOQT_CODEC_H264) {
+        if (s->codec == MOQT_CODEC_H264 || s->codec == MOQT_CODEC_H265) {
             vcfg = s->config; vcfg_len = s->config_len;
         } else {
             acfg = s->config; acfg_len = s->config_len;

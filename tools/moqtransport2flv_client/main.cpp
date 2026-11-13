@@ -2,8 +2,7 @@
  * moqtransport2flv_client
  *
  * Subscribe to a moqlivecast stream with moq_transport_client and write
- * H.264 + AAC to an FLV file.  FLV muxing uses
- * moqlivecast/format/flv/FlvMuxer.
+ * H.264/H.265 + AAC to an FLV file.  H.265 uses enhanced-RTMP hvc1 tags.
  *
  * Usage:
  *   moqtransport2flv_client <host> <port> <app> <stream> <out.flv>
@@ -13,8 +12,8 @@
 #include "moq_transport_client.h"
 
 #include "cpp_streamer_interface.hpp"
-#include "flv_mux.hpp"
 #include "media_packet.hpp"
+#include "flv_mux.hpp"
 
 #include <uv.h>
 #include <netdb.h>
@@ -73,8 +72,6 @@ struct App {
     uv_getaddrinfo_t resolve;
 
     FILE *fp = nullptr;
-    cpp_streamer::FlvMuxer *muxer = nullptr;
-    FileSink *sink = nullptr;
     moqt_client_t *client = nullptr;
 
     std::string path;
@@ -90,6 +87,8 @@ struct App {
     bool aseq = false;
     bool done = false;
     bool got_media = false;
+    cpp_streamer::FlvMuxer *muxer = nullptr;
+    FileSink *sink = nullptr;
     uint64_t packets = 0;
     uint64_t payload_bytes = 0;
     double duration_sec = 0;
@@ -135,30 +134,33 @@ void on_connected(moqt_client_t *, moqt_result_t status,
 void write_seq(App *a, moqt_stream_t *s, moqt_codec_t codec,
                const uint8_t *cfg, size_t cfg_len) {
     if (!cfg || cfg_len == 0) return;
-    if (codec == MOQT_CODEC_H264 && a->vseq) return;
+    if ((codec == MOQT_CODEC_H264 || codec == MOQT_CODEC_H265) && a->vseq) return;
     if (codec == MOQT_CODEC_AAC && a->aseq) return;
 
     auto pkt = std::make_shared<cpp_streamer::Media_Packet>();
-    pkt->av_type_ = (codec == MOQT_CODEC_H264)
+    pkt->av_type_ = (codec == MOQT_CODEC_H264 || codec == MOQT_CODEC_H265)
                         ? cpp_streamer::MEDIA_VIDEO_TYPE
                         : cpp_streamer::MEDIA_AUDIO_TYPE;
     pkt->codec_type_ = (codec == MOQT_CODEC_H264)
                            ? cpp_streamer::MEDIA_CODEC_H264
-                           : cpp_streamer::MEDIA_CODEC_AAC;
+                           : (codec == MOQT_CODEC_H265
+                                  ? cpp_streamer::MEDIA_CODEC_H265
+                                  : cpp_streamer::MEDIA_CODEC_AAC);
     pkt->is_seq_hdr_ = true;
     pkt->is_key_frame_ = false;
     pkt->dts_ = 0;
     pkt->pts_ = 0;
     pkt->buffer_ptr_->AppendData((const char *)cfg, cfg_len);
-    if (a->muxer->InputPacket(pkt) < 0) {
+    if (!a->muxer || a->muxer->InputPacket(pkt) < 0) {
         fprintf(stderr, "[moqtransport2flv] seq header mux failed\n");
         stop_loop(a);
         return;
     }
-    if (codec == MOQT_CODEC_H264) a->vseq = true;
+    if (codec == MOQT_CODEC_H264 || codec == MOQT_CODEC_H265) a->vseq = true;
     else a->aseq = true;
     printf("[moqtransport2flv] wrote %s sequence header (%zu bytes)\n",
-           codec == MOQT_CODEC_H264 ? "video" : "audio", cfg_len);
+           (codec == MOQT_CODEC_H264 || codec == MOQT_CODEC_H265) ? "video" : "audio",
+           cfg_len);
     (void)s;
 }
 
@@ -167,7 +169,8 @@ void on_stream_ready(moqt_client_t *, moqt_stream_t *s,
     App *a = (App *)user;
     printf("[moqtransport2flv] stream %s ready codec=%s cfg=%zu\n",
            info->track_name,
-           info->codec == MOQT_CODEC_H264 ? "H264" : "AAC",
+           info->codec == MOQT_CODEC_H264 ? "H264" :
+           (info->codec == MOQT_CODEC_H265 ? "H265" : "AAC"),
            info->config_len);
     write_seq(a, s, info->codec, info->config, info->config_len);
 }
@@ -176,7 +179,7 @@ void write_media(App *a, moqt_stream_t *s,
                  const uint8_t *data, size_t len,
                  int64_t dts_ms, int64_t pts_ms, int keyframe) {
     moqt_codec_t codec = moqt_stream_codec(s);
-    if (codec == MOQT_CODEC_H264 && !a->vseq) {
+    if ((codec == MOQT_CODEC_H264 || codec == MOQT_CODEC_H265) && !a->vseq) {
         size_t cfg_len = 0;
         const uint8_t *cfg = moqt_stream_config(s, &cfg_len);
         write_seq(a, s, codec, cfg, cfg_len);
@@ -187,19 +190,20 @@ void write_media(App *a, moqt_stream_t *s,
     }
 
     auto pkt = std::make_shared<cpp_streamer::Media_Packet>();
-    pkt->av_type_ = (codec == MOQT_CODEC_H264)
+    pkt->av_type_ = (codec == MOQT_CODEC_H264 || codec == MOQT_CODEC_H265)
                         ? cpp_streamer::MEDIA_VIDEO_TYPE
                         : cpp_streamer::MEDIA_AUDIO_TYPE;
     pkt->codec_type_ = (codec == MOQT_CODEC_H264)
                            ? cpp_streamer::MEDIA_CODEC_H264
-                           : cpp_streamer::MEDIA_CODEC_AAC;
+                           : (codec == MOQT_CODEC_H265
+                                  ? cpp_streamer::MEDIA_CODEC_H265
+                                  : cpp_streamer::MEDIA_CODEC_AAC);
     pkt->is_seq_hdr_ = false;
     pkt->is_key_frame_ = keyframe != 0;
     pkt->dts_ = dts_ms;
     pkt->pts_ = pts_ms;
     pkt->buffer_ptr_->AppendData((const char *)data, len);
-
-    if (a->muxer->InputPacket(pkt) < 0) {
+    if (!a->muxer || a->muxer->InputPacket(pkt) < 0) {
         fprintf(stderr, "[moqtransport2flv] media mux failed\n");
         stop_loop(a);
         return;
@@ -339,7 +343,6 @@ int main(int argc, char **argv) {
     a.muxer->SetLogger(nullptr);
     a.sink = new FileSink(a.fp);
     a.muxer->AddSinker(a.sink);
-
     moqt_callbacks_t cbs;
     memset(&cbs, 0, sizeof(cbs));
     cbs.on_connected = on_connected;

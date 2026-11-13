@@ -164,11 +164,15 @@ int FlvMuxer::InputPacket(Media_Packet_Ptr pkt_ptr) {
 
     size_t data_size = pkt_ptr->buffer_ptr_->DataLen();
     size_t media_size = 0;
-    uint8_t header_data[16];
+    uint8_t header_data[32];
 
     if (pkt_ptr->av_type_ == MEDIA_VIDEO_TYPE) {
-        //11 bytes header | 0x17 00 | 00 00 00 | data[...] | pre tag size
-        media_size = 2 + 3 + data_size;
+        // H.265 uses enhanced-RTMP ExVideo: 1B lead + "hvc1" + optional CTS.
+        if (pkt_ptr->codec_type_ == MEDIA_CODEC_H265) {
+            media_size = (pkt_ptr->is_seq_hdr_ ? 5 : 8) + data_size;
+        } else {
+            media_size = 5 + data_size;   // 0x17/0x27 + AVCPacketType + CTS
+        }
         header_data[0] = FLV_TAG_VIDEO;
 
     } else if (pkt_ptr->av_type_ == MEDIA_AUDIO_TYPE) {
@@ -210,23 +214,47 @@ int FlvMuxer::InputPacket(Media_Packet_Ptr pkt_ptr) {
     size_t pre_size = 0;
 
     if (pkt_ptr->av_type_ == MEDIA_VIDEO_TYPE) {
-        //set media header
-        header_size = 16;
-        pre_size = 11 + 5 + pkt_ptr->buffer_ptr_->DataLen();
-        if (pkt_ptr->is_seq_hdr_) {
-            header_data[11] = FLV_VIDEO_KEY_FLAG;
-            header_data[12] = FLV_VIDEO_AVC_SEQHDR;
-        } else if (pkt_ptr->is_key_frame_) {
-            header_data[11] = FLV_VIDEO_KEY_FLAG;
-            header_data[12] = FLV_VIDEO_AVC_NALU;
-        } else {
-            header_data[11] = FLV_VIDEO_INTER_FLAG;
-            header_data[12] = FLV_VIDEO_AVC_NALU;
-        }
-        if (pkt_ptr->codec_type_ == MEDIA_CODEC_H264) {
-            header_data[11] |= FLV_VIDEO_H264_CODEC;
-        } else if (pkt_ptr->codec_type_ == MEDIA_CODEC_H265) {
-            header_data[11] |= FLV_VIDEO_H265_CODEC;
+        if (pkt_ptr->codec_type_ == MEDIA_CODEC_H265) {
+            /* Enhanced-RTMP H.265: 0x80|frame|packet, FourCC "hvc1",
+             * SI24 CTS on CodedFrames, then hvcC / HEVC access unit. */
+            /* header_size is the full FLV tag header + ExVideo header, because
+             * the append path copies header_data from index 0. */
+            header_size = 11 + (pkt_ptr->is_seq_hdr_ ? 5 : 8);
+            pre_size = header_size + data_size;
+            const uint8_t frame = (pkt_ptr->is_seq_hdr_ || pkt_ptr->is_key_frame_)
+                                      ? 1 : 2;
+            const uint8_t packet = pkt_ptr->is_seq_hdr_ ? 0 : 1;
+            header_data[11] = static_cast<uint8_t>(0x80 | (frame << 4) | packet);
+            header_data[12] = 'h';
+            header_data[13] = 'v';
+            header_data[14] = 'c';
+            header_data[15] = '1';
+            if (!pkt_ptr->is_seq_hdr_) {
+                int64_t cts = pkt_ptr->pts_ - pkt_ptr->dts_;
+                if (cts < 0) cts = 0;
+                const uint32_t bits = static_cast<uint32_t>(cts) & 0xffffffu;
+                header_data[16] = static_cast<uint8_t>((bits >> 16) & 0xff);
+                header_data[17] = static_cast<uint8_t>((bits >> 8) & 0xff);
+                header_data[18] = static_cast<uint8_t>(bits & 0xff);
+            }
+        } else if (pkt_ptr->codec_type_ == MEDIA_CODEC_H264) {
+            header_size = 16;
+            pre_size = header_size + data_size;
+            if (pkt_ptr->is_seq_hdr_) {
+                header_data[11] = FLV_VIDEO_KEY_FLAG | FLV_VIDEO_H264_CODEC;
+                header_data[12] = FLV_VIDEO_AVC_SEQHDR;
+            } else if (pkt_ptr->is_key_frame_) {
+                header_data[11] = FLV_VIDEO_KEY_FLAG | FLV_VIDEO_H264_CODEC;
+                header_data[12] = FLV_VIDEO_AVC_NALU;
+            } else {
+                header_data[11] = FLV_VIDEO_INTER_FLAG | FLV_VIDEO_H264_CODEC;
+                header_data[12] = FLV_VIDEO_AVC_NALU;
+            }
+            uint32_t ts_delta = (pkt_ptr->pts_ > pkt_ptr->dts_)
+                                    ? (pkt_ptr->pts_ - pkt_ptr->dts_) : 0;
+            header_data[13] = (ts_delta >> 16) & 0xff;
+            header_data[14] = (ts_delta >> 8) & 0xff;
+            header_data[15] = ts_delta & 0xff;
         } else {
             char error_sz[128];
             snprintf(error_sz, sizeof(error_sz), "flv mux unsuport video codec type:%d", pkt_ptr->codec_type_);
@@ -234,13 +262,9 @@ int FlvMuxer::InputPacket(Media_Packet_Ptr pkt_ptr) {
             Report("error", error_sz);
             return -1;
         }
-        uint32_t ts_delta = (pkt_ptr->pts_ > pkt_ptr->dts_) ? (pkt_ptr->pts_ - pkt_ptr->dts_) : 0;
-        header_data[13] = (ts_delta >> 16) & 0xff;
-        header_data[14] = (ts_delta >> 8) & 0xff;
-        header_data[15] = ts_delta & 0xff;
     } else if (pkt_ptr->av_type_ == MEDIA_AUDIO_TYPE) {
         header_size = 13;
-        pre_size = 11 + 2 + pkt_ptr->buffer_ptr_->DataLen();
+        pre_size = header_size + pkt_ptr->buffer_ptr_->DataLen();
 
         header_data[11] = 0x0f;
         if (pkt_ptr->is_seq_hdr_) {
@@ -259,7 +283,7 @@ int FlvMuxer::InputPacket(Media_Packet_Ptr pkt_ptr) {
         }
     } else if (pkt_ptr->av_type_ == MEDIA_METADATA_TYPE) {
         header_size = 11;
-        pre_size = 11 + pkt_ptr->buffer_ptr_->DataLen();
+        pre_size = header_size + pkt_ptr->buffer_ptr_->DataLen();
     } else {
         char error_sz[128];
         snprintf(error_sz, sizeof(error_sz), "flv mux does not suport media type:%d", (int)pkt_ptr->av_type_);
@@ -268,15 +292,20 @@ int FlvMuxer::InputPacket(Media_Packet_Ptr pkt_ptr) {
         return -1;
     }
 
-    output_pkt_ptr->buffer_ptr_->AppendData((char*)header_data, header_size);
-    output_pkt_ptr->buffer_ptr_->AppendData(pkt_ptr->buffer_ptr_->Data(), pkt_ptr->buffer_ptr_->DataLen());
-
-    uint8_t pre_tag_size_p[4];
-    pre_tag_size_p[0] = (pre_size >> 24) & 0xff;
-    pre_tag_size_p[1] = (pre_size >> 16) & 0xff;
-    pre_tag_size_p[2] = (pre_size >> 8) & 0xff;
-    pre_tag_size_p[3] = pre_size & 0xff;
-    output_pkt_ptr->buffer_ptr_->AppendData((char*)pre_tag_size_p, sizeof(pre_tag_size_p));
+    std::vector<uint8_t> out;
+    out.reserve(header_size + pkt_ptr->buffer_ptr_->DataLen() + 4);
+    out.insert(out.end(), header_data, header_data + header_size);
+    const char *payload = pkt_ptr->buffer_ptr_->Data();
+    out.insert(out.end(), payload, payload + pkt_ptr->buffer_ptr_->DataLen());
+    const uint8_t pre_tag_size_p[4] = {
+        static_cast<uint8_t>((pre_size >> 24) & 0xff),
+        static_cast<uint8_t>((pre_size >> 16) & 0xff),
+        static_cast<uint8_t>((pre_size >> 8) & 0xff),
+        static_cast<uint8_t>(pre_size & 0xff),
+    };
+    out.insert(out.end(), pre_tag_size_p, pre_tag_size_p + 4);
+    output_pkt_ptr->buffer_ptr_->AppendData(
+        reinterpret_cast<const char *>(out.data()), out.size());
     output_pkt_ptr->av_type_    = pkt_ptr->av_type_;
     output_pkt_ptr->codec_type_ = pkt_ptr->codec_type_;
     output_pkt_ptr->fmt_type_   = MEDIA_FORMAT_FLV;

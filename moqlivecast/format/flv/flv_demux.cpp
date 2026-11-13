@@ -2,6 +2,7 @@
 #include "logger.hpp"
 #include "byte_stream.hpp"
 #include "flv_pub.hpp"
+#include "flv_h265.hpp"
 #include "uuid.hpp"
 #include "media_packet.hpp"
 #include "amf0.hpp"
@@ -185,7 +186,11 @@ int FlvDemuxer::HandleVideoTag(uint8_t* data, int data_len, Media_Packet_Ptr pkt
                     codectype_tostring(pkt_ptr->codec_type_).c_str(), (char)p[0], (char)p[1], (char)p[2], (char)p[3], video_packet_type);
             }
         }
-        if (pkt_ptr->codec_type_ == MEDIA_CODEC_H264 || pkt_ptr->codec_type_ == MEDIA_CODEC_H265) {
+        /* Enhanced H.265/H.264 SequenceStart and CodedFramesX have no SI24
+         * CompositionTime.  Only CodedFrames carries it. */
+        if ((pkt_ptr->codec_type_ == MEDIA_CODEC_H264 ||
+             pkt_ptr->codec_type_ == MEDIA_CODEC_H265) &&
+            video_packet_type == VIDEO_PKTTYPE_CODEDFRAMES) {
             ts_delta = ByteStream::Read3Bytes(p);
             p += 3;
         } else {
@@ -196,7 +201,20 @@ int FlvDemuxer::HandleVideoTag(uint8_t* data, int data_len, Media_Packet_Ptr pkt
     pkt_ptr->pts_ = pkt_ptr->dts_ + ts_delta;
     if (support_flv_media_hdr_) {
         pkt_ptr->fmt_type_ = MEDIA_FORMAT_FLV;
-        pkt_ptr->buffer_ptr_->AppendData((const char*)data, data_len);
+        if (pkt_ptr->codec_type_ == MEDIA_CODEC_H265 &&
+            !(data[0] & 0x80)) {
+            std::vector<uint8_t> ex;
+            size_t payload_off = 0;
+            if (NormalizeH265FlvVideoBody(data, data_len, &ex, &payload_off)) {
+                pkt_ptr->flv_offset_ = payload_off;
+                pkt_ptr->buffer_ptr_->AppendData(
+                    reinterpret_cast<const char *>(ex.data()), ex.size());
+            } else {
+                pkt_ptr->buffer_ptr_->AppendData((const char*)data, data_len);
+            }
+        } else {
+            pkt_ptr->buffer_ptr_->AppendData((const char*)data, data_len);
+        }
     } else {
         pkt_ptr->fmt_type_ = MEDIA_FORMAT_RAW;
 
