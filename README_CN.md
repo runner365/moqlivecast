@@ -15,6 +15,8 @@
   入口兼容旧 `CodecID=0x0C`，统一归一化为 enhanced hvc1。
   浏览器 H.265 推流仅在 Chrome WebCodecs 报告支持 HEVC 编码时显示选项；
   本版本不包含集群/moq-lite 的 H.265。
+- **Web 客户端（`tools/moq_js_client`）** —— Vue 3 + Vite；
+  MoQ 推流/拉流（H.264/H.265 WebCodecs）、WebTransport FLV、HTTP-FLV、WebSocket-FLV
 - **WebTransport FLV** 推流 / 拉流
 - **HTTP-FLV 拉流**，与 WebTransport 共用同一端口（UDP + TCP）
 - **WebSocket-FLV 拉流** —— 独立 TCP 端口上的 WS/WSS 二进制 FLV tag，
@@ -146,7 +148,11 @@ log:
   console: false
 ```
 
-### 浏览器 Demo
+### 浏览器客户端（`tools/moq_js_client`）
+
+`tools/moq_js_client` 是一个 Vue 3 + Vite 的 Web 客户端，可以直接在 Chrome
+里推流和拉流。MoQ 走 WebTransport，H.264/H.265 解码走 WebCodecs，
+HTTP-FLV / WebSocket-FLV 的 H.264 路径走 flv.js。
 
 ```bash
 cd tools/moq_js_client
@@ -156,17 +162,41 @@ npm run dev
 
 Vite 默认监听 `http://127.0.0.1:5174`。
 
-| 路径 | 用途 |
-|---|---|
-| `/moq` | MoQ Transport（draft-22）推流 |
-| `/moq-pull` | MoQ Transport（draft-22）拉流 |
-| `/flv` | WebTransport FLV 推流 |
-| `/pull` | WebTransport FLV 拉流 |
-| `/http-flv` | HTTP-FLV 拉流 |
-| `/ws-flv` | WebSocket-FLV 拉流 |
+| 路径 | 用途 | 编解码 |
+|---|---|---|
+| `/moq` | MoQ Transport（draft-22）推流 | H.264/H.265 + AAC |
+| `/moq-pull` | MoQ Transport（draft-22）拉流 | H.264/H.265（WebCodecs） |
+| `/flv` | WebTransport FLV 推流 | H.264 + AAC |
+| `/pull` | WebTransport FLV 拉流 | H.264 + AAC |
+| `/http-flv` | HTTP-FLV 拉流 | H.264（flv.js） |
+| `/ws-flv` | WebSocket-FLV 拉流 | H.264（flv.js） |
 
-> 修改 C++ 代码后需要重新编译并重启 `moqlivecast`；
-> 浏览器 Demo 不会自动连接新启动的服务端。
+**MoQ 推流**
+
+- 页面启动时通过 `VideoEncoder.isConfigSupported()` 检测当前 Chrome 是否
+  支持 HEVC 编码。
+- 支持时显示视频编码下拉框，包含 **H.264 / H.265**，默认选择 H.264。
+- 不支持时整个下拉框不显示，默认按 H.264 推流。
+- H.265 使用 WebCodecs 的 `hevc` 输出（hvcC + HEVC access unit），音频仍然
+  使用 AAC 编码。
+
+**MoQ 拉流**
+
+- WebCodecs 模式支持 H.264 和 H.265；H.265 需要 Chrome 的 HEVC WebCodecs
+  解码能力（Chrome 107+，且 GPU/系统支持）。
+- H.265 会从 `LOC_VIDEO_CONFIG` 自动识别 hvcC，使用 `hvc1.*` 配置
+  `VideoDecoder`，并去掉 Chrome 兼容性较差的非 VPS/SPS/PPS array。
+- flv.js 模式只支持 H.264。
+
+**HTTP-FLV / WebSocket-FLV**
+
+- 目前使用 flv.js，只支持 H.264。
+- 本版本不包含这两条浏览器路径的 H.265 播放；浏览器上播放 H.265 请使用
+  MoQ Pull 的 WebCodecs 模式。
+
+> 客户端的默认地址和 URL 辅助函数位于 `tools/moq_js_client/src/config.ts`。
+> 修改 C++ 代码后需要重新编译并重启 `moqlivecast`；浏览器客户端不会自动连接
+> 新启动的服务端。WebTransport 要求证书 hostname 与 Chrome 中打开的 URL 一致。
 
 ### Android 推流 Demo
 
@@ -356,11 +386,11 @@ moq-lite-06 裸 QUIC 线格式。
 | `moqlivecast/cluster/` | Edge 侧集群：发现、上推、按需回源 |
 | `wt2ws/` | WebTransport ↔ WebSocket 中继（最后一公里）—— **[说明](wt2ws/README.md)**（Vue 测试客户端 + Python echo 后端） |
 | `wt2ws/StreamVox/` | WebSocket 语音 Agent（兼容 OpenAI Realtime 事件）—— **[说明](wt2ws/StreamVox/README.md)** |
-| `moq_transport_client/` | C SDK：**moq-transport draft-22**，H.264 + AAC 推流/拉流（WebTransport）—— **[说明](moq_transport_client/README.md)** |
+| `moq_transport_client/` | C SDK：**moq-transport draft-22**，H.264/H.265 + AAC 推流/拉流（WebTransport）—— **[说明](moq_transport_client/README.md)** |
 | `moqlite/` | **独立的** moq-lite-06 客户端 C 库（裸 QUIC，不是 moq-transport）—— **[推流客户端开发指南](moqlite/how_to_use_moq_lite_c_api_CN.md)** · [English](moqlite/how_to_use_moq_lite_c_api.md) |
-| `tools/moq_js_client/` | 浏览器推流 / 拉流 Demo（moq-transport over WebTransport） |
+| `tools/moq_js_client/` | Vue 浏览器客户端：MoQ 推流/拉流（H.264/H.265 WebCodecs）、WebTransport FLV、HTTP-FLV、WebSocket-FLV |
 | `tools/android/` | Android 推流客户端（Camera2 + 麦克风 → moq-lite-06）—— **[使用指南](tools/android/how_to_use_android_moqlit_push.md)** |
-| `tools/moqtransport2flv_client/` | **moq-transport draft-22** 拉流 → H.264/AAC FLV 文件（使用 C SDK） |
+| `tools/moqtransport2flv_client/` | **moq-transport draft-22** 拉流 → H.264/H.265 + AAC FLV 文件（使用 C SDK） |
 | `tools/flv2moqtransport_client/` | FLV 文件 → **moq-transport draft-22** 推流（使用 C SDK） |
 | `tools/flv2moq_client/` | FLV 文件 → **moq-transport（draft-22）over WebTransport** 推流（C++） |
 | `tools/flv2moqlite_client/` | FLV 文件 → **moq-lite-06** 推流（C++，用的就是 `moqlite/` 的 C API）|

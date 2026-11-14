@@ -2,7 +2,7 @@
 
 **English** | [简体中文](README_CN.md)
 
-A live media stack built on a from-scratch C implementation of QUIC, HTTP/3, and WebTransport. The server binary is `moqlivecast`. A Vue demo in `tools/moq_js_client` can publish and play from the browser.
+A live media stack built on a from-scratch C implementation of QUIC, HTTP/3, and WebTransport. The server binary is `moqlivecast`. A Vue web client in `tools/moq_js_client` can publish and play from the browser.
 
 ## Features
 
@@ -13,6 +13,8 @@ A live media stack built on a from-scratch C implementation of QUIC, HTTP/3, and
   legacy `CodecID=0x0C` is accepted on ingest and normalised to enhanced hvc1.
   Browser H.265 publishing is offered only when Chrome WebCodecs reports HEVC
   encode support; cluster/moq-lite H.265 is not included in this version.
+- **Web client (`tools/moq_js_client`)** — Vue 3 + Vite; MoQ Push/Pull with
+  WebCodecs H.264/H.265, WebTransport FLV, HTTP-FLV and WebSocket-FLV
 - **WebTransport FLV** Push / Pull
 - **HTTP-FLV Pull** on the same port as WebTransport (UDP + TCP)
 - **WebSocket-FLV Pull** — WS/WSS binary FLV tags on a dedicated TCP port
@@ -141,7 +143,12 @@ log:
   console: false
 ```
 
-### Browser demo
+### Browser client (`tools/moq_js_client`)
+
+`tools/moq_js_client` is a Vue 3 + Vite web client for publishing and playing
+the server's streams directly from Chrome. It uses WebTransport for MoQ,
+WebCodecs for H.264/H.265 decode, and flv.js for the H.264 HTTP-FLV /
+WebSocket-FLV paths.
 
 ```bash
 cd tools/moq_js_client
@@ -151,16 +158,44 @@ npm run dev
 
 Vite listens on `http://127.0.0.1:5174`.
 
-| Path | Role |
-|---|---|
-| `/moq` | MoQ Transport (draft-22) Push |
-| `/moq-pull` | MoQ Transport (draft-22) Pull |
-| `/flv` | WebTransport FLV Push |
-| `/pull` | WebTransport FLV Pull |
-| `/http-flv` | HTTP-FLV Pull |
-| `/ws-flv` | WebSocket-FLV Pull |
+| Path | Role | Codec |
+|---|---|---|
+| `/moq` | MoQ Transport (draft-22) Push | H.264/H.265 + AAC |
+| `/moq-pull` | MoQ Transport (draft-22) Pull | H.264/H.265 (WebCodecs) |
+| `/flv` | WebTransport FLV Push | H.264 + AAC |
+| `/pull` | WebTransport FLV Pull | H.264 + AAC |
+| `/http-flv` | HTTP-FLV Pull | H.264 via flv.js |
+| `/ws-flv` | WebSocket-FLV Pull | H.264 via flv.js |
 
-After changing C++ code, rebuild and restart `moqlivecast`. The browser demo does not pick up a new server by itself.
+**MoQ Push**
+
+- The page probes HEVC encode support with
+  `VideoEncoder.isConfigSupported()` when it loads.
+- If HEVC encoding is supported, a video selector appears with **H.264 and
+  H.265**; H.264 is the default.
+- If HEVC encoding is not supported, the selector is hidden and H.264 is used.
+- H.265 uses WebCodecs HEVC output (`hevc` bitstream with hvcC), and the same
+  page still publishes AAC audio.
+
+**MoQ Pull**
+
+- WebCodecs mode supports both H.264 and H.265. H.265 requires Chrome's
+  HEVC WebCodecs decoder (Chrome 107+ with a supported GPU).
+- For H.265, the client detects hvcC in `LOC_VIDEO_CONFIG`, configures the
+  decoder as `hvc1.*`, and removes non-VPS/SPS/PPS hvcC arrays for Chrome
+  compatibility.
+- flv.js mode is H.264-only.
+
+**HTTP-FLV / WebSocket-FLV**
+
+- These pages currently use flv.js and therefore support H.264 only.
+- H.265 playback for these two browser paths is not included in this version;
+  use MoQ Pull with WebCodecs for browser H.265 playback.
+
+> The client defaults and URL helpers live in `tools/moq_js_client/src/config.ts`.
+> After changing C++ code, rebuild and restart `moqlivecast`; the browser demo
+> does not pick up a new server by itself. WebTransport requires a certificate
+> whose hostname matches the URL opened in Chrome.
 
 ### Android push demo
 
@@ -176,7 +211,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 In the app, enter the server's **LAN IP** (e.g. `moql://192.168.1.143:4433/anon`)
 and a broadcast name (default `android.hang`), grant camera + microphone, and
-press **Start**. Pull it in the browser demo at `/moq-pull` with:
+press **Start**. Pull it in the web client at `/moq-pull` with:
 
 ```
 https://<server-host>:4433/moq?app=anon&stream=android.hang
@@ -368,11 +403,11 @@ draft specifies and it will not interoperate.
 | `moqlivecast/cluster/` | Edge-side cluster: discovery, upstream push, on-demand pull |
 | `wt2ws/` | WebTransport ↔ WebSocket relay for the last mile — **[guide](wt2ws/README.md)** (Vue test client + Python echo backend) |
 | `wt2ws/StreamVox/` | WebSocket voice agent (OpenAI Realtime-compatible) — **[guide](wt2ws/StreamVox/README.md)** |
-| `moq_transport_client/` | C SDK for **moq-transport draft-22** (H.264 + AAC publish/subscribe over WebTransport) — **[guide](moq_transport_client/README.md)** |
+| `moq_transport_client/` | C SDK for **moq-transport draft-22** (H.264/H.265 + AAC publish/subscribe over WebTransport) — **[guide](moq_transport_client/README.md)** |
 | `moqlite/` | **separate** moq-lite-06 C client library (bare QUIC, not moq-transport) — **[guide: writing a push client](moqlite/how_to_use_moq_lite_c_api.md)** · [中文](moqlite/how_to_use_moq_lite_c_api_CN.md) |
-| `tools/moq_js_client/` | Browser publish / play demo (moq-transport over WebTransport) |
+| `tools/moq_js_client/` | Vue browser client: MoQ Push/Pull (H.264/H.265 WebCodecs), WebTransport FLV, HTTP-FLV and WebSocket-FLV |
 | `tools/android/` | Android push client (Camera2 + mic → moq-lite-06) — **[guide](tools/android/how_to_use_android_moqlit_push.md)** |
-| `tools/moqtransport2flv_client/` | **moq-transport draft-22** pull → H.264/AAC FLV file, using the C SDK |
+| `tools/moqtransport2flv_client/` | **moq-transport draft-22** pull → H.264/H.265 + AAC FLV file, using the C SDK |
 | `tools/flv2moqtransport_client/` | FLV file → **moq-transport draft-22** publish using the C SDK |
 | `tools/flv2moq_client/` | FLV file → **moq-transport (draft-22) over WebTransport** push (C++) |
 | `tools/flv2moqlite_client/` | FLV file → **moq-lite-06** push (C++, uses the `moqlite/` C API) |
