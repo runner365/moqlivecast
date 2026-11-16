@@ -414,7 +414,8 @@ moq-transport over WebTransport、HTTP-FLV、RTMP 都能播放回源来的流。
 [集群（Edge / Center）](#集群edge--center)。
 
 **尚未完成**：MoQ catalog / 控制平面的完整度（`GOAWAY` 等控制消息目前只解析、不处理）；
-catalog 更新对已连接的 moq-lite-06 订阅方生效；RTMPS 与推流鉴权。
+catalog 更新对已连接的 moq-lite-06 订阅方生效。面向音视频通话的 datagram / 不可靠媒体
+模式目前是规划项，本版本尚未实现。
 
 RTMP 的发布端仲裁已与 moq-lite-06 / MOQ 对齐：同一 `app/stream` 同时只有一个
 publisher，新连接顶替旧连接（带 10 秒内 3 次的防抖），旧会话停止写帧并被断开；
@@ -422,7 +423,23 @@ publisher，新连接顶替旧连接（带 10 秒内 3 次的防抖），旧会�
 
 ## 路线图
 
-**集群加固** —— 两级链路已经端到端跑通，但还有几处要补：
+### 下一版：Datagram / 弱网实时媒体
+
+可靠流仍然是直播的默认路径。下一个里程碑增加一条明确允许丢包的媒体通道，
+面向音视频通话：
+
+- 支持 QUIC DATAGRAM（RFC 9221），以及浏览器侧的 WebTransport datagram；
+- 按轨道选择可靠性：可靠流或 datagram；
+- catalog、控制信令仍然走可靠流；关键帧可以走可靠流，或在应用层做分片；
+- 按 MTU 分包并做发送 pacing，datagram 路径不做 QUIC 重传；
+- 面向 1 对 1 和小规模群聊的通话 profile，允许音频/视频丢包和抖动；
+- 增加丢包、抖动、单向延迟和降级行为的观测指标。
+
+datagram 是新增模式，不是替换现有直播链路的可靠传输。
+
+### 之后：集群加固
+
+两级链路已经端到端跑通，但还有几处要补：
 
 - Edge↔Center 链路的 TLS 是 `SSL_VERIFY_NONE`（和仓库里其它客户端一样），
   链路上也没有鉴权；暂时不要把回源端口暴露到不可信网络。
@@ -431,8 +448,9 @@ publisher，新连接顶替旧连接（带 10 秒内 3 次的防抖），旧会�
 - 链路协议只实现了 moq-lite-06（`cluster.protocol: rtmp` 会被拒绝），
   也还没有多级 / mesh 拓扑。
 
-之后是：catalog 与控制平面的完整度、对已连接 moq-lite-06 订阅方的 catalog 实时更新、
-RTMPS 与推流鉴权。
+### 后续：控制平面
+
+catalog 与控制平面的完整度，以及对已连接 moq-lite-06 订阅方的 catalog 实时更新。
 
 ## License
 

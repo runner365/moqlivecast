@@ -429,14 +429,34 @@ plain center, announces the center's broadcasts to its local clients, and pulls 
 missing stream on demand — playback on the edge works over moq-lite-06,
 moq-transport over WebTransport, HTTP-FLV and RTMP. See [Cluster (edge / origin)](#cluster-edge--origin).
 
-Not finished: MoQ catalog / control-plane completeness (`GOAWAY` and other
-control messages are parsed but not acted on); catalog updates for
-already-connected moq-lite-06 subscribers; RTMPS and push authentication.
+Still open: MoQ catalog / control-plane completeness (`GOAWAY` and other
+control messages are parsed but not acted on) and catalog updates for
+already-connected moq-lite-06 subscribers. Datagram / unreliable media for
+interactive calls is planned and not implemented in this snapshot.
 
 ## Roadmap
 
-**Cluster hardening** — the two-tier path works end to end, but the link still
-has room to grow:
+### Next: Datagram / unreliable media for interactive calls
+
+The reliable stream path remains the default for live streaming. The next
+milestone adds an explicitly loss-tolerant media path for audio/video calls:
+
+- QUIC DATAGRAM (RFC 9221), plus WebTransport datagrams for browser clients.
+- Per-track reliability choice: reliable stream or datagram.
+- Keep catalog and control signaling on reliable streams; keyframes can use the
+  reliable stream or application-level fragmentation.
+- MTU-aware packetization and pacing; the datagram path does not use QUIC
+  retransmission.
+- A call-oriented profile for 1:1 and small group calls, with audio/video that
+  tolerates loss and jitter.
+- Metrics for loss, jitter, one-way delay, and fallback behavior.
+
+Datagram mode is an additional mode, not a replacement for reliable live
+streaming.
+
+### After that: Cluster hardening
+
+The two-tier path works end to end, but the link still has room to grow:
 
 - TLS on the edge↔center link is `SSL_VERIFY_NONE` (like every other client in
   this repo) and the link has no authentication; don't expose it to an untrusted
@@ -446,8 +466,10 @@ has room to grow:
 - Only the moq-lite-06 link protocol is implemented (`cluster.protocol: rtmp` is
   rejected), and there is no multi-level or mesh topology yet.
 
-After that: catalog and control-plane completeness, live catalog updates for
-connected moq-lite-06 subscribers, RTMPS and push authentication.
+### Later: control plane
+
+Catalog and control-plane completeness, and live catalog updates for connected
+moq-lite-06 subscribers.
 
 ## License
 
