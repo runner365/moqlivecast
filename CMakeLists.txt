@@ -39,8 +39,49 @@ elseif(UNIX)
     endif()
 endif()
 
+# ---- QNX 8.0 交叉编译支持 ----
+# QNX 也是 UNIX，上面的分支会选对 OPENSSL_TARGET，但 Configure 不会自动用 qcc，
+# 且 OpenSSL 默认构建包含 Linux 专有组件（AF_ALG 引擎）与 apps/tests。
+if(CMAKE_SYSTEM_NAME STREQUAL "QNX")
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+        set(_qcc_variant "gcc_ntoaarch64le")
+        set(_qnx_ar      "ntoaarch64-ar")
+        set(_qnx_ranlib  "ntoaarch64-ranlib")
+    else()
+        set(_qcc_variant "gcc_ntox86_64")
+        set(_qnx_ar      "ntox86_64-ar")
+        set(_qnx_ranlib  "ntox86_64-ranlib")
+    endif()
+    # qcc 不认识 -MF（会把依赖文件名当成第二个输入文件），用包装脚本过滤
+    set(OPENSSL_CC_ARG     "CC=${CMAKE_CURRENT_SOURCE_DIR}/../scripts/qcc-nodep -V${_qcc_variant}")
+    set(OPENSSL_AR_ARG     "AR=${_qnx_ar}")
+    set(OPENSSL_RANLIB_ARG "RANLIB=${_qnx_ranlib}")
+    set(OPENSSL_EXTRA_OPTS no-shared no-tests no-asm no-async no-afalgeng)
+    set(OPENSSL_BUILD_CMD  ${CMAKE_MAKE_PROGRAM} build_libs)
+else()
+    set(OPENSSL_CC_ARG "")
+    set(OPENSSL_AR_ARG "")
+    set(OPENSSL_RANLIB_ARG "")
+    set(OPENSSL_EXTRA_OPTS no-shared)
+    set(OPENSSL_BUILD_CMD  make -j${NPROC})
+    set(OPENSSL_INSTALL_CMD make install_sw)
+endif()
+
 set(OPENSSL_SRC_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/openssl-3.5.8")
 set(OPENSSL_INSTALL_DIR "${CMAKE_BINARY_DIR}/openssl_install")
+
+# QNX: 只构建了 build_libs，没有 apps，所以不能用 make install_sw，
+# 直接拷贝 include 和两个静态库到安装目录。
+if(CMAKE_SYSTEM_NAME STREQUAL "QNX")
+    set(OPENSSL_INSTALL_CMD
+        ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_BINARY_DIR}/openssl_ext-prefix/src/openssl_ext-build/include
+            ${OPENSSL_INSTALL_DIR}/include
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_BINARY_DIR}/openssl_ext-prefix/src/openssl_ext-build/libssl.a
+            ${CMAKE_BINARY_DIR}/openssl_ext-prefix/src/openssl_ext-build/libcrypto.a
+            ${OPENSSL_INSTALL_DIR}/lib/)
+endif()
 
 # 提前创建目录，避免 IMPORTED target 因路径不存在而报错
 file(MAKE_DIRECTORY ${OPENSSL_INSTALL_DIR}/include)
@@ -60,9 +101,12 @@ ExternalProject_Add(openssl_ext
                       --prefix=${OPENSSL_INSTALL_DIR}
                       --openssldir=${OPENSSL_INSTALL_DIR}
                       --libdir=lib
-                      no-shared
-    BUILD_COMMAND     make -j${NPROC}
-    INSTALL_COMMAND   make install_sw
+                      ${OPENSSL_EXTRA_OPTS}
+                      ${OPENSSL_CC_ARG}
+                      ${OPENSSL_AR_ARG}
+                      ${OPENSSL_RANLIB_ARG}
+    BUILD_COMMAND     ${OPENSSL_BUILD_CMD}
+    INSTALL_COMMAND   ${OPENSSL_INSTALL_CMD}
     BUILD_BYPRODUCTS  ${OPENSSL_INSTALL_DIR}/lib/libssl.a
                       ${OPENSSL_INSTALL_DIR}/lib/libcrypto.a
 )
