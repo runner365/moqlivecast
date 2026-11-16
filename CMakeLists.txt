@@ -72,9 +72,17 @@ set(OPENSSL_INSTALL_DIR "${CMAKE_BINARY_DIR}/openssl_install")
 
 # QNX: 只构建了 build_libs，没有 apps，所以不能用 make install_sw，
 # 直接拷贝 include 和两个静态库到安装目录。
+#
+# 注意：build/include 只有 Configure 生成的公共头（ssl.h 等），
+# 不带源码树里的公共头（例如 OpenSSL 3.5 的 e_ostime.h）。
+# 先铺源码 include，再用 build/include 覆盖生成头；否则编译器会看到
+# ssl.h 里的 #include <openssl/e_ostime.h>，但安装目录里没有该文件。
 if(CMAKE_SYSTEM_NAME STREQUAL "QNX")
     set(OPENSSL_INSTALL_CMD
         ${CMAKE_COMMAND} -E copy_directory
+            ${OPENSSL_SRC_DIR}/include
+            ${OPENSSL_INSTALL_DIR}/include
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${CMAKE_BINARY_DIR}/openssl_ext-prefix/src/openssl_ext-build/include
             ${OPENSSL_INSTALL_DIR}/include
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
