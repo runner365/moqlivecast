@@ -376,10 +376,10 @@ done:
 
 
 static int uv__get_process_title(void) {
-  WCHAR title_w[MAX_TITLE_LENGTH];
+  WCHAR title_w[MAX_PATH];
   DWORD wlen;
 
-  wlen = GetConsoleTitleW(title_w, sizeof(title_w) / sizeof(WCHAR));
+  wlen = GetModuleFileNameW(NULL, title_w, MAX_PATH);
   if (wlen == 0)
     return uv_translate_sys_error(GetLastError());
 
@@ -509,14 +509,14 @@ unsigned int uv_available_parallelism(void) {
   DWORD_PTR procmask;
   DWORD_PTR sysmask;
   int count;
-  int i;
+  unsigned int i;
 
   /* TODO(bnoordhuis) Use GetLogicalProcessorInformationEx() to support systems
    * with > 64 CPUs? See https://github.com/libuv/libuv/pull/3458
    */
   count = 0;
   if (GetProcessAffinityMask(GetCurrentProcess(), &procmask, &sysmask))
-    for (i = 0; i < 8 * sizeof(procmask); i++)
+    for (i = 0; i < 8u * sizeof(procmask); i++)
       count += 1 & (procmask >> i);
 
   if (count > 0)
@@ -627,7 +627,7 @@ int uv_cpu_info(uv_cpu_info_t** cpu_infos_ptr, int* cpu_count_ptr) {
 
     uv__convert_utf16_to_utf8(cpu_brand,
                               cpu_brand_size / sizeof(WCHAR),
-                              &(cpu_info->model));
+                              (char**) &(cpu_info->model));
   }
 
   uv__free(sppi);
@@ -639,12 +639,8 @@ int uv_cpu_info(uv_cpu_info_t** cpu_infos_ptr, int* cpu_count_ptr) {
 
  error:
   if (cpu_infos != NULL) {
-    /* This is safe because the cpu_infos array is zeroed on allocation. */
-    for (i = 0; i < cpu_count; i++)
-      uv__free(cpu_infos[i].model);
+    uv_free_cpu_info(cpu_infos, cpu_count);
   }
-
-  uv__free(cpu_infos);
   uv__free(sppi);
 
   return uv_translate_sys_error(err);
@@ -864,12 +860,6 @@ int uv_interface_addresses(uv_interface_address_t** addresses_ptr,
   *count_ptr = count;
 
   return 0;
-}
-
-
-void uv_free_interface_addresses(uv_interface_address_t* addresses,
-    int count) {
-  uv__free(addresses);
 }
 
 
@@ -1281,7 +1271,7 @@ fail:
   FreeEnvironmentStringsW(env);
 
   for (i = 0; i < cnt; i++) {
-    envitem = &(*envitems)[cnt];
+    envitem = &(*envitems)[i];
     uv__free(envitem->name);
   }
   uv__free(*envitems);
@@ -1519,20 +1509,26 @@ int uv_os_setpriority(uv_pid_t pid, int priority) {
 }
 
 int uv_thread_getpriority(uv_thread_t tid, int* priority) {
+  DWORD err;
   int r;
 
   if (priority == NULL)
     return UV_EINVAL;
 
   r = GetThreadPriority(tid);
-  if (r == THREAD_PRIORITY_ERROR_RETURN)
-    return uv_translate_sys_error(GetLastError());
+  if (r == THREAD_PRIORITY_ERROR_RETURN) {
+    err = GetLastError();
+    if (err == ERROR_INVALID_HANDLE)
+      return UV_ESRCH;
+    return uv_translate_sys_error(err);
+  }
 
   *priority = r;
   return 0;
 }
 
 int uv_thread_setpriority(uv_thread_t tid, int priority) {
+  DWORD err;
   int r;
 
   switch (priority) {
@@ -1555,8 +1551,12 @@ int uv_thread_setpriority(uv_thread_t tid, int priority) {
       return 0;
   }
 
-  if (r == 0)
-    return uv_translate_sys_error(GetLastError());
+  if (r == 0) {
+    err = GetLastError();
+    if (err == ERROR_INVALID_HANDLE)
+      return UV_ESRCH;
+    return uv_translate_sys_error(err);
+  }
 
   return 0;
 }
@@ -1703,6 +1703,9 @@ int uv_os_uname(uv_utsname_t* buffer) {
     case PROCESSOR_ARCHITECTURE_ARM:
       uv__strscpy(buffer->machine, "arm", sizeof(buffer->machine));
       break;
+    case PROCESSOR_ARCHITECTURE_ARM64:
+      uv__strscpy(buffer->machine, "arm64", sizeof(buffer->machine));
+      break;
     default:
       uv__strscpy(buffer->machine, "unknown", sizeof(buffer->machine));
       break;
@@ -1735,8 +1738,11 @@ int uv_gettimeofday(uv_timeval64_t* tv) {
   return 0;
 }
 
-int uv__random_rtlgenrandom(void* buf, size_t buflen) {
+int uv__random_winrandom(void* buf, size_t buflen) {
   if (buflen == 0)
+    return 0;
+
+  if (pProcessPrng != NULL && pProcessPrng(buf, buflen))
     return 0;
 
   if (SystemFunction036(buf, buflen) == FALSE)

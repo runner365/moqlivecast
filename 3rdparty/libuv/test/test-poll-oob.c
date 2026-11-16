@@ -68,7 +68,7 @@ static void idle_cb(uv_idle_t* idle) {
 static void poll_cb(uv_poll_t* handle, int status, int events) {
   char buffer[5];
   int n;
-  int fd;
+  uv_os_fd_t fd;
 
   ASSERT_OK(uv_fileno((uv_handle_t*)handle, &fd));
   memset(buffer, 0, 5);
@@ -91,8 +91,8 @@ static void poll_cb(uv_poll_t* handle, int status, int events) {
       while (n == -1 && errno == EINTR);
       ASSERT(n >= 0 || errno != EINVAL);
       if (cli_rd_check == 1) {
-        ASSERT_OK(strncmp(buffer, "world", n));
         ASSERT_EQ(5, n);
+        ASSERT_OK(strncmp(buffer, "world", n));
         cli_rd_check = 2;
       }
       if (cli_rd_check == 0) {
@@ -202,6 +202,9 @@ TEST_IMPL(poll_oob) {
    * through POLLIN.
    */
   ASSERT_EQ(1, srv_rd_check);
+
+  /* uv_poll_init() does not take ownership of the socket. */
+  ASSERT_OK(close(client_fd));
 
   MAKE_VALGRIND_HAPPY(loop);
   return 0;

@@ -4164,6 +4164,10 @@ typedef struct _REPARSE_DATA_BUFFER {
       WCHAR PathBuffer[1];
     } SymbolicLinkReparseBuffer;
     struct {
+      ULONG Version;
+      UCHAR PathBuffer[1];
+    } LinuxSymbolicLinkReparseBuffer;
+    struct {
       USHORT SubstituteNameOffset;
       USHORT SubstituteNameLength;
       USHORT PrintNameOffset;
@@ -4582,6 +4586,9 @@ typedef struct _SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION {
 #ifndef IO_REPARSE_TAG_SYMLINK
 # define IO_REPARSE_TAG_SYMLINK (0xA000000CL)
 #endif
+#ifndef IO_REPARSE_TAG_LX_SYMLINK
+# define IO_REPARSE_TAG_LX_SYMLINK (0xA000001DL)
+#endif
 #ifndef IO_REPARSE_TAG_APPEXECLINK
 # define IO_REPARSE_TAG_APPEXECLINK (0x8000001BL)
 #endif
@@ -4751,6 +4758,8 @@ typedef DWORD (WINAPI *sPowerRegisterSuspendResumeNotification)
                HANDLE        Recipient,
                _PHPOWERNOTIFY RegistrationHandle);
 
+typedef BOOL (WINAPI *sProcessPrng)(/*_Out_*/PBYTE pbData, SIZE_T cbData);
+
 /* from Winuser.h */
 typedef VOID (CALLBACK* WINEVENTPROC)
              (HWINEVENTHOOK hWinEventHook,
@@ -4776,6 +4785,9 @@ typedef struct _TCP_INITIAL_RTO_PARAMETERS {
   UCHAR  MaxSynRetransmissions;
 } TCP_INITIAL_RTO_PARAMETERS, *PTCP_INITIAL_RTO_PARAMETERS;
 
+#ifndef TCP_INITIAL_RTO_DEFAULT_RTT
+# define TCP_INITIAL_RTO_DEFAULT_RTT 0
+#endif
 #ifndef TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS
 # define TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS ((UCHAR) -2)
 #endif
@@ -4814,6 +4826,9 @@ extern sNtQueryInformationProcess pNtQueryInformationProcess;
 
 /* Powrprof.dll function pointer */
 extern sPowerRegisterSuspendResumeNotification pPowerRegisterSuspendResumeNotification;
+
+/* bcryptprimitives.dll function pointer */
+extern sProcessPrng pProcessPrng;
 
 /* User32.dll function pointer */
 extern sSetWinEventHook pSetWinEventHook;

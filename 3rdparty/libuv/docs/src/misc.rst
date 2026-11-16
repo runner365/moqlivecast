@@ -281,13 +281,13 @@ API
     do so automatically when it is unloaded but it can be instructed to perform
     cleanup manually.
 
-    .. warning:: Only call :c:func:`uv_library_shutdown()` once.
+    .. warning:: Only call :c:func:`uv_library_shutdown` once.
 
-    .. warning:: Don't call :c:func:`uv_library_shutdown()` when there are
+    .. warning:: Don't call :c:func:`uv_library_shutdown` when there are
                  still event loops or I/O requests active.
 
     .. warning:: Don't call libuv functions after calling
-                 :c:func:`uv_library_shutdown()`.
+                 :c:func:`uv_library_shutdown`.
 
 .. c:function:: uv_buf_t uv_buf_init(char* base, unsigned int len)
 
@@ -296,6 +296,13 @@ API
     Due to platform differences the user cannot rely on the ordering of the
     `base` and `len` members of the uv_buf_t struct. The user is responsible for
     freeing `base` after the uv_buf_t is done. Return struct passed by value.
+
+   .. warning:: It is discouraged to set `len` to a large value as that may
+                result in spurious failures.  Specifically, Windows may fail on
+                writes larger than about 511 MB, and various Unicies may fail
+                on I/O larger than about 2 GB (0x7ffff000 bytes). Instead it is
+                generally better to split the data into multiple `uv_write`
+                calls (attach the `write_cb` to the last one).
 
 .. c:function:: char** uv_setup_args(int argc, char** argv)
 
@@ -521,6 +528,10 @@ API
 
     Gets the executable path. You *must* call `uv_setup_args` before calling
     this function.
+
+    Be careful in setuid executables. On some platforms the executable path
+    is an arbitrary string that is controlled by the user. On other platforms
+    environment variables are consulted that may be under control of the user.
 
 .. c:function:: int uv_cwd(char* buffer, size_t* size)
 
@@ -892,6 +903,16 @@ API
 
     .. versionadded:: 1.34.0
 
+.. code-block:: c
+    #include <uv.h>
+    #include <stdio.h>
+    int main() {
+        printf("Sleeping for 1 second...\n");
+        uv_sleep(1000);
+        printf("Awake!\n");
+        return 0;
+    }
+
 String manipulation functions
 -----------------------------
 
@@ -913,7 +934,7 @@ is not complete.
     `utf16_len` count (in characters) gives the length of `utf16`. If `utf16`
     is NUL terminated, `utf16_len` can be set to -1, otherwise it must be
     specified. If `wtf8_ptr` is `NULL`, no result will be computed, but the
-    length (equal to `uv_utf16_length_as_wtf8`) will be stored in `wtf8_ptr`.
+    length (equal to `uv_utf16_length_as_wtf8`) will be stored in `wtf8_len_ptr`.
     If `*wtf8_ptr` is `NULL`, space for the conversion will be allocated and
     returned in `wtf8_ptr` and the length will be returned in `wtf8_len_ptr`.
     Otherwise, the length of `*wtf8_ptr` must be passed in `wtf8_len_ptr`. The

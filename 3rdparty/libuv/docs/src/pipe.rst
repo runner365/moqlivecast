@@ -94,7 +94,7 @@ API
         Paths on Unix get truncated to ``sizeof(sockaddr_un.sun_path)`` bytes,
         typically between 92 and 108 bytes.
 
-.. c:function:: void uv_pipe_connect2(uv_connect_t* req, uv_pipe_t* handle, const char* name, size_t namelen, unsigned int flags, uv_connect_cb cb)
+.. c:function:: int uv_pipe_connect2(uv_connect_t* req, uv_pipe_t* handle, const char* name, size_t namelen, unsigned int flags, uv_connect_cb cb)
 
     Connect to the Unix domain socket or the Windows named pipe.
 
@@ -119,6 +119,10 @@ API
     of the buffer and it's set to the number of bytes written to the buffer on
     output. If the buffer is not big enough ``UV_ENOBUFS`` will be returned and
     len will contain the required size.
+
+    UNIX domain socket paths on FreeBSD cannot exceed the size of
+    ``sockaddr_un.sun_path`` although the platform defines a
+    ``SOCK_MAXADDRLEN`` that is larger.
 
     .. versionchanged:: 1.3.0 the returned length no longer includes the terminating null byte,
                         and the buffer is not null terminated.

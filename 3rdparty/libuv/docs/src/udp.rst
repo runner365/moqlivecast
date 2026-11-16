@@ -76,7 +76,8 @@ Data types
              */
             UV_UDP_REUSEPORT = 64,
             /*
-             * Indicates that recvmmsg should be used, if available.
+             * Indicates that recvmmsg should be used, if available. The uv_alloc_cb
+             * for this handle should create buffers that are multiples of 64 KiB.
              */
             UV_UDP_RECVMMSG = 256
         };
@@ -168,10 +169,27 @@ API
     The remaining bits can be used to set one of these flags:
 
     * `UV_UDP_RECVMMSG`: if set, and the platform supports it, :man:`recvmmsg(2)` will
-      be used.
+      be used. The :c:type:`uv_alloc_cb` for this handle should create
+      buffers that are multiples of 64 KiB.
 
     .. versionadded:: 1.7.0
     .. versionchanged:: 1.37.0 added the `UV_UDP_RECVMMSG` flag.
+
+.. c:function:: int uv_udp_open_ex(uv_udp_t* handle, uv_os_sock_t sock, unsigned int flags)
+
+    Opens an existing file descriptor or Windows SOCKET as a UDP handle.
+
+    :param handle: UDP handle. Should have been initialized with
+        :c:func:`uv_udp_init`.
+
+    :param sock: An existing socket to associate with the handle.
+
+    :param flags: Flags that control socket behavior,
+        ``UV_UDP_REUSEADDR``, and ``UV_UDP_REUSEPORT`` are supported.
+
+    :returns: 0 on success, or an error code < 0 on failure.
+
+    .. versionadded:: 1.52.0
 
 .. c:function:: int uv_udp_open(uv_udp_t* handle, uv_os_sock_t sock)
 
@@ -188,6 +206,10 @@ API
     .. note::
         The passed file descriptor or SOCKET is not checked for its type, but
         it's required that it represents a valid datagram socket.
+
+        Internally sets the SO_REUSEADDR socket option unconditionally. This
+        means the reuse flag is always enabled, regardless of user intent. For
+        more control use :c:func:`uv_udp_open_ex`.
 
 .. c:function:: int uv_udp_bind(uv_udp_t* handle, const struct sockaddr* addr, unsigned int flags)
 
@@ -314,7 +336,7 @@ API
     :param handle: UDP handle. Should have been initialized with
         :c:func:`uv_udp_init_ex` as either ``AF_INET`` or ``AF_INET6``, or have
         been bound to an address explicitly with :c:func:`uv_udp_bind`, or
-        implicitly with :c:func:`uv_udp_send()` or :c:func:`uv_udp_recv_start`.
+        implicitly with :c:func:`uv_udp_send` or :c:func:`uv_udp_recv_start`.
 
     :param on: 1 for on, 0 for off.
 
@@ -327,7 +349,7 @@ API
     :param handle: UDP handle. Should have been initialized with
         :c:func:`uv_udp_init_ex` as either ``AF_INET`` or ``AF_INET6``, or have
         been bound to an address explicitly with :c:func:`uv_udp_bind`, or
-        implicitly with :c:func:`uv_udp_send()` or :c:func:`uv_udp_recv_start`.
+        implicitly with :c:func:`uv_udp_send` or :c:func:`uv_udp_recv_start`.
 
     :param ttl: 1 through 255.
 
@@ -340,7 +362,7 @@ API
     :param handle: UDP handle. Should have been initialized with
         :c:func:`uv_udp_init_ex` as either ``AF_INET`` or ``AF_INET6``, or have
         been bound to an address explicitly with :c:func:`uv_udp_bind`, or
-        implicitly with :c:func:`uv_udp_send()` or :c:func:`uv_udp_recv_start`.
+        implicitly with :c:func:`uv_udp_send` or :c:func:`uv_udp_recv_start`.
 
     :param interface_addr: interface address.
 
@@ -353,7 +375,7 @@ API
     :param handle: UDP handle. Should have been initialized with
         :c:func:`uv_udp_init_ex` as either ``AF_INET`` or ``AF_INET6``, or have
         been bound to an address explicitly with :c:func:`uv_udp_bind`, or
-        implicitly with :c:func:`uv_udp_send()` or :c:func:`uv_udp_recv_start`.
+        implicitly with :c:func:`uv_udp_send` or :c:func:`uv_udp_recv_start`.
 
     :param on: 1 for on, 0 for off.
 
@@ -366,7 +388,7 @@ API
     :param handle: UDP handle. Should have been initialized with
         :c:func:`uv_udp_init_ex` as either ``AF_INET`` or ``AF_INET6``, or have
         been bound to an address explicitly with :c:func:`uv_udp_bind`, or
-        implicitly with :c:func:`uv_udp_send()` or :c:func:`uv_udp_recv_start`.
+        implicitly with :c:func:`uv_udp_send` or :c:func:`uv_udp_recv_start`.
 
     :param ttl: 1 through 255.
 
@@ -461,8 +483,8 @@ API
         `suggested_size` in `alloc_cb` for udp_recv is always set to the size of 1 max size dgram.
 
     .. versionchanged:: 1.35.0 added support for :man:`recvmmsg(2)` on supported platforms).
-                        The use of this feature requires a buffer larger than
-                        2 * 64KB to be passed to `alloc_cb`.
+                        The :c:type:`uv_alloc_cb` for this handle should create
+                        buffers that are multiples of 64 KiB.
     .. versionchanged:: 1.37.0 :man:`recvmmsg(2)` support is no longer enabled implicitly,
                         it must be explicitly requested by passing the `UV_UDP_RECVMMSG` flag to
                         :c:func:`uv_udp_init_ex`.

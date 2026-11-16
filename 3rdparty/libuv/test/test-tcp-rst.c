@@ -22,6 +22,11 @@
 #include "uv.h"
 #include "task.h"
 
+#ifdef _WIN32
+TEST_IMPL(tcp_rst) {
+  RETURN_SKIP("Unix only test");
+}
+#else  /* !_WIN32 */
 static uv_tcp_t tcp;
 static uv_connect_t connect_req;
 static uv_buf_t qbuf;
@@ -47,11 +52,6 @@ static void read_cb(uv_stream_t* t, ssize_t nread, const uv_buf_t* buf) {
   ASSERT_PTR_EQ((uv_tcp_t*) t, &tcp);
   ASSERT_EQ(nread, UV_ECONNRESET);
 
-  int fd;
-  ASSERT_OK(uv_fileno((uv_handle_t*) t, &fd));
-  uv_handle_type type = uv_guess_handle(fd);
-  ASSERT_EQ(type, UV_TCP);
-
   uv_close((uv_handle_t *) t, close_cb);
   free(buf->base);
 }
@@ -76,12 +76,12 @@ static void connect_cb(uv_connect_t *req, int status) {
  * RST. Test checks that uv_guess_handle still works on a reset TCP handle.
  */
 TEST_IMPL(tcp_rst) {
+  struct sockaddr_in server_addr;
+  int r;
+
 #if defined(__OpenBSD__)
   RETURN_SKIP("Test does not currently work in OpenBSD");
 #endif
-#ifndef _WIN32
-  struct sockaddr_in server_addr;
-  int r;
 
   qbuf.base = "QSH";
   qbuf.len = 3;
@@ -104,7 +104,5 @@ TEST_IMPL(tcp_rst) {
 
   MAKE_VALGRIND_HAPPY(uv_default_loop());
   return 0;
-#else
-  RETURN_SKIP("Unix only test");
-#endif
 }
+#endif  /* !_WIN32 */

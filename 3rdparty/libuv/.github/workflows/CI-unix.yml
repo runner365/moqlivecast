@@ -13,11 +13,13 @@ on:
       - v[0-9].*
       - master
 
+permissions: read-all
+
 jobs:
   build-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: configure
         run: |
           ./autogen.sh
@@ -32,7 +34,7 @@ jobs:
     env:
       ANDROID_AVD_HOME: /root/.android/avd
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Envinfo
         run: npx envinfo
       - name: Enable KVM
@@ -41,7 +43,7 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
       - name: Build and Test
-        uses: reactivecircus/android-emulator-runner@v2
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
         with:
           api-level: 30
           arch: x86_64
@@ -51,7 +53,7 @@ jobs:
           disable-animations: true
           script: |
             echo "::group::Configure"
-            cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DANDROID_ABI="x86_64" -DANDROID_PLATFORM=android-30
+            cmake -B build -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DANDROID_ABI="x86_64" -DANDROID_PLATFORM=android-30
             echo "::endgroup::"
 
             echo "::group::Build"
@@ -80,9 +82,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-13, macos-14]
+        os: [macos-14, macos-15, macos-15-intel]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Envinfo
         run: npx envinfo
       - name: Disable Firewall
@@ -95,9 +97,7 @@ jobs:
           brew install ninja automake libtool
       - name: Configure
         run: |
-          mkdir build
-          cd build
-          cmake .. -DBUILD_TESTING=ON -G Ninja
+          cmake -B build -DBUILD_TESTING=ON -G Ninja
       - name: Build
         run: |
           cmake --build build
@@ -109,6 +109,11 @@ jobs:
         run: |
           ./build/uv_run_tests_a platform_output
       - name: Test
+        if: ${{ matrix.os == 'macos-15' || matrix.os == 'macos-15-intel' }}
+        run: |
+          cd build && sudo UV_RUN_AS_ROOT=1 ctest -V
+      - name: Test
+        if: ${{ matrix.os != 'macos-15' && matrix.os != 'macos-15-intel' }}
         run: |
           cd build && ctest -V
       - name: Autotools configure
@@ -124,14 +129,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-13, macos-14]
+        os: [macos-14, macos-15]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Configure
         run: |
-          mkdir build-ios
-          cd build-ios
-          cmake .. -GXcode -DCMAKE_SYSTEM_NAME:STRING=iOS -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED:BOOL=NO -DCMAKE_CONFIGURATION_TYPES:STRING=Release
+          cmake -B build-ios -GXcode -DCMAKE_SYSTEM_NAME:STRING=iOS -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED:BOOL=NO -DCMAKE_CONFIGURATION_TYPES:STRING=Release
       - name: Build
         run: |
           cmake --build build-ios
@@ -163,16 +166,14 @@ jobs:
           - {target: ppc64 (u64 slots),   toolchain: gcc-powerpc64-linux-gnu,     cc: powerpc64-linux-gnu-gcc,    qemu: qemu-ppc64    }
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install qemu and ${{ matrix.config.toolchain }}
         run: |
           sudo apt update
           sudo apt install qemu-user qemu-user-binfmt ${{ matrix.config.toolchain }} -y
       - name: Configure with ${{ matrix.config.cc }}
         run: |
-          mkdir build
-          cd build
-          cmake .. -DBUILD_TESTING=ON -DQEMU=ON -DCMAKE_C_COMPILER=${{ matrix.config.cc }}
+          cmake -B build -DBUILD_TESTING=ON -DQEMU=ON -DCMAKE_C_COMPILER=${{ matrix.config.cc }}
       - name: Build
         run: |
           cmake --build build

@@ -61,13 +61,13 @@ AM_CPPFLAGS += -I$(top_srcdir)/src/win \
                -DWIN32_LEAN_AND_MEAN \
                -D_WIN32_WINNT=0x0A00
 libuv_la_SOURCES += src/win/async.c \
-                    src/win/atomicops-inl.h \
                     src/win/core.c \
                     src/win/detect-wakeup.c \
                     src/win/dl.c \
                     src/win/error.c \
                     src/win/fs-event.c \
                     src/win/fs.c \
+                    src/win/fs-fd-hash-inl.h \
                     src/win/getaddrinfo.c \
                     src/win/getnameinfo.c \
                     src/win/handle.c \
@@ -128,7 +128,8 @@ EXTRA_DIST = test/fixtures/empty_file \
              CONTRIBUTING.md \
              LICENSE \
              LICENSE-extra \
-             README.md
+             README.md \
+             uv_win_longpath.manifest
 
 
 
@@ -218,6 +219,7 @@ test_run_tests_SOURCES = test/blackhole-server.c \
                          test/test-mutexes.c \
                          test/test-not-readable-nor-writable-on-read-error.c \
                          test/test-not-writable-after-shutdown.c \
+                         test/test-osx-resident-set-memory.c \
                          test/test-osx-select.c \
                          test/test-pass-always.c \
                          test/test-ping-pong.c \
@@ -232,6 +234,7 @@ test_run_tests_SOURCES = test/blackhole-server.c \
                          test/test-pipe-close-stdout-read-stdin.c \
                          test/test-pipe-set-non-blocking.c \
                          test/test-pipe-set-fchmod.c \
+                         test/test-pipe-write.c \
                          test/test-platform-output.c \
                          test/test-poll.c \
                          test/test-poll-close.c \
@@ -256,9 +259,11 @@ test_run_tests_SOURCES = test/blackhole-server.c \
                          test/test-signal-multiple-loops.c \
                          test/test-signal-pending-on-close.c \
                          test/test-signal.c \
+                         test/test-sizeof.c \
                          test/test-socket-buffer-size.c \
                          test/test-spawn.c \
                          test/test-stdio-over-pipes.c \
+                         test/test-io-64-safe.c \
                          test/test-strscpy.c \
                          test/test-strtok.c \
                          test/test-tcp-alloc-cb-fail.c \
@@ -290,6 +295,8 @@ test_run_tests_SOURCES = test/blackhole-server.c \
                          test/test-tcp-try-write.c \
                          test/test-tcp-write-in-a-row.c \
                          test/test-tcp-try-write-error.c \
+                         test/test-write-cancel.c \
+                         test/test-tcp-write-in-read-cb-backend-timeout.c \
                          test/test-tcp-write-queue-order.c \
                          test/test-test-macros.c \
                          test/test-thread-equal.c \
@@ -322,10 +329,13 @@ test_run_tests_SOURCES = test/blackhole-server.c \
                          test/test-udp-open.c \
                          test/test-udp-options.c \
                          test/test-udp-send-and-recv.c \
+                         test/test-udp-send-fail.c \
                          test/test-udp-send-hang-loop.c \
                          test/test-udp-send-immediate.c \
                          test/test-udp-sendmmsg-error.c \
                          test/test-udp-send-unreachable.c \
+                         test/test-udp-recv-cb-close-pollerr.c \
+                         test/test-udp-recvmsg-unreachable-error.c \
                          test/test-udp-try-send.c \
                          test/test-udp-recv-in-a-row.c \
                          test/test-udp-reuseport.c \
@@ -438,7 +448,7 @@ libuv_la_SOURCES += src/unix/bsd-ifaddrs.c \
                     src/unix/kqueue.c \
                     src/unix/proctitle.c \
                     src/unix/random-getentropy.c
-test_run_tests_LDFLAGS += -lutil
+test_run_tests_LDFLAGS += -lutil -lm
 endif
 
 if DRAGONFLY
@@ -448,7 +458,7 @@ libuv_la_SOURCES += src/unix/bsd-ifaddrs.c \
                     src/unix/freebsd.c \
                     src/unix/kqueue.c \
                     src/unix/posix-hrtime.c
-test_run_tests_LDFLAGS += -lutil
+test_run_tests_LDFLAGS += -lutil -lm
 endif
 
 if FREEBSD
@@ -459,7 +469,7 @@ libuv_la_SOURCES += src/unix/bsd-ifaddrs.c \
                     src/unix/kqueue.c \
                     src/unix/posix-hrtime.c \
                     src/unix/random-getrandom.c
-test_run_tests_LDFLAGS += -lutil
+test_run_tests_LDFLAGS += -lutil -lm
 endif
 
 if HAIKU
@@ -471,6 +481,7 @@ libuv_la_SOURCES += src/unix/bsd-ifaddrs.c \
                     src/unix/no-proctitle.c \
                     src/unix/posix-hrtime.c \
                     src/unix/posix-poll.c
+test_run_tests_LDFLAGS += -lbsd
 endif
 
 if HURD
@@ -491,7 +502,7 @@ libuv_la_SOURCES += src/unix/linux.c \
                     src/unix/proctitle.c \
                     src/unix/random-getrandom.c \
                     src/unix/random-sysctl-linux.c
-test_run_tests_LDFLAGS += -lutil
+test_run_tests_LDFLAGS += -lutil -lm
 endif
 
 if MSYS
@@ -514,7 +525,7 @@ libuv_la_SOURCES += src/unix/bsd-ifaddrs.c \
                     src/unix/kqueue.c \
                     src/unix/netbsd.c \
                     src/unix/posix-hrtime.c
-test_run_tests_LDFLAGS += -lutil
+test_run_tests_LDFLAGS += -lutil -lm
 endif
 
 if OPENBSD
@@ -525,7 +536,7 @@ libuv_la_SOURCES += src/unix/bsd-ifaddrs.c \
                     src/unix/openbsd.c \
                     src/unix/posix-hrtime.c \
                     src/unix/random-getentropy.c
-test_run_tests_LDFLAGS += -lutil
+test_run_tests_LDFLAGS += -lutil -lm
 endif
 
 if SUNOS
@@ -534,6 +545,7 @@ libuv_la_CFLAGS += -D__EXTENSIONS__ \
                    -D_XOPEN_SOURCE=500 \
                    -D_REENTRANT
 libuv_la_SOURCES += src/unix/no-proctitle.c \
+                    src/unix/random-getrandom.c \
                     src/unix/sunos.c
 endif
 
