@@ -15,6 +15,9 @@ A live media stack built on a from-scratch C implementation of QUIC, HTTP/3, and
   encode support; cluster/moq-lite H.265 is not included in this version.
 - **Web client (`tools/moq_js_client`)** — Vue 3 + Vite; MoQ Push/Pull with
   WebCodecs H.264/H.265, WebTransport FLV, HTTP-FLV and WebSocket-FLV
+- **Native desktop player (`moq_player`)** — a separate player built on the
+  `moq_transport_client` C SDK; pulls MoQ, decodes H.264/H.265 + AAC with FFmpeg,
+  and renders with SDL3
 - **WebTransport FLV** Push / Pull
 - **HTTP-FLV Pull** on the same port as WebTransport (UDP + TCP)
 - **WebSocket-FLV Pull** — WS/WSS binary FLV tags on a dedicated TCP port
@@ -196,6 +199,28 @@ Vite listens on `http://127.0.0.1:5174`.
 > After changing C++ code, rebuild and restart `moqlivecast`; the browser demo
 > does not pick up a new server by itself. WebTransport requires a certificate
 > whose hostname matches the URL opened in Chrome.
+
+### Native desktop player (`moq_player`)
+
+[`moq_player`](https://github.com/runner365/moq_player) is a separate native
+desktop player built on this repo's **C SDK** (`moq_transport_client`). It
+SUBSCRIBEs to a MoQ `app/stream`, decodes **H.264/H.265 + AAC** with FFmpeg, and
+renders video/audio with **SDL3** — no browser or WebCodecs involved.
+
+It is useful for verifying the C SDK and server end to end on a desktop,
+including H.265 playback and A/V sync:
+
+```bash
+git clone https://github.com/runner365/moq_player.git
+cd moq_player
+git submodule update --init --recursive
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j8
+./build/bin/moq_player 127.0.0.1 4433 live demo
+```
+
+See the [moq_player README](https://github.com/runner365/moq_player) for
+build dependencies, options and diagnostics.
 
 ### Android push demo
 

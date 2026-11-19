@@ -101,6 +101,39 @@ cluster:
   max_pull_connections: 128
   negative_cache_ms: 5000
 
+# ── 本地媒体源 ──
+# 第一版只支持单个 FLV 文件。source manager 尚未接入时，这里只做配置解析；
+# 接入后由 MediaSourceManager 在启动时读取并创建 FlvFileSource。
+#
+# 字段：
+#   id        唯一标识
+#   enable    是否启动；缺省 true
+#   type      第一版只支持 flv
+#   app/stream 发布使用的命名空间
+#   paths     FLV 节目单，按顺序播放；loop=true 时播完回到第一个
+#   realtime  按文件时间戳播放；false = 尽快送入
+#   loop      循环播放；loop 后 DTS/PTS 继续单调递增
+media_sources:
+  - id: program-1
+    enable: true
+    type: flv
+    app: live
+    stream: program1
+    paths:
+      - /Users/wei.shi/Documents/media/silicon_valley_s01_01.flv
+      - /Users/wei.shi/Documents/media/silicon_valley_s02_01.flv
+    realtime: true
+    loop: true
+  - id: program-2
+    enable: false
+    type: flv
+    app: live
+    stream: program2
+    paths:
+      - /data/program2.flv
+    realtime: true
+    loop: false
+
 log:
   # info 就够验 moq-lite 的落地链路了：流 key、catalog 各轨、首帧形状、
   # "delivery started"、每 100 帧一条 delivered=N、以及会话关闭时的收尾摘要

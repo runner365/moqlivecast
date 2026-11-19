@@ -1,11 +1,20 @@
 #include "stringex.hpp"
 
+#if defined(__QNX__)
+/* QNX libc 提供 POSIX iconv，没有 GNU libiconv 的带前缀符号 */
+#define libiconv_open  iconv_open
+#define libiconv       iconv
+#define libiconv_close iconv_close
+#endif
+
 #ifdef _WIN32
 #include <Windows.h>
 #else
 #include <iconv.h>
 #include <cstring>
 #endif
+
+
 
 namespace cpp_streamer
 {

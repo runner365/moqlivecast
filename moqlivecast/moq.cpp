@@ -6,6 +6,7 @@
 #include "websocket_flv_server.hpp"
 #include "net/rtmp/rtmp_server.hpp"
 #include "cluster/cluster_manager.hpp"
+#include "media_source/media_source_manager.hpp"
 #include "media_stream_manager.hpp"
 #include "utils/logger.hpp"
 #include "utils/meta_log.hpp"
@@ -26,10 +27,12 @@ std::unique_ptr<cpp_streamer::HttpFlvServer> g_httpflv;
 std::unique_ptr<cpp_streamer::WebSocketFlvServer> g_wsflv;
 std::unique_ptr<cpp_streamer::RtmpServer> g_rtmp;
 std::unique_ptr<cpp_streamer::ClusterManager> g_cluster;
+std::unique_ptr<cpp_streamer::MediaSourceManager> g_media_sources;
 uv_signal_t g_sig;
 
 void OnSignal(uv_signal_t *sig, int signum) {
     LOG_WARN("[moq] signal %d, shutting down", signum);
+    if (g_media_sources) g_media_sources->Stop();
     if (g_srv) g_srv->Stop();
     /* 先摘回调和集群组件，再拆会话 —— 回调捕获了 g_moq_lite / g_cluster，
      * 显式注销能避免任何退出路径上的时序意外。 */
@@ -271,7 +274,15 @@ int main(int argc, char *argv[]) {
              cfg.ListenIp().c_str(), cfg.Port(), cfg.SubPaths().size(),
              cfg.AlpnList().size());
 
+    /* 本地媒体源必须在 listener/catalog 回调都就位后启动；source 线程只入队，
+     * 实际发布在 uv loop 里完成。 */
+    g_media_sources = std::make_unique<cpp_streamer::MediaSourceManager>(loop);
+    g_media_sources->Start(cfg.MediaSources());
+
     uv_run(loop, UV_RUN_DEFAULT);
+
+    if (g_media_sources) g_media_sources->Stop();
+    g_media_sources.reset();
 
     if (g_cluster) g_cluster->Shutdown();
     cpp_streamer::MediaStreamManager::SetCatalogUpdatedCallback(nullptr);

@@ -3,6 +3,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <set>
 #include <yaml-cpp/yaml.h>
 
 namespace cpp_streamer {
@@ -111,6 +112,112 @@ static bool LoadSubPathList(const char *key, const YAML::Node &node,
         }
         out.push_back(std::move(sp));
     }
+    return true;
+}
+
+/* media_sources 是静态本地源配置：
+ *   media_sources:
+ *     - id: program-1
+ *       type: flv
+ *       app: live
+ *       stream: program1
+ *       paths: [/data/program1.flv, /data/program2.flv]
+ *       realtime: true
+ *       loop: true
+ *
+ * paths 是节目单，按文件顺序连续播放；loop=true 时最后一个文件播完回到
+ * 第一个文件。每个文件切换时由 source 重新发 sequence header，并将 DTS/PTS
+ * 接到上一条时间轴后面。 */
+static bool LoadMediaSourceList(const YAML::Node &node,
+                                std::vector<MediaSourceConfig> &out) {
+    if (!node.IsSequence()) {
+        LOG_ERROR("[config] media_sources must be a list");
+        return false;
+    }
+    out.clear();
+    std::set<std::string> ids;
+    std::set<std::string> enabled_app_streams;
+    size_t enabled_count = 0;
+    for (const auto &item : node) {
+        if (!item || !item.IsMap()) {
+            LOG_ERROR("[config] media_sources item must be a map");
+            return false;
+        }
+
+        MediaSourceConfig src;
+        src.id = YamlStringOrEmpty(item["id"]);
+        if (src.id.empty()) {
+            LOG_ERROR("[config] media_sources item needs a non-empty id");
+            return false;
+        }
+        if (!ids.insert(src.id).second) {
+            LOG_ERROR("[config] duplicate media_sources id: %s", src.id.c_str());
+            return false;
+        }
+
+        if (item["enable"]) {
+            src.enable = item["enable"].as<bool>();
+        }
+
+        src.type = YamlStringOrEmpty(item["type"]);
+        if (src.type.empty()) src.type = "flv";
+        for (char &c : src.type) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        if (src.type != "flv") {
+            LOG_ERROR("[config] media_sources %s: unsupported type \"%s\" "
+                      "(first version supports only flv)",
+                      src.id.c_str(), src.type.c_str());
+            return false;
+        }
+
+        src.app = YamlStringOrEmpty(item["app"]);
+        src.stream = YamlStringOrEmpty(item["stream"]);
+        if (src.app.empty() || src.stream.empty()) {
+            LOG_ERROR("[config] media_sources %s: app and stream are required",
+                      src.id.c_str());
+            return false;
+        }
+        if (src.app.find('/') != std::string::npos ||
+            src.stream.find('/') != std::string::npos) {
+            LOG_ERROR("[config] media_sources %s: app/stream must not contain '/'",
+                      src.id.c_str());
+            return false;
+        }
+        const std::string stream_key = src.app + "/" + src.stream;
+        /* disabled source 不会实际发布，因此不占用 app/stream。这样可以把
+         * 同一路流的多个候选配置都留在文件里，只切换 enable。 */
+        if (src.enable && !enabled_app_streams.insert(stream_key).second) {
+            LOG_ERROR("[config] media_sources %s: duplicate enabled app/stream %s",
+                      src.id.c_str(), stream_key.c_str());
+            return false;
+        }
+
+        YAML::Node paths = item["paths"];
+        if (!paths || !paths.IsSequence() || paths.size() == 0) {
+            LOG_ERROR("[config] media_sources %s: paths must be a non-empty list",
+                      src.id.c_str());
+            return false;
+        }
+        for (const auto &path_node : paths) {
+            std::string path = TrimCopy(path_node.as<std::string>());
+            if (path.empty()) {
+                LOG_ERROR("[config] media_sources %s: empty path", src.id.c_str());
+                return false;
+            }
+            src.paths.push_back(std::move(path));
+        }
+        if (item["realtime"]) {
+            src.realtime = item["realtime"].as<bool>();
+        }
+        if (item["loop"]) {
+            src.loop = item["loop"].as<bool>();
+        }
+        if (src.enable) ++enabled_count;
+        out.push_back(std::move(src));
+    }
+    LOG_INFO("[config] media_sources: total=%zu enabled=%zu disabled=%zu",
+             out.size(), enabled_count, out.size() - enabled_count);
     return true;
 }
 
@@ -285,6 +392,15 @@ bool Config::Load(const std::string &filename) {
             }
         }
 
+        std::vector<MediaSourceConfig> parsed_sources;
+        YAML::Node media_sources = root["media_sources"];
+        if (media_sources) {
+            if (!LoadMediaSourceList(media_sources, parsed_sources)) {
+                return false;
+            }
+        }
+        media_sources_ = std::move(parsed_sources);
+
         YAML::Node log = root["log"];
         if (log && log.IsMap()) {
             if (log["level"]) {
@@ -312,6 +428,15 @@ bool Config::Load(const std::string &filename) {
     } catch (const YAML::Exception &e) {
         LOG_ERROR("[config] parse %s failed: %s", filename.c_str(), e.what());
         return false;
+    }
+
+    for (const auto &src : media_sources_) {
+        LOG_INFO("[config] media source id=%s enabled=%d type=%s app=%s "
+                 "stream=%s paths=%zu first=%s realtime=%d loop=%d",
+                 src.id.c_str(), src.enable ? 1 : 0, src.type.c_str(),
+                 src.app.c_str(), src.stream.c_str(), src.paths.size(),
+                 src.paths[0].c_str(), src.realtime ? 1 : 0,
+                 src.loop ? 1 : 0);
     }
 
     if (listen_ip_.empty() || port_ <= 0 || port_ > 65535) {

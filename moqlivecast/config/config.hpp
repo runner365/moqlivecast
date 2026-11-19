@@ -13,6 +13,22 @@ struct SubPathItem {
     std::string path;
 };
 
+/* 一个本地媒体源（当前只有 FLV 文件源）。
+ *
+ * 这里放 YAML 侧的全部字段；IMediaSource 的 SourceConfig 只保留
+ * source_id/paths/realtime/loop，app/stream 由 MediaSourceManager 在
+ * start() 时单独传入。 */
+struct MediaSourceConfig {
+    std::string id;
+    bool enable = true;
+    std::string type = "flv";
+    std::string app;
+    std::string stream;
+    std::vector<std::string> paths;
+    bool realtime = true;
+    bool loop = false;
+};
+
 /* 两级集群里的本机角色。kOff = 不参与集群（缺省）。
  *
  * 没有 center：中心节点就是一个**普通服务端** —— 它不需要知道自己被谁拨，
@@ -48,6 +64,12 @@ public:
      * 裸 QUIC 的 moq-lite 就是靠在这张表里加 "moq-lite-06" 与 WebTransport
      * 共用同一个 UDP 端口 —— 包按连接 ID 分，协议在握手时定一次。 */
     const std::vector<std::string> &AlpnList() const { return alpn_list_; }
+
+    /* 本地媒体源，来自 YAML 的 media_sources。
+     * 第一版接受 type=flv；paths 可以是多个文件，按顺序轮询播放。 */
+    const std::vector<MediaSourceConfig> &MediaSources() const {
+        return media_sources_;
+    }
 
     const std::string &HttpFlvListenIp() const { return httpflv_listen_ip_; }
     int HttpFlvPort() const { return httpflv_port_; }
@@ -112,6 +134,7 @@ private:
     std::string cert_file_;
     std::string key_file_;
     std::vector<std::string> alpn_list_;
+    std::vector<MediaSourceConfig> media_sources_;
 
     std::string httpflv_listen_ip_ = "0.0.0.0";
     int httpflv_port_ = 4433;

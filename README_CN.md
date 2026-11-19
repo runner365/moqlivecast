@@ -17,6 +17,9 @@
   本版本不包含集群/moq-lite 的 H.265。
 - **Web 客户端（`tools/moq_js_client`）** —— Vue 3 + Vite；
   MoQ 推流/拉流（H.264/H.265 WebCodecs）、WebTransport FLV、HTTP-FLV、WebSocket-FLV
+- **桌面播放器（`moq_player`）** —— 独立项目，基于本仓库的
+  `moq_transport_client` C SDK；MoQ 拉流，FFmpeg 解码 H.264/H.265 + AAC，
+  SDL3 渲染
 - **WebTransport FLV** 推流 / 拉流
 - **HTTP-FLV 拉流**，与 WebTransport 共用同一端口（UDP + TCP）
 - **WebSocket-FLV 拉流** —— 独立 TCP 端口上的 WS/WSS 二进制 FLV tag，
@@ -197,6 +200,27 @@ Vite 默认监听 `http://127.0.0.1:5174`。
 > 客户端的默认地址和 URL 辅助函数位于 `tools/moq_js_client/src/config.ts`。
 > 修改 C++ 代码后需要重新编译并重启 `moqlivecast`；浏览器客户端不会自动连接
 > 新启动的服务端。WebTransport 要求证书 hostname 与 Chrome 中打开的 URL 一致。
+
+### 桌面播放器（`moq_player`）
+
+[`moq_player`](https://github.com/runner365/moq_player) 是一个独立的桌面播放器，
+基于本仓库的 **C SDK**（`moq_transport_client`）实现。它订阅 MoQ 的
+`app/stream`，用 FFmpeg 解码 **H.264/H.265 + AAC**，再通过 **SDL3** 渲染画面
+和播放音频，不需要浏览器或 WebCodecs。
+
+它适合在桌面上端到端验证 C SDK 和服务端，包括 H.265 播放和音画同步：
+
+```bash
+git clone https://github.com/runner365/moq_player.git
+cd moq_player
+git submodule update --init --recursive
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j8
+./build/bin/moq_player 127.0.0.1 4433 live demo
+```
+
+构建依赖、命令行参数和诊断日志见
+[moq_player README](https://github.com/runner365/moq_player)。
 
 ### Android 推流 Demo
 

@@ -122,6 +122,9 @@ ExternalProject_Add(openssl_ext
 # 创建 IMPORTED 库供各目标链接
 add_library(ssl    STATIC IMPORTED GLOBAL)
 add_library(crypto STATIC IMPORTED GLOBAL)
+if(CMAKE_SYSTEM_NAME STREQUAL "QNX")
+    link_libraries(iconv)
+endif()
 
 set_target_properties(ssl PROPERTIES
     IMPORTED_LOCATION ${OPENSSL_INSTALL_DIR}/lib/libssl.a
