@@ -21,7 +21,9 @@
   独立项目，基于本仓库的 `moq_transport_client` C SDK；MoQ 拉流，
   FFmpeg 解码 H.264/H.265 + AAC，SDL3 渲染
 - **WebTransport FLV** 推流 / 拉流
-- **HTTP-FLV 拉流**，与 WebTransport 共用同一端口（UDP + TCP）
+- **HTTP-FLV 拉流** —— 基于 HTTPS/TCP（4433 端口）；它是独立的 TCP
+  listener，和 WebTransport 的 UDP listener 没有传输层关系，不使用
+  WebTransport，只是共享 `MediaStreamManager` 和 GOP 缓存。
 - **WebSocket-FLV 拉流** —— 独立 TCP 端口上的 WS/WSS 二进制 FLV tag，
   endpoint `/wsflv?app=...&stream=...`，接入 `MediaStreamManager`
 - **RTMP 推流 / 拉流**（TCP 1935）—— OBS / ffmpeg 推流，任意来源的流也能用 RTMP 拉

@@ -19,7 +19,9 @@ A live media stack built on a from-scratch C implementation of QUIC, HTTP/3, and
   a separate player built on the `moq_transport_client` C SDK; pulls MoQ,
   decodes H.264/H.265 + AAC with FFmpeg, and renders with SDL3
 - **WebTransport FLV** Push / Pull
-- **HTTP-FLV Pull** on the same port as WebTransport (UDP + TCP)
+- **HTTP-FLV Pull** — HTTPS over TCP (port 4433); a separate TCP listener
+  from WebTransport's UDP listener. It does not use WebTransport; it shares
+  `MediaStreamManager` and the GOP cache with the other egress protocols.
 - **WebSocket-FLV Pull** — WS/WSS binary FLV tags on a dedicated TCP port
   (`/wsflv?app=...&stream=...`), integrated with `MediaStreamManager`
 - **RTMP push / play** on TCP 1935 — OBS / ffmpeg can push, and any stream can
