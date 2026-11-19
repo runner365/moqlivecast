@@ -15,9 +15,9 @@ A live media stack built on a from-scratch C implementation of QUIC, HTTP/3, and
   encode support; cluster/moq-lite H.265 is not included in this version.
 - **Web client (`tools/moq_js_client`)** — Vue 3 + Vite; MoQ Push/Pull with
   WebCodecs H.264/H.265, WebTransport FLV, HTTP-FLV and WebSocket-FLV
-- **Native desktop player (`moq_player`)** — a separate player built on the
-  `moq_transport_client` C SDK; pulls MoQ, decodes H.264/H.265 + AAC with FFmpeg,
-  and renders with SDL3
+- **Native desktop player ([`moq_player`](https://github.com/runner365/moq_player))** —
+  a separate player built on the `moq_transport_client` C SDK; pulls MoQ,
+  decodes H.264/H.265 + AAC with FFmpeg, and renders with SDL3
 - **WebTransport FLV** Push / Pull
 - **HTTP-FLV Pull** on the same port as WebTransport (UDP + TCP)
 - **WebSocket-FLV Pull** — WS/WSS binary FLV tags on a dedicated TCP port

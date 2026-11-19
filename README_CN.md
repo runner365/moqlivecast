@@ -17,9 +17,9 @@
   本版本不包含集群/moq-lite 的 H.265。
 - **Web 客户端（`tools/moq_js_client`）** —— Vue 3 + Vite；
   MoQ 推流/拉流（H.264/H.265 WebCodecs）、WebTransport FLV、HTTP-FLV、WebSocket-FLV
-- **桌面播放器（`moq_player`）** —— 独立项目，基于本仓库的
-  `moq_transport_client` C SDK；MoQ 拉流，FFmpeg 解码 H.264/H.265 + AAC，
-  SDL3 渲染
+- **桌面播放器（[`moq_player`](https://github.com/runner365/moq_player)）** ——
+  独立项目，基于本仓库的 `moq_transport_client` C SDK；MoQ 拉流，
+  FFmpeg 解码 H.264/H.265 + AAC，SDL3 渲染
 - **WebTransport FLV** 推流 / 拉流
 - **HTTP-FLV 拉流**，与 WebTransport 共用同一端口（UDP + TCP）
 - **WebSocket-FLV 拉流** —— 独立 TCP 端口上的 WS/WSS 二进制 FLV tag，
