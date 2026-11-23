@@ -2,19 +2,26 @@
 
 #include "media_source_sink.hpp"
 
+#include "data_buffer.hpp"
 #include "h264_h265_header.hpp"
 #include "logger.h"
 #include "media_packet.hpp"
 
 #include <atomic>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <vector>
 
 #include <uv.h>
+
+/* This file is a C ABI implementation but its internals use the server's
+ * C++ media types (Media_Packet, MEDIA_CODEC_*, DataBuffer, AnnexB2Avcc). */
+using namespace cpp_streamer;
 
 namespace {
 
@@ -104,6 +111,8 @@ moq_source_t* moq_source_create(const char* app, const char* stream,
     s->stream = stream;
     s->id = source_id ? source_id : "capi";
     s->sink.reset(new cpp_streamer::MediaSourceSink(g_loop, s->app, s->stream, s->id));
+    LOG_INFO("[moq-source-capi] created app=%s stream=%s id=%s",
+             s->app.c_str(), s->stream.c_str(), s->id.c_str());
     return s;
 }
 
@@ -145,6 +154,8 @@ int moq_source_push_video_config(moq_source_t* s, moq_codec_t codec,
     s->video_codec.store(static_cast<int>(info.codec));
     info.extradata.assign(extradata, extradata + len);
     const int ret = s->sink->onTrackInfo(info);
+    LOG_INFO("[moq-source-capi] video config codec=%d extradata=%zuB ret=%d",
+             static_cast<int>(info.codec), info.extradata.size(), ret);
     if (ret < 0) SetError("onTrackInfo(video) rejected", ret);
     return ret;
 }
@@ -157,6 +168,8 @@ int moq_source_push_audio_config(moq_source_t* s,
     info.codec = MEDIA_CODEC_AAC;
     info.extradata.assign(extradata, extradata + len);
     const int ret = s->sink->onTrackInfo(info);
+    LOG_INFO("[moq-source-capi] audio config extradata=%zuB ret=%d",
+             info.extradata.size(), ret);
     if (ret < 0) SetError("onTrackInfo(audio) rejected", ret);
     return ret;
 }
@@ -194,6 +207,11 @@ int moq_source_push_video(moq_source_t* s, const moq_video_frame_t* f) {
     pkt->buffer_ptr_->AppendData(reinterpret_cast<const char*>(payload), len);
 
     const int ret = s->sink->onVideo(pkt);
+    const uint64_t n = s->frames_in.load();
+    if ((n == 0) || ((n % 300) == 0)) {
+        LOG_INFO("[moq-source-capi] push video dts=%lld key=%d len=%zu ret=%d",
+                 static_cast<long long>(f->dts_ms), f->is_keyframe, len, ret);
+    }
     if (ret == 0) {
         s->frames_in.fetch_add(1);
         s->last_dts.store(f->dts_ms);
@@ -251,6 +269,11 @@ int moq_source_push_audio(moq_source_t* s, const uint8_t* data, size_t len,
     pkt->buffer_ptr_->AppendData(reinterpret_cast<const char*>(payload), plen);
 
     const int ret = s->sink->onAudio(pkt);
+    const uint64_t n = s->frames_in.load();
+    if ((n == 0) || ((n % 300) == 0)) {
+        LOG_INFO("[moq-source-capi] push audio dts=%lld len=%zu ret=%d",
+                 static_cast<long long>(dts_ms), plen, ret);
+    }
     if (ret == 0) {
         s->frames_in.fetch_add(1);
     } else {

@@ -14,14 +14,15 @@ moq_source_c_api.h    -> moqlivecast/media_source/moq_source_c_api.h
 moq_source_c_api.cpp  -> moqlivecast/media_source/moq_source_c_api.cpp
 ```
 
-## 2. Add to the build
+## 2. Build integration
 
-In the `moqlivecast` target's source list (where the other `media_source/*.cpp`
-entries are), append:
+Nothing to do: `moqlivecast/CMakeLists.txt` collects sources with
+`file(GLOB_RECURSE ... *.cpp)`, so `media_source/moq_source_c_api.cpp` is picked
+up automatically.
 
-```cmake
-    media_source/moq_source_c_api.cpp
-```
+The `iconv` link is handled by the top-level `CMakeLists.txt`
+(`if(CMAKE_SYSTEM_NAME STREQUAL "QNX") link_libraries(iconv)`), which runs before
+`add_subdirectory(moqlivecast)`.
 
 ## 3. Inject the uv loop from the server
 
@@ -85,3 +86,59 @@ moq_source_push_audio(src, aac_frame, aac_len, dts, pts, MOQ_AUDIO_AAC_ADTS);
   the same queueing, catalog generation and backpressure logic.
 - **Observable**: `moq_source_get_stats()` exposes counters that a status
   endpoint (`/dev/moq`, `moqctl status`) can report.
+
+---
+
+## 7. Reference feeder (no camera required)
+
+`moq_source_feeder.c` reads an FLV file and pushes it through the public C API the
+way a camera SDK would. It is both a validation tool and the demo "device-side
+process" for the automotive scenario.
+
+### Build
+
+The file is C, and the server's source glob only collects `*.cpp`, so add it to
+the C source list (`MOQ_SERVER_STACK`) in `moqlivecast/CMakeLists.txt`:
+
+```cmake
+    ${CMAKE_CURRENT_SOURCE_DIR}/media_source/moq_source_feeder.c
+```
+
+### Hook it up in `moq.cpp`
+
+```cpp
+extern int  moq_feeder_attach(const char* file, const char* app,
+                              const char* stream, int loop, int realtime);
+extern void moq_feeder_detach(void);
+
+/* right before uv_run(loop, UV_RUN_DEFAULT): */
+const char* feed = getenv("MOQ_FEED_FILE");
+if (feed && *feed) {
+    moq_feeder_attach(feed,
+                      getenv("MOQ_FEED_APP") ? getenv("MOQ_FEED_APP") : "anon",
+                      getenv("MOQ_FEED_STREAM") ? getenv("MOQ_FEED_STREAM") : "cam0",
+                      /*loop=*/1, /*realtime=*/1);
+}
+
+/* after uv_run() returns: */
+moq_feeder_detach();
+```
+
+### Run
+
+```bash
+MOQ_FEED_FILE=/data/media/sample.flv \
+MOQ_FEED_APP=anon MOQ_FEED_STREAM=cam0 \
+./moqlivecast config.yml
+```
+
+Then subscribe to `anon/cam0` with `moq_player` or the browser player.
+
+### Behaviour
+
+- parses only the FLV container; payloads are passed as AVCC / raw AAC
+- publishes the AVC / AAC configuration records as track info
+- real-time pacing on `CLOCK_MONOTONIC`; frames later than 400 ms are dropped
+  instead of burst-sent (the same policy a camera pipeline needs)
+- on loop, timestamps continue monotonically (+40 ms gap), so subscribers never
+  see time going backwards

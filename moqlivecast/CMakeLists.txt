@@ -33,6 +33,8 @@ set(MOQ_SERVER_STACK
     # 的 MOQ_SERVER_STACK 产生重复符号。
     ${CMAKE_SOURCE_DIR}/moqlite/moq_lite_client.c
     ${CMAKE_SOURCE_DIR}/moqlite/moq_lite_wire.c
+    # 媒体源 C API 的参考 feeder（FLV 文件模拟 camera push）
+    ${CMAKE_CURRENT_SOURCE_DIR}/media_source/moq_source_feeder.c
 )
 
 # ── 本目录 C++ 源 / 头文件 ───────────────────────

@@ -7,6 +7,7 @@
 #include "net/rtmp/rtmp_server.hpp"
 #include "cluster/cluster_manager.hpp"
 #include "media_source/media_source_manager.hpp"
+#include "media_source/moq_source_c_api.h"
 #include "media_stream_manager.hpp"
 #include "utils/logger.hpp"
 #include "utils/meta_log.hpp"
@@ -17,6 +18,10 @@
 #include <csignal>
 #include <memory>
 #include <uv.h>
+
+/* Implemented in media_source/moq_source_feeder.c (C ABI). */
+extern "C" int moq_feeder_attach(const char* file, const char* app,
+                                 const char* stream, int loop, int realtime);
 
 namespace {
 
@@ -72,6 +77,10 @@ int main(int argc, char *argv[]) {
     }
 
     uv_loop_t *loop = uv_default_loop();
+    if (moq_source_set_loop(loop) != 0) {
+        LOG_ERROR("[moq] failed to inject uv loop into media-source C API");
+        return 1;
+    }
     uv_signal_init(loop, &g_sig);
     uv_signal_start(&g_sig, OnSignal, SIGINT);
 
@@ -279,6 +288,13 @@ int main(int argc, char *argv[]) {
     g_media_sources = std::make_unique<cpp_streamer::MediaSourceManager>(loop);
     g_media_sources->Start(cfg.MediaSources());
 
+    const char* feed = getenv("MOQ_FEED_FILE");
+    if (feed && *feed) {
+        moq_feeder_attach(feed,
+                          getenv("MOQ_FEED_APP") ? getenv("MOQ_FEED_APP") : "anon",
+                          getenv("MOQ_FEED_STREAM") ? getenv("MOQ_FEED_STREAM") : "cam0",
+                          /*loop=*/1, /*realtime=*/1);
+    }
     uv_run(loop, UV_RUN_DEFAULT);
 
     if (g_media_sources) g_media_sources->Stop();
