@@ -21,6 +21,7 @@ extern "C" {
 #include "logger.h"
 }
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -86,6 +87,21 @@ bool env_flag_on(const char *name) {
            std::strcmp(v, "off") != 0;
 }
 
+bool parse_bool_arg(const char *v, bool *out) {
+    if (!v || !out) return false;
+    std::string s(v);
+    for (char &c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (s == "1" || s == "true" || s == "yes" || s == "on") {
+        *out = true;
+        return true;
+    }
+    if (s == "0" || s == "false" || s == "no" || s == "off") {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
 void usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s <input.flv> <host> <port> <app> <stream> [options]\n"
@@ -94,6 +110,8 @@ void usage(const char *argv0) {
             "  --speed <x>       playback speed, default 1.0\n"
             "  --stats <sec>     stats interval, default 5, 0 disables\n"
             "  --path <path>     WebTransport path, default /moq\n"
+            "  --console <1|true> enable console log; default off\n"
+            "  log file defaults to /tmp/flv2moqtransport_client.log\n"
             "example:\n"
             "  %s test.flv 127.0.0.1 4433 live demo\n",
             argv0, argv0);
@@ -115,13 +133,13 @@ void on_connected(moqt_client_t *, moqt_result_t status,
                   const char *reason, void *user) {
     App *a = (App *)user;
     if (status != MOQT_OK) {
-        fprintf(stderr, "[flv2moqtransport] connect failed: %s\n",
-                reason && reason[0] ? reason : "unknown");
+        LOG_ERROR("[flv2moqtransport] connect failed: %s",
+                  reason && reason[0] ? reason : "unknown");
         a->failed = true;
         stop_loop(a);
         return;
     }
-    printf("[flv2moqtransport] connected, waiting for publish streams\n");
+    LOG_INFO("[flv2moqtransport] connected, waiting for publish streams");
 }
 
 void on_stream_ready(moqt_client_t *, moqt_stream_t *s,
@@ -130,17 +148,17 @@ void on_stream_ready(moqt_client_t *, moqt_stream_t *s,
     if (info->codec == MOQT_CODEC_H264 || info->codec == MOQT_CODEC_H265)
         a->video_ready = true;
     if (info->codec == MOQT_CODEC_AAC) a->audio_ready = true;
-    printf("[flv2moqtransport] stream %s ready codec=%s cfg=%zu\n",
-           info->track_name,
-           info->codec == MOQT_CODEC_H264 ? "H264" :
-           (info->codec == MOQT_CODEC_H265 ? "H265" : "AAC"),
-           info->config_len);
+    LOG_INFO("[flv2moqtransport] stream %s ready codec=%s cfg=%zu",
+             info->track_name,
+             info->codec == MOQT_CODEC_H264 ? "H264" :
+             (info->codec == MOQT_CODEC_H265 ? "H265" : "AAC"),
+             info->config_len);
     if (a->video_ready && a->audio_ready && !a->started) {
         a->started = true;
         a->start_wall_ms = uv_now(&a->loop);
         if (a->first_dts < 0 && !a->pending.empty())
             a->first_dts = a->pending.front().dts;
-        printf("[flv2moqtransport] publishing at %.2fx\n", a->speed);
+        LOG_INFO("[flv2moqtransport] publishing at %.2fx", a->speed);
     }
     (void)s;
 }
@@ -153,8 +171,8 @@ void on_write_done(moqt_stream_t *s, moqt_result_t status,
         a->bytes += nbytes;
     } else {
         a->write_errors++;
-        fprintf(stderr, "[flv2moqtransport] write %s failed: status=%d bytes=%zu\n",
-                moqt_stream_track_name(s), (int)status, nbytes);
+        LOG_ERROR("[flv2moqtransport] write %s failed: status=%d bytes=%zu",
+                  moqt_stream_track_name(s), (int)status, nbytes);
     }
     (void)s;
 }
@@ -162,8 +180,8 @@ void on_write_done(moqt_stream_t *s, moqt_result_t status,
 void on_closed(moqt_client_t *, moqt_result_t status,
                const char *reason, void *user) {
     App *a = (App *)user;
-    printf("[flv2moqtransport] closed status=%d reason=%s\n",
-           (int)status, reason ? reason : "");
+    LOG_INFO("[flv2moqtransport] closed status=%d reason=%s",
+             (int)status, reason ? reason : "");
     if (!a->done) {
         a->done = true;
         uv_stop(&a->loop);
@@ -218,7 +236,7 @@ void on_tick(uv_timer_t *t) {
     if (a->first_dts < 0) {
         if (a->eof && a->pending.empty() && !a->finishing) {
             a->finishing = true;
-            printf("[flv2moqtransport] input has no media frames\n");
+            LOG_WARN("[flv2moqtransport] input has no media frames");
             uv_timer_start(&a->finish, [](uv_timer_t *ft) {
                 uv_stop((uv_loop_t *)ft->data);
             }, 200, 0);
@@ -249,7 +267,7 @@ void on_tick(uv_timer_t *t) {
             on_write_done, a);
         if (r == MOQT_ERR_AGAIN) break;  /* caller/sdk high watermark */
         if (r != MOQT_OK) {
-            fprintf(stderr, "[flv2moqtransport] write queue failed: %d\n", (int)r);
+            LOG_ERROR("[flv2moqtransport] write queue failed: %d", (int)r);
             a->write_errors++;
             a->failed = true;
         }
@@ -263,8 +281,8 @@ void on_tick(uv_timer_t *t) {
     }
     if (a->eof && a->pending.empty() && !a->finishing) {
         a->finishing = true;
-        printf("[flv2moqtransport] input done: video=%llu audio=%llu "
-               "acked=%llu bytes=%llu errors=%llu\n",
+        LOG_INFO("[flv2moqtransport] input done: video=%llu audio=%llu "
+                 "acked=%llu bytes=%llu errors=%llu",
                (unsigned long long)a->sent_video,
                (unsigned long long)a->sent_audio,
                (unsigned long long)a->acked,
@@ -295,23 +313,23 @@ void on_resolved(uv_getaddrinfo_t *req, int status, struct addrinfo *res) {
     }
     if (res) uv_freeaddrinfo(res);
     if (status != 0 || ip[0] == 0) {
-        fprintf(stderr, "[flv2moqtransport] DNS %s failed: %s\n",
-                a->host.c_str(),
-                status != 0 ? uv_strerror(status) : "no IPv4 A record");
+        LOG_ERROR("[flv2moqtransport] DNS %s failed: %s",
+                  a->host.c_str(),
+                  status != 0 ? uv_strerror(status) : "no IPv4 A record");
         a->failed = true;
         uv_stop(&a->loop);
         return;
     }
 
     a->connect_ip = ip;
-    printf("[flv2moqtransport] resolved %s -> %s\n",
-           a->host.c_str(), a->connect_ip.c_str());
+    LOG_INFO("[flv2moqtransport] resolved %s -> %s",
+             a->host.c_str(), a->connect_ip.c_str());
     moqt_result_t r = moqt_client_connect_ex(
         a->client, a->host.c_str(), a->connect_ip.c_str(), a->port,
         a->path.c_str(), a->appname.c_str(), a->stream.c_str(),
         MOQT_DIRECTION_PUBLISH, 5000);
     if (r != MOQT_OK) {
-        fprintf(stderr, "[flv2moqtransport] connect_ex failed: %d\n", (int)r);
+        LOG_ERROR("[flv2moqtransport] connect_ex failed: %d", (int)r);
         a->failed = true;
         uv_stop(&a->loop);
     }
@@ -320,8 +338,8 @@ void on_resolved(uv_getaddrinfo_t *req, int status, struct addrinfo *res) {
 void on_stats(uv_timer_t *t) {
     App *a = (App *)t->data;
     if (a->done) return;
-    printf("[flv2moqtransport] sent v=%llu a=%llu acked=%llu bytes=%llu "
-           "errors=%llu pending=%zu eof=%d\n",
+    LOG_INFO("[flv2moqtransport] sent v=%llu a=%llu acked=%llu bytes=%llu "
+             "errors=%llu pending=%zu eof=%d",
            (unsigned long long)a->sent_video,
            (unsigned long long)a->sent_audio,
            (unsigned long long)a->acked,
@@ -346,6 +364,7 @@ int main(int argc, char **argv) {
     std::string wt_path = "/moq";
     double speed = 1.0;
     double stats_sec = 5.0;
+    bool console_log = false;
 
     for (int i = 6; i < argc; i++) {
         if (strcmp(argv[i], "--speed") == 0 && i + 1 < argc) {
@@ -354,6 +373,12 @@ int main(int argc, char **argv) {
             stats_sec = atof(argv[++i]);
         } else if (strcmp(argv[i], "--path") == 0 && i + 1 < argc) {
             wt_path = argv[++i];
+        } else if (strcmp(argv[i], "--console") == 0 && i + 1 < argc) {
+            if (!parse_bool_arg(argv[++i], &console_log)) {
+                fprintf(stderr, "--console expects 1/true or 0/false\n");
+                usage(argv[0]);
+                return 1;
+            }
         } else {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             usage(argv[0]);
@@ -371,7 +396,8 @@ int main(int argc, char **argv) {
     }
 
     g_client_debug = env_flag_on("MOQ_CLIENT_DEBUG");
-    log_set_console(1);
+    log_set_file("/tmp/flv2moqtransport_client.log");
+    log_set_console(console_log ? 1 : 0);
     log_set_level(g_client_debug ? INFO : WARN);
 
     App a;

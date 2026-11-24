@@ -5,7 +5,7 @@ paced by the file's DTS.
 
 ```bash
 ./build/bin/flv2moqtransport_client <input.flv> <host> <port> <app> <stream> \
-    [--speed 1.0] [--stats 5] [--path /moq]
+    [--speed 1.0] [--stats 5] [--path /moq] [--console 1|true]
 ```
 
 Example:
@@ -21,6 +21,10 @@ Example:
   audio (`AudioSpecificConfig`).  H.265 is sent with `MOQT_CODEC_H265` and the
   hvcC record as the MoQ video config.
 - Frames are sent in file DTS order; `--speed 2` sends twice as fast.
+- Logs are written to `/tmp/flv2moqtransport_client.log` by default.
+  Add `--console 1` (or `--console true`) to also print them to the console.
+- Set `MOQ_CLIENT_DEBUG=1` to include per-video-frame `dts` / wall-clock
+  diagnostics (`[client-debug]`).
 - The tool prints sent/ACK counts and exits non-zero if any write fails.
 
 This is a demo client for the SDK; it keeps the whole pending frame queue in
