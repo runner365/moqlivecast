@@ -111,6 +111,9 @@ void usage(const char *argv0) {
             "  --stats <sec>     stats interval, default 5, 0 disables\n"
             "  --path <path>     WebTransport path, default /moq\n"
             "  --console <1|true> enable console log; default off\n"
+            "  --only-video      publish video only (ignore audio)\n"
+            "  --only-audio      publish audio only (ignore video)\n"
+            "  --only-video and --only-audio are mutually exclusive\n"
             "  log file defaults to /tmp/flv2moqtransport_client.log\n"
             "example:\n"
             "  %s test.flv 127.0.0.1 4433 live demo\n",
@@ -373,6 +376,8 @@ int main(int argc, char **argv) {
     double speed = 1.0;
     double stats_sec = 5.0;
     bool console_log = false;
+    bool only_video = false;
+    bool only_audio = false;
 
     for (int i = 6; i < argc; i++) {
         if (strcmp(argv[i], "--speed") == 0 && i + 1 < argc) {
@@ -387,6 +392,10 @@ int main(int argc, char **argv) {
                 usage(argv[0]);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--only-video") == 0) {
+            only_video = true;
+        } else if (strcmp(argv[i], "--only-audio") == 0) {
+            only_audio = true;
         } else {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             usage(argv[0]);
@@ -402,11 +411,15 @@ int main(int argc, char **argv) {
         fprintf(stderr, "invalid port: %d\n", port);
         return 1;
     }
+    if (only_video && only_audio) {
+        fprintf(stderr, "--only-video and --only-audio are mutually exclusive\n");
+        return 1;
+    }
 
     g_client_debug = env_flag_on("MOQ_CLIENT_DEBUG");
     log_set_file("/tmp/flv2moqtransport_client.log");
     log_set_console(console_log ? 1 : 0);
-    log_set_level(g_client_debug ? INFO : WARN);
+    log_set_level((g_client_debug || console_log) ? INFO : WARN);
 
     App a;
     a.speed = speed;
@@ -430,7 +443,11 @@ int main(int argc, char **argv) {
     /* Read sequence headers. If the FLV has only one track, stop once
      * the first media frame appears: waiting for the missing sequence
      * header would otherwise read the whole file before connecting. */
-    while ((a.vcfg.empty() || a.acfg.empty()) && a.reader.Fill()) {
+    const bool want_video = !only_audio;
+    const bool want_audio = !only_video;
+    while ((want_video && a.vcfg.empty()) ||
+           (want_audio && a.acfg.empty())) {
+        if (!a.reader.Fill()) break;
         bool saw_media = false;
         while (!a.reader.Empty()) {
             flv2moq::FlvFrame f = a.reader.TakeFront();
@@ -446,7 +463,22 @@ int main(int argc, char **argv) {
                 saw_media = true;
             }
         }
-        if (saw_media && (!a.vcfg.empty() || !a.acfg.empty())) break;
+        if (only_video && !a.vcfg.empty()) break;
+        if (only_audio && !a.acfg.empty()) break;
+        if (!only_video && !only_audio && saw_media &&
+            (!a.vcfg.empty() || !a.acfg.empty())) {
+            break;
+        }
+    }
+    if (only_video && a.vcfg.empty()) {
+        fprintf(stderr, "--only-video requested, but FLV has no H.264/H.265 "
+                        "avcC/hvcC\n");
+        return 1;
+    }
+    if (only_audio && a.acfg.empty()) {
+        fprintf(stderr, "--only-audio requested, but FLV has no AAC "
+                        "AudioSpecificConfig\n");
+        return 1;
     }
     if (a.vcfg.empty() && a.acfg.empty()) {
         fprintf(stderr, "FLV has no usable H.264/H.265 avcC/hvcC or AAC "
@@ -467,7 +499,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (!a.vcfg.empty()) {
+    if (!only_audio && !a.vcfg.empty()) {
         moqt_stream_config_t v = {
             .codec = a.video_h265 ? MOQT_CODEC_H265 : MOQT_CODEC_H264,
             .config = a.vcfg.data(),
@@ -480,7 +512,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    if (!a.acfg.empty()) {
+    if (!only_video && !a.acfg.empty()) {
         moqt_stream_config_t au = {
             .codec = MOQT_CODEC_AAC,
             .config = a.acfg.data(),

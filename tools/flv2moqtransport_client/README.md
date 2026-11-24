@@ -6,7 +6,8 @@ inputs are supported.
 
 ```bash
 ./build/bin/flv2moqtransport_client <input.flv> <host> <port> <app> <stream> \
-    [--speed 1.0] [--stats 5] [--path /moq] [--console 1|true]
+    [--speed 1.0] [--stats 5] [--path /moq] [--console 1|true] \
+    [--only-video | --only-audio]
 ```
 
 Example:
@@ -21,6 +22,8 @@ Example:
 - The FLV may contain H.264 (`avcC`) or H.265/HEVC (`hvcC`) video, AAC audio
   (`AudioSpecificConfig`), or only one of them.  H.265 is sent with
   `MOQT_CODEC_H265` and the hvcC record as the MoQ video config.
+- `--only-video` and `--only-audio` force a single track and ignore the other;
+  they are mutually exclusive.
 - Frames are sent in file DTS order; `--speed 2` sends twice as fast.
 - Logs are written to `/tmp/flv2moqtransport_client.log` by default.
   Add `--console 1` (or `--console true`) to also print them to the console.
