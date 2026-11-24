@@ -159,6 +159,9 @@ private:
     static std::unordered_map<std::string, std::unique_ptr<MoqPushSession>> sessions_;
 };
 
+/* Enable per-video-frame diagnostics. Call once from main(), before uv_run(). */
+void MoqPushSetStreamDebug(bool enabled);
+
 } /* namespace cpp_streamer */
 
 #endif /* MEDIA_OVER_WT_MOQ_PUSH_HPP */

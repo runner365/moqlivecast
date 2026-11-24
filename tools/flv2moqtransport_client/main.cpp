@@ -11,6 +11,7 @@
 
 #include "flv_reader.hpp"
 #include "moq_transport_client.h"
+#include "timeex.hpp"
 
 #include <uv.h>
 #include <netdb.h>
@@ -73,6 +74,17 @@ struct App {
     uint64_t bytes = 0;
     bool failed = false;
 };
+
+/* Read once at startup; the send path only tests this bool. */
+bool g_client_debug = false;
+
+bool env_flag_on(const char *name) {
+    const char *v = std::getenv(name);
+    return v && *v &&
+           std::strcmp(v, "0") != 0 &&
+           std::strcmp(v, "false") != 0 &&
+           std::strcmp(v, "off") != 0;
+}
 
 void usage(const char *argv0) {
     fprintf(stderr,
@@ -223,6 +235,14 @@ void on_tick(uv_timer_t *t) {
         if (offset < 0 || now < a->start_wall_ms + (uint64_t)offset) break;
 
         moqt_stream_t *s = f.is_video ? a->video : a->audio;
+        if (g_client_debug && f.is_video) {
+            const int64_t wall_ms = cpp_streamer::now_millisec();
+            LOG_INFO("[client-debug] dts=%lld wall_ms=%lld app=%s stream=%s "
+                     "key=%d size=%zu",
+                     (long long)f.dts, (long long)wall_ms,
+                     a->appname.c_str(), a->stream.c_str(),
+                     f.key ? 1 : 0, f.payload.size());
+        }
         moqt_result_t r = moqt_stream_write_ex(
             s, f.payload.data(), f.payload.size(),
             f.dts, f.dts + f.cts, f.key,
@@ -350,8 +370,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    g_client_debug = env_flag_on("MOQ_CLIENT_DEBUG");
     log_set_console(1);
-    log_set_level(WARN);
+    log_set_level(g_client_debug ? INFO : WARN);
 
     App a;
     a.speed = speed;

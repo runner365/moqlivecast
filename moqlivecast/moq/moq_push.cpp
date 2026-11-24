@@ -35,6 +35,9 @@ constexpr uint64_t kLocTimestamp = 0x10;
 constexpr uint64_t kAliasVideo = 1;
 constexpr uint64_t kAliasAudio = 2;
 
+/* Read once in main(); the receive path only tests this bool. */
+bool g_moq_stream_debug = false;
+
 bool ReadBytes(const uint8_t *p, size_t len, size_t &off,
                size_t n, const uint8_t **out) {
     if (off + n > len) return false;
@@ -1083,6 +1086,16 @@ void MoqPushSession::OnLocObject(uint64_t alias, int64_t ts_ms, int64_t cts_ms,
             PublishCatalog();
         }
         EmitFlvVideo(ts_ms, false, key, payload, payload_len, cts_ms);
+        if (g_moq_stream_debug) {
+            const int64_t wall_ms = now_millisec();
+            LOG_INFO("[stream-debug] dts=%lld wall_ms=%lld app=%s stream=%s "
+                     "codec=%s key=%d size=%zu",
+                     static_cast<long long>(ts_ms),
+                     static_cast<long long>(wall_ms),
+                     app_.c_str(), stream_.c_str(),
+                     video_codec_ == MEDIA_CODEC_H265 ? "H265" : "H264",
+                     key ? 1 : 0, payload_len);
+        }
         return;
     }
     if (alias == kAliasAudio) {
@@ -1218,6 +1231,10 @@ void MoqPushSession::EmitFlvAudio(int64_t dts, bool seq,
     MediaStreamManager::WriterMediaPacket(pkt);
     LOG_DEBUG("[moq-rfc] flv audio %s dts=%lld size=%zu",
              seq ? "seq" : "raw", (long long)dts, len);
+}
+
+void MoqPushSetStreamDebug(bool enabled) {
+    g_moq_stream_debug = enabled;
 }
 
 } /* namespace cpp_streamer */

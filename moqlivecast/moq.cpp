@@ -8,6 +8,7 @@
 #include "cluster/cluster_manager.hpp"
 #include "media_source/media_source_manager.hpp"
 #include "media_source/moq_source_c_api.h"
+#include "moq/moq_push.hpp"
 #include "media_stream_manager.hpp"
 #include "utils/logger.hpp"
 #include "utils/meta_log.hpp"
@@ -65,6 +66,13 @@ int main(int argc, char *argv[]) {
     cfg_path = argv[1];
 
     setbuf(stdout, nullptr);
+    {
+        const char* v = getenv("MOQ_STREAM_DEBUG");
+        const bool on = v && *v &&
+            strcmp(v, "0") != 0 && strcmp(v, "false") != 0 &&
+            strcmp(v, "off") != 0;
+        cpp_streamer::MoqPushSetStreamDebug(on);
+    }
 
     auto &cfg = cpp_streamer::Config::Instance();
     if (!cfg.Load(cfg_path)) {
