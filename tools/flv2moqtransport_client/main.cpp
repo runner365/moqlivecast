@@ -153,12 +153,15 @@ void on_stream_ready(moqt_client_t *, moqt_stream_t *s,
              info->codec == MOQT_CODEC_H264 ? "H264" :
              (info->codec == MOQT_CODEC_H265 ? "H265" : "AAC"),
              info->config_len);
-    if (a->video_ready && a->audio_ready && !a->started) {
+    const bool video_done = a->video_ready || (a->video == nullptr);
+    const bool audio_done = a->audio_ready || (a->audio == nullptr);
+    if (video_done && audio_done && !a->started) {
         a->started = true;
         a->start_wall_ms = uv_now(&a->loop);
         if (a->first_dts < 0 && !a->pending.empty())
             a->first_dts = a->pending.front().dts;
-        LOG_INFO("[flv2moqtransport] publishing at %.2fx", a->speed);
+        LOG_INFO("[flv2moqtransport] publishing at %.2fx (video=%s audio=%s)",
+                 a->speed, a->video ? "yes" : "no", a->audio ? "yes" : "no");
     }
     (void)s;
 }
@@ -253,6 +256,11 @@ void on_tick(uv_timer_t *t) {
         if (offset < 0 || now < a->start_wall_ms + (uint64_t)offset) break;
 
         moqt_stream_t *s = f.is_video ? a->video : a->audio;
+        if (!s) {
+            /* Track was absent in the FLV (video-only / audio-only input). */
+            a->pending.pop_front();
+            continue;
+        }
         if (g_client_debug && f.is_video) {
             const int64_t wall_ms = cpp_streamer::now_millisec();
             LOG_INFO("[client-debug] dts=%lld wall_ms=%lld app=%s stream=%s "
@@ -419,8 +427,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Read until both sequence headers are found. */
+    /* Read sequence headers. If the FLV has only one track, stop once
+     * the first media frame appears: waiting for the missing sequence
+     * header would otherwise read the whole file before connecting. */
     while ((a.vcfg.empty() || a.acfg.empty()) && a.reader.Fill()) {
+        bool saw_media = false;
         while (!a.reader.Empty()) {
             flv2moq::FlvFrame f = a.reader.TakeFront();
             if (f.is_seq_hdr) {
@@ -432,12 +443,14 @@ int main(int argc, char **argv) {
                 }
             } else {
                 a.pending.push_back(std::move(f));
+                saw_media = true;
             }
         }
+        if (saw_media && (!a.vcfg.empty() || !a.acfg.empty())) break;
     }
-    if (a.vcfg.empty() || a.acfg.empty()) {
-        fprintf(stderr, "FLV missing H.264 avcC or AAC AudioSpecificConfig "
-                        "(video=%zu audio=%zu)\n",
+    if (a.vcfg.empty() && a.acfg.empty()) {
+        fprintf(stderr, "FLV has no usable H.264/H.265 avcC/hvcC or AAC "
+                        "AudioSpecificConfig (video=%zu audio=%zu)\n",
                 a.vcfg.size(), a.acfg.size());
         return 1;
     }
@@ -454,23 +467,31 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    moqt_stream_config_t v = {
-        .codec = a.video_h265 ? MOQT_CODEC_H265 : MOQT_CODEC_H264,
-        .config = a.vcfg.data(),
-        .config_len = a.vcfg.size(),
-        .codec_name = a.video_h265 ? "hvc1.1.6.L93.B0" : "avc1.64001f",
-    };
-    moqt_stream_config_t au = {
-        .codec = MOQT_CODEC_AAC,
-        .config = a.acfg.data(),
-        .config_len = a.acfg.size(),
-        .codec_name = "mp4a.40.2",
-    };
-    a.video = moqt_client_add_stream(a.client, &v);
-    a.audio = moqt_client_add_stream(a.client, &au);
-    if (!a.video || !a.audio) {
-        fprintf(stderr, "add_stream failed\n");
-        return 1;
+    if (!a.vcfg.empty()) {
+        moqt_stream_config_t v = {
+            .codec = a.video_h265 ? MOQT_CODEC_H265 : MOQT_CODEC_H264,
+            .config = a.vcfg.data(),
+            .config_len = a.vcfg.size(),
+            .codec_name = a.video_h265 ? "hvc1.1.6.L93.B0" : "avc1.64001f",
+        };
+        a.video = moqt_client_add_stream(a.client, &v);
+        if (!a.video) {
+            fprintf(stderr, "add_stream(video) failed\n");
+            return 1;
+        }
+    }
+    if (!a.acfg.empty()) {
+        moqt_stream_config_t au = {
+            .codec = MOQT_CODEC_AAC,
+            .config = a.acfg.data(),
+            .config_len = a.acfg.size(),
+            .codec_name = "mp4a.40.2",
+        };
+        a.audio = moqt_client_add_stream(a.client, &au);
+        if (!a.audio) {
+            fprintf(stderr, "add_stream(audio) failed\n");
+            return 1;
+        }
     }
 
     uv_timer_init(&a.loop, &a.tick);

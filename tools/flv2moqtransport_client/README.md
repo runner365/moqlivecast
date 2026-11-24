@@ -1,7 +1,8 @@
 # flv2moqtransport_client
 
-Read an FLV file and publish it with `moq_transport_client` (H.264 + AAC),
-paced by the file's DTS.
+Read an FLV file and publish it with `moq_transport_client` (H.264/H.265 +
+AAC), paced by the file's DTS.  Video-only, audio-only, and video+audio FLV
+inputs are supported.
 
 ```bash
 ./build/bin/flv2moqtransport_client <input.flv> <host> <port> <app> <stream> \
@@ -17,9 +18,9 @@ Example:
 - `host` may be an IPv4 literal or a domain with an IPv4 A record; the tool
   resolves it with `uv_getaddrinfo(AF_INET)` and keeps the domain as the
   WebTransport `:authority`. The QUIC stack itself is IPv4-only.
-- The FLV may contain H.264 (`avcC`) or H.265/HEVC (`hvcC`) video, plus AAC
-  audio (`AudioSpecificConfig`).  H.265 is sent with `MOQT_CODEC_H265` and the
-  hvcC record as the MoQ video config.
+- The FLV may contain H.264 (`avcC`) or H.265/HEVC (`hvcC`) video, AAC audio
+  (`AudioSpecificConfig`), or only one of them.  H.265 is sent with
+  `MOQT_CODEC_H265` and the hvcC record as the MoQ video config.
 - Frames are sent in file DTS order; `--speed 2` sends twice as fast.
 - Logs are written to `/tmp/flv2moqtransport_client.log` by default.
   Add `--console 1` (or `--console true`) to also print them to the console.
