@@ -16,7 +16,7 @@ client -> connect(host, port, path="/moq", app, stream, direction, timeout_ms)
 ```c
 moqt_client_t *c = moqt_client_new(loop, &callbacks, user);
 
-/* Publisher: add video + audio before connect. */
+/* Publisher: add video and/or audio before connect (at least one). */
 moqt_client_add_stream(c, &(moqt_stream_config_t){
     .codec = MOQT_CODEC_H264,             /* or MOQT_CODEC_H265 */
     .config = avcC, .config_len = avcC_len,
@@ -74,8 +74,9 @@ moqt_client_connect(c, host, port, "/moq", app, stream,
 - `high_watermark` is in **payload bytes**, not wire bytes.  When
   `inflight + len > watermark`, writes return `MOQT_ERR_AGAIN`; the caller
   decides whether to drop non-key video.
-- Publisher requires both video and audio.  A video-only variant can be
-  added by relaxing the check in `moqt_client_connect`.
+- Publisher requires at least one track: video-only, audio-only, and
+  video+audio are all supported.  Add only the tracks that exist before
+  `moqt_client_connect()`.
 - The server may rebase media timestamps when replaying a GOP (a pull starts
   near 0); subscribers should treat timestamps as a continuous timeline,
   not as the publisher's absolute DTS.

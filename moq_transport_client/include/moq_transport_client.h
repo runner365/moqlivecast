@@ -109,7 +109,8 @@ moqt_stream_t *moqt_client_add_stream(moqt_client_t *c,
 
 /* Connect and start the session.  `path` is the server WebTransport path
  * (normally "/moq"); app/stream form the MoQ namespace and must be non-empty.
- * For publish, call add_stream() for video and audio before this.
+ * For publish, call add_stream() for video and/or audio (at least one)
+ * before this.
  * For subscribe, the SDK creates the video/audio streams from incoming data.
  * Returns MOQT_OK if the async connect was queued; the final result arrives
  * through on_connected(). */

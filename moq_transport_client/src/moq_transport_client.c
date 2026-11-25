@@ -504,8 +504,21 @@ static void send_buf(moqt_client_t *c, wt_stream_t *st, moq_buf *b) {
 
 /* ---------------- publisher ---------------- */
 
+static int pub_slot_available(const moqt_client_t *c, int slot) {
+    if ((slot == PUB_REQ_VIDEO || slot == PUB_DATA_VIDEO) && !c->video)
+        return 0;
+    if ((slot == PUB_REQ_AUDIO || slot == PUB_DATA_AUDIO) && !c->audio)
+        return 0;
+    return 1;
+}
+
 static void pub_open_next(moqt_client_t *c) {
-    if (!c->wt || c->pub_opened >= PUB_DONE) return;
+    if (!c->wt) return;
+    while (c->pub_opened < PUB_DONE &&
+           !pub_slot_available(c, c->pub_opened)) {
+        c->pub_opened++;
+    }
+    if (c->pub_opened >= PUB_DONE) return;
     int slot = c->pub_opened;
     if (slot == PUB_CONTROL || slot >= PUB_DATA_CATALOG)
         wt_client_open_uni_stream(c->wt);
@@ -539,6 +552,7 @@ static void pub_handle_open(moqt_client_t *c, int slot, wt_stream_t *st) {
         return;
     }
     if (slot == PUB_REQ_VIDEO) {
+        if (!c->video) return;
         moq_buf b = build_publish(c->app, c->stream, "video",
                                   ALIAS_VIDEO, 2);
         send_buf(c, st, &b);
@@ -546,6 +560,7 @@ static void pub_handle_open(moqt_client_t *c, int slot, wt_stream_t *st) {
         return;
     }
     if (slot == PUB_REQ_AUDIO) {
+        if (!c->audio) return;
         moq_buf b = build_publish(c->app, c->stream, "audio",
                                   ALIAS_AUDIO, 4);
         send_buf(c, st, &b);
@@ -982,7 +997,7 @@ moqt_result_t moqt_client_connect_ex(moqt_client_t *c,
     if (direction != MOQT_DIRECTION_PUBLISH &&
         direction != MOQT_DIRECTION_SUBSCRIBE)
         return MOQT_ERR_INVALID;
-    if (direction == MOQT_DIRECTION_PUBLISH && (!c->video || !c->audio))
+    if (direction == MOQT_DIRECTION_PUBLISH && !c->video && !c->audio)
         return MOQT_ERR_INVALID;
     if (c->state != C_IDLE) return MOQT_ERR_STATE;
 
