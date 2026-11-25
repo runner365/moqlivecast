@@ -419,7 +419,7 @@ int main(int argc, char **argv) {
     g_client_debug = env_flag_on("MOQ_CLIENT_DEBUG");
     log_set_file("/tmp/flv2moqtransport_client.log");
     log_set_console(console_log ? 1 : 0);
-    log_set_level((g_client_debug || console_log) ? INFO : WARN);
+    log_set_level(INFO);
 
     App a;
     a.speed = speed;

@@ -19,6 +19,11 @@
 /* ============================================
  * 结构体
  * ============================================ */
+typedef struct {
+    uint64_t lo;
+    uint64_t hi;
+} QuicAckRange;
+
 struct QuicConnection {
     uv_loop_t *loop_;
     QuicState  state_;
@@ -99,10 +104,13 @@ struct QuicConnection {
     uint64_t  pkts_acked_with_key_;    /* 当前 key phase 已被确认的包 PN 上限 */
 #define QUIC_KEY_UPDATE_INTERVAL   5000  /* 每 5000 包发起一次 Key Update */
 
-    /* 收到的 PN — 每级 PN 空间独立跟踪 ACK */
-    int      need_ack_[QUIC_TLS_LEVEL_NUM];
-    uint64_t ack_largest_pn_[QUIC_TLS_LEVEL_NUM];
-    uint64_t ack_first_range_[QUIC_TLS_LEVEL_NUM];
+    /* 收到的 PN — 每级 PN 空间独立跟踪 ACK。
+     * 必须保存多个区间：丢包后会出现「后面的包已收到、中间的包稍后重传」
+     * 的乱序模式；只记 largest + first_range 无法 ACK 低 PN 的重传包，
+     * 发送端会永远 PTO 重传同一个 chunk。 */
+    int          need_ack_[QUIC_TLS_LEVEL_NUM];
+    QuicAckRange ack_ranges_[QUIC_TLS_LEVEL_NUM][QUIC_ACK_MAX_RANGES];
+    int          ack_range_count_[QUIC_TLS_LEVEL_NUM];
 
     /* 关闭 */
     uint64_t   close_ec_;
@@ -565,17 +573,92 @@ int quic_conn_queue_frames(void *vconn, const uint8_t *frames, size_t flen) {
  *   - 有这行，但 largest 停在原地不往前走 → ACK 内容或 PN 记账的问题
  *   - alen < 0 那条 ERROR → ACK 帧根本没拼出来（会被静默丢掉，见下）
  */
+/* ── 收到的 PN 区间维护 ────────────────────────
+ * ack_ranges_ 按 lo 升序保存；相邻/重叠区间立即合并。
+ * 返回 1 表示这是一个此前没见过的 PN（需要回 ACK）。 */
+static uint64_t ack_largest_received(const QuicConnection *conn, int level) {
+    const int n = conn->ack_range_count_[level];
+    return n > 0 ? conn->ack_ranges_[level][n - 1].hi : 0;
+}
+
+static int ack_record_received(QuicConnection *conn, int level, uint64_t pn) {
+    QuicAckRange *r = conn->ack_ranges_[level];
+    int n = conn->ack_range_count_[level];
+
+    for (int i = 0; i < n; i++) {
+        if (pn >= r[i].lo && pn <= r[i].hi) return 0;  /* duplicate */
+    }
+
+    int pos = n;
+    while (pos > 0 && r[pos - 1].lo > pn) pos--;
+
+    if (n == QUIC_ACK_MAX_RANGES) {
+        /* 区间窗口满：保留较新的区间。比最旧区间还老的包不再 ACK。 */
+        if (pos == 0) return 0;
+        memmove(&r[0], &r[1], sizeof(r[0]) * (size_t)(n - 1));
+        pos--;
+        n--;
+    }
+
+    memmove(&r[pos + 1], &r[pos], sizeof(r[0]) * (size_t)(n - pos));
+    r[pos].lo = pn;
+    r[pos].hi = pn;
+    n++;
+
+    /* merge touching/overlapping ranges */
+    for (int i = 0; i + 1 < n; ) {
+        if (r[i].hi >= r[i + 1].lo ||
+            (r[i].hi != UINT64_MAX && r[i].hi + 1 == r[i + 1].lo)) {
+            if (r[i + 1].hi > r[i].hi) r[i].hi = r[i + 1].hi;
+            memmove(&r[i + 1], &r[i + 2],
+                    sizeof(r[0]) * (size_t)(n - i - 2));
+            n--;
+        } else {
+            i++;
+        }
+    }
+    conn->ack_range_count_[level] = n;
+    return 1;
+}
+
+/* Fill a QUIC ACK frame from the received-PN interval set. */
+static int ack_build_from_ranges(QuicConnection *conn, int level,
+                                 QuicAckFrame *ack) {
+    const QuicAckRange *r = conn->ack_ranges_[level];
+    const int n = conn->ack_range_count_[level];
+    if (!ack || n <= 0) return -1;
+
+    memset(ack, 0, sizeof(*ack));
+    const QuicAckRange *top = &r[n - 1];
+    ack->largest_acknowledged = top->hi;
+    ack->ack_delay = 0;
+    ack->first_ack_range = top->hi - top->lo;
+
+    uint64_t prev_lo = top->lo;
+    int nr = 0;
+    for (int i = n - 2; i >= 0 && nr < QUIC_ACK_MAX_RANGES; i--) {
+        if (r[i].hi >= prev_lo) continue;  /* already merged */
+        ack->gap[nr] = prev_lo - r[i].hi - 2;
+        ack->ack_range[nr] = r[i].hi - r[i].lo;
+        prev_lo = r[i].lo;
+        nr++;
+    }
+    ack->num_ranges = nr;
+    return 0;
+}
+
 static void log_ack_observability(QuicConnection *conn, const char *where,
-                                  uint64_t largest, uint64_t first_range, int alen) {
+                                  uint64_t largest, uint64_t first_range,
+                                  int num_ranges, int alen) {
     static uint64_t last_ms;
     static uint64_t n;
     uint64_t now = uv_now(conn->loop_);
     n++;
     if (last_ms != 0 && now - last_ms < 1000) return;
     last_ms = now;
-    LOG_DEBUG("[quic-conn] ACK %s: largest=%llu first_range=%llu alen=%d (total=%llu)",
+    LOG_DEBUG("[quic-conn] ACK %s: largest=%llu first_range=%llu ranges=%d alen=%d (total=%llu)",
               where, (unsigned long long)largest, (unsigned long long)first_range,
-              alen, (unsigned long long)n);
+              num_ranges, alen, (unsigned long long)n);
 }
 
 void quic_conn_queue_ack(void *vconn) {
@@ -584,13 +667,9 @@ void quic_conn_queue_ack(void *vconn) {
     if (!conn->need_ack_[level]) return;
     conn->need_ack_[level] = 0;
 
-    uint8_t ack_buf[256];
+    uint8_t ack_buf[1024];
     QuicAckFrame ack;
-    memset(&ack, 0, sizeof(ack));
-    ack.largest_acknowledged = conn->ack_largest_pn_[level];
-    ack.ack_delay            = 0;
-    ack.num_ranges           = 0;
-    ack.first_ack_range      = conn->ack_first_range_[level];
+    if (ack_build_from_ranges(conn, level, &ack) < 0) return;
 
     int alen = quic_frame_write_ack(ack_buf, sizeof(ack_buf), &ack);
     if (alen < 0) {
@@ -605,7 +684,7 @@ void quic_conn_queue_ack(void *vconn) {
         return;
     }
     log_ack_observability(conn, "queued", ack.largest_acknowledged,
-                          ack.first_ack_range, alen);
+                          ack.first_ack_range, ack.num_ranges, alen);
 
     /* ACK 帧放在最前面 */
     if (conn->pkt_payload_len_ + (size_t)alen > QUIC_MAX_PAYLOAD_LEN) {
@@ -1467,23 +1546,15 @@ static void record_rx_pn(QuicConnection *conn, int level, uint64_t pn,
      * 灌满、把真正要发的组流饿死。 */
     if (!ack_eliciting) return;
 
-    if (!conn->need_ack_[level]) {
-        conn->ack_largest_pn_[level]  = pn;
-        conn->ack_first_range_[level] = 0;
-        conn->need_ack_[level]        = 1;
-    } else {
-        if (pn == conn->ack_largest_pn_[level] + 1) {
-            conn->ack_first_range_[level]++;
-            conn->ack_largest_pn_[level] = pn;
-        } else if (pn > conn->ack_largest_pn_[level]) {
-            /* gap detected: flush pending ACK first, then start new range */
-            build_and_send_ack(conn, level);
-            conn->ack_largest_pn_[level]  = pn;
-            conn->ack_first_range_[level] = 0;
-            conn->need_ack_[level]        = 1;
-        }
-        /* pn < largest: duplicate or reordered, ignored */
-    }
+    const uint64_t old_largest = ack_largest_received(conn, level);
+    if (!ack_record_received(conn, level, pn)) return;
+
+    conn->need_ack_[level] = 1;
+    /* A new largest PN is useful immediately (gap feedback); a lower PN is
+     * a reordered/retransmitted packet and will be included by the next
+     * ACK timer tick.  The key point is that it is now recorded and will
+     * be acknowledged, unlike the old implementation. */
+    if (pn > old_largest) build_and_send_ack(conn, level);
 }
 
 static int build_and_send_ack(QuicConnection *conn, int level) {
@@ -1493,13 +1564,9 @@ static int build_and_send_ack(QuicConnection *conn, int level) {
     if (!conn->need_ack_[level]) return 0;
     conn->need_ack_[level] = 0;
 
-    uint8_t ack_buf[256];
+    uint8_t ack_buf[1024];
     QuicAckFrame ack;
-    memset(&ack, 0, sizeof(ack));
-    ack.largest_acknowledged = conn->ack_largest_pn_[level];
-    ack.ack_delay            = 0;
-    ack.num_ranges           = 0;
-    ack.first_ack_range      = conn->ack_first_range_[level];
+    if (ack_build_from_ranges(conn, level, &ack) < 0) return 0;
 
     int alen = quic_frame_write_ack(ack_buf, sizeof(ack_buf), &ack);
     if (alen < 0) {
@@ -1510,7 +1577,7 @@ static int build_and_send_ack(QuicConnection *conn, int level) {
         return -1;
     }
     log_ack_observability(conn, "sent-now", ack.largest_acknowledged,
-                          ack.first_ack_range, alen);
+                          ack.first_ack_range, ack.num_ranges, alen);
 
     /* ACK 帧作为单独的短头包发送，或捎带在下一个出站包中 */
     /* 简化：如果 ACK 后还有数据发送，会自然捎带。这里发送单独的 ACK-only 包 */
