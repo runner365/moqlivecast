@@ -219,6 +219,7 @@ struct QuicConnection {
     uint64_t stats_bytes_recv_;
     uint64_t stats_pkts_sent_;
     uint64_t stats_pkts_recv_;
+    uint64_t stats_ack_frames_;   /* 已发出的 ACK 帧次数（上行反馈量） */
     uint64_t send_rate_start_ms_;
     uint64_t send_rate_bytes_;
     uint64_t send_kbps_;
@@ -683,6 +684,7 @@ void quic_conn_queue_ack(void *vconn) {
                   (unsigned long long)ack.first_ack_range);
         return;
     }
+    conn->stats_ack_frames_++;
     log_ack_observability(conn, "queued", ack.largest_acknowledged,
                           ack.first_ack_range, ack.num_ranges, alen);
 
@@ -1576,6 +1578,7 @@ static int build_and_send_ack(QuicConnection *conn, int level) {
                   (unsigned long long)ack.first_ack_range, level);
         return -1;
     }
+    conn->stats_ack_frames_++;
     log_ack_observability(conn, "sent-now", ack.largest_acknowledged,
                           ack.first_ack_range, ack.num_ranges, alen);
 
@@ -3690,6 +3693,32 @@ int QuicConnectionGetStats(QuicConnection *conn, QuicConnectionStats *out) {
     const QuicRecoveryCtx *rc = &conn->recovery_ctx_;
     out->packets_lost = rc->packets_lost_;
     out->packets_acked = rc->packets_acked_;
+
+    /* 上行反馈量：我们发了多少次 ACK（纯 ACK 包与捎带的都算） */
+    out->ack_frames = conn->stats_ack_frames_;
+
+    /* 下行丢包率：用 1-RTT PN 空间的区间空洞推算。
+     *   span = 最大 PN − 最小已记录 PN + 1，实收 = Σ(区间长度)
+     * 基线取「首个记录到的 PN」而不是 0：连接建立初期的包可能在我们开始
+     * 记账之前就处理掉了，从 0 起算会把这部分恒定误判成丢包（实测回环
+     * 网络也会显示 1%+，且随 largest 增大而缓慢下降——典型的固定偏移）。
+     * 注意区间数有上限（QUIC_ACK_MAX_RANGES），极端碎片化时会高估。 */
+    {
+        const int lvl = QUIC_TLS_LEVEL_APPLICATION;
+        const int n = conn->ack_range_count_[lvl];
+        uint64_t got = 0;
+        for (int i = 0; i < n; i++) {
+            got += conn->ack_ranges_[lvl][i].hi - conn->ack_ranges_[lvl][i].lo + 1;
+        }
+        const uint64_t largest  = ack_largest_received(conn, lvl);
+        const uint64_t first_lo = (n > 0) ? conn->ack_ranges_[lvl][0].lo : 0;
+        const uint64_t span = largest >= first_lo ? largest - first_lo + 1 : 0;
+        out->packets_expected = span;
+        if (span > 0) {
+            double loss = 1.0 - (double)got / (double)span;
+            out->rx_loss_rate = loss > 0.0 ? loss : 0.0;
+        }
+    }
     out->srtt_ms = rc->smoothed_rtt_;
     out->latest_rtt_ms = rc->latest_rtt_;
     out->min_rtt_ms = rc->min_rtt_;

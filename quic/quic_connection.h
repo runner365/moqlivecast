@@ -179,6 +179,10 @@ typedef struct QuicConnectionStats {
     uint64_t packets_lost;
     uint64_t packets_acked;
 
+    uint64_t ack_frames;        /* 已发出的 ACK 帧次数（上行反馈） */
+    uint64_t packets_expected;  /* 下行按 PN 推算的应收包数 */
+    double   rx_loss_rate;      /* 下行丢包率 0..1（按 PN 空洞推算） */
+
     uint64_t srtt_ms;
     uint64_t latest_rtt_ms;
     uint64_t min_rtt_ms;

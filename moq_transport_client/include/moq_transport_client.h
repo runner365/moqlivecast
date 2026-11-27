@@ -169,6 +169,29 @@ void moqt_client_close(moqt_client_t *c);
  * 建议在 moqt_client_connect() 之前调用。 */
 void moqt_client_set_pto_max(moqt_client_t *c, uint64_t max_ms);
 
+/* ── 链路统计快照 ────────────────────────────────────────────
+ * 任意时刻可调用；连接未建立时返回 -1。
+ *
+ * 字段语义：
+ *   recv_kbps / send_kbps   QUIC 层最近 ~1s 的**总**速率（含所有轨）
+ *   rx_loss_rate            下行丢包率 0..1，按 1-RTT PN 空洞推算
+ *   packets_lost            **上行**（我们发出去的包）被判定丢失的数量
+ *   ack_frames              已发出的 ACK 帧次数（累计值，用于算上行反馈速率）
+ * 速率类字段（ack_frames 除外）已由 QUIC 层按 1s 窗口更新，其余为累计值。 */
+typedef struct {
+    uint64_t send_kbps, recv_kbps;
+    uint64_t bytes_sent, bytes_recv;
+    uint64_t packets_sent, packets_recv;
+    uint64_t packets_lost, packets_acked;
+    uint64_t ack_frames;
+    uint64_t packets_expected;   /* 下行按 PN 推算的应收包数 */
+    uint64_t srtt_ms, latest_rtt_ms, min_rtt_ms;
+    uint64_t bytes_in_flight;
+    double   rx_loss_rate;       /* 0..1 */
+} moqt_link_stats_t;
+
+int moqt_client_get_link_stats(moqt_client_t *c, moqt_link_stats_t *out);
+
 /* Free the client after close/loop shutdown.  Does not free the loop. */
 void moqt_client_free(moqt_client_t *c);
 
