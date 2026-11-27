@@ -29,6 +29,8 @@ Example:
   Add `--console 1` (or `--console true`) to also print them to the console.
 - Set `MOQ_CLIENT_DEBUG=1` to include per-video-frame `dts` / wall-clock
   diagnostics (`[client-debug]`).
+- The client caps QUIC PTO at **300 ms** for real-time publishing; the cap
+  never goes below the RTT-derived `pto_base`.
 - The tool prints sent/ACK counts and exits non-zero if any write fails.
 
 This is a demo client for the SDK; it keeps the whole pending frame queue in

@@ -175,6 +175,9 @@ int moq_lite_session_set_alpn(const char *const *protos, int count);
 int moq_lite_session_connect(moq_lite_session_t s, const char *url,
                              const moq_lite_session_cb_t *cb);
 
+/* 0 = 不额外限制；>0 = 最大 PTO（不会低于 pto_base）。须在 connect 前调用。 */
+void moq_lite_session_set_pto_max(moq_lite_session_t s, uint64_t max_ms);
+
 /* 协商到的 ALPN（握手完成后有效）。空串 = 还没握手 / 对端没提供。 */
 const char *moq_lite_session_alpn(moq_lite_session_t s);
 

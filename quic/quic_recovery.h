@@ -90,6 +90,9 @@ typedef struct {
     /* PTO */
     uint64_t pto_count_;
     uint64_t pto_base_;
+    /* 0 = 不额外限制；>0 = 最大 PTO（仍保证不低于 pto_base_）。 */
+    uint64_t pto_max_ms_;
+    uint64_t last_pto_cap_log_ms_;
 
     #define QUIC_PERSISTENT_CONGESTION_THRESHOLD 3
     uint64_t loss_epoch_start_ms_;
@@ -145,6 +148,7 @@ void quic_recovery_clear_handshake(QuicRecoveryCtx *ctx);
 uint64_t quic_recovery_get_srtt(const QuicRecoveryCtx *ctx);
 uint64_t quic_recovery_get_bytes_in_flight(const QuicRecoveryCtx *ctx);
 void     quic_recovery_reset_pto(QuicRecoveryCtx *ctx);
+void     quic_recovery_set_pto_max_ms(QuicRecoveryCtx *ctx, uint64_t max_ms);
 int      quic_recovery_can_send(const QuicRecoveryCtx *ctx);
 
 #ifdef __cplusplus

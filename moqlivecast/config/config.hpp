@@ -65,6 +65,9 @@ public:
      * 共用同一个 UDP 端口 —— 包按连接 ID 分，协议在握手时定一次。 */
     const std::vector<std::string> &AlpnList() const { return alpn_list_; }
 
+    /* QUIC PTO 上限。0 = 不额外限制；>0 = 最大 PTO（不会低于 pto_base）。 */
+    int QuicPtoMaxMs() const { return quic_pto_max_ms_; }
+
     /* 本地媒体源，来自 YAML 的 media_sources。
      * 第一版接受 type=flv；paths 可以是多个文件，按顺序轮询播放。 */
     const std::vector<MediaSourceConfig> &MediaSources() const {
@@ -134,6 +137,7 @@ private:
     std::string cert_file_;
     std::string key_file_;
     std::vector<std::string> alpn_list_;
+    int quic_pto_max_ms_ = 0;
     std::vector<MediaSourceConfig> media_sources_;
 
     std::string httpflv_listen_ip_ = "0.0.0.0";

@@ -106,6 +106,8 @@ struct moqt_client {
     moqt_stream_t *video;
     moqt_stream_t *audio;
 
+    uint64_t pto_max_ms;
+
     int closing;
     char close_reason[128];
 
@@ -939,6 +941,7 @@ moqt_client_t *moqt_client_new(uv_loop_t *loop,
     c->cb = *callbacks;
     c->user = user;
     c->state = C_IDLE;
+    c->pto_max_ms = 0;
     c->connect_timeout_ms = 10000;
     uv_timer_init(loop, &c->connect_timer);
     c->connect_timer.data = c;
@@ -1020,6 +1023,8 @@ moqt_result_t moqt_client_connect_ex(moqt_client_t *c,
 
     c->wt = wt_client_new(c->loop, &wcb);
     if (!c->wt) return MOQT_ERR_CONNECT;
+    if (c->pto_max_ms > 0)
+        wt_client_set_pto_max(c->wt, c->pto_max_ms);
     c->state = C_CONNECTING;
     c->connect_reported = 0;
     c->close_reported = 0;
@@ -1111,6 +1116,12 @@ const char *moqt_stream_track_name(const moqt_stream_t *s) {
 const uint8_t *moqt_stream_config(const moqt_stream_t *s, size_t *len) {
     if (len) *len = s ? s->config_len : 0;
     return s ? s->config : NULL;
+}
+
+void moqt_client_set_pto_max(moqt_client_t *c, uint64_t max_ms) {
+    if (!c) return;
+    c->pto_max_ms = max_ms;
+    if (c->wt) wt_client_set_pto_max(c->wt, max_ms);
 }
 
 void moqt_client_close(moqt_client_t *c) {

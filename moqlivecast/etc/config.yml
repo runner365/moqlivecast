@@ -35,6 +35,14 @@ moq_server:
   certfile: ""
   keyfile: ""
 
+# ── QUIC 恢复层 ──
+# pto_max_ms:
+#   0   = 保持当前行为：最大 8 × pto_base（最多 3 次退避）
+#   >0  = PTO 绝对上限，仍保证不低于 pto_base，避免伪重传
+#   实时音视频可试 300~500；文本/弱网场景建议保持 0。
+quic:
+  pto_max_ms: 300
+
 httpflv:
   listenip: 0.0.0.0
   port: 4433

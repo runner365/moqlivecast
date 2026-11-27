@@ -354,6 +354,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "moqt_client_new failed\n");
         return 1;
     }
+    moqt_client_set_pto_max(a.client, 300);
 
     uv_timer_init(&a.loop, &a.duration);
     uv_timer_init(&a.loop, &a.finish);

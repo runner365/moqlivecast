@@ -157,6 +157,9 @@ const char* QuicConnectionGetAlpn(QuicConnection *conn);
 int QuicConnectionSetAlpnList(QuicConnection *conn,
                                const char *const *protos, int count);
 
+/* 0 = 不额外限制 PTO；>0 = 最大 PTO，且不会低于 pto_base。 */
+void QuicConnectionSetPtoMaxMs(QuicConnection *conn, uint64_t max_ms);
+
 /* 对端地址。握手完成回调里也能用（on_connection 之外还需要它的场合）。 */
 void QuicConnectionGetPeer(QuicConnection *conn, char *ip, size_t ip_len,
                             int *port);

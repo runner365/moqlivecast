@@ -50,6 +50,10 @@ public:
     /* 进程退出/停服时主动收摊。不断开连接，只丢本地会话。 */
     void Clear();
 
+    /* 0 = 不额外限制；>0 = 最大 PTO（仍保证不低于 pto_base）。
+     * 必须在 OnConnection 之前设置。 */
+    void SetPtoMaxMs(uint64_t max_ms) { pto_max_ms_ = max_ms; }
+
     /* catalog.json 更新：转发给每个会话，由会话给它的 catalog 订阅方补发新组。
      * 必须在唯一 uv loop 线程调用（MediaStreamManager 的回调就是这个线程）。 */
     void OnCatalogUpdated(const std::string &stream_key, uint64_t rev);
@@ -100,6 +104,7 @@ private:
     StreamMissingFn on_stream_missing_;
     RemoteAnnounceProvider remote_announce_provider_;
     int deferred_subscribe_ms_ = 3000;
+    uint64_t pto_max_ms_ = 0;
 };
 
 } /* namespace cpp_streamer */

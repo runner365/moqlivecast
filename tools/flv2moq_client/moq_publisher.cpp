@@ -75,6 +75,7 @@ int MoqPublisher::Start(uv_loop_t *loop, const std::string &host, int port,
         LOG_ERROR("[flv2moq] wt_client_new 失败");
         return -1;
     }
+    wt_client_set_pto_max(cli_, 300);
 
     LOG_INFO("[flv2moq] 连接 %s:%d path=%s", host.c_str(), port,
              url_path.c_str());

@@ -148,6 +148,7 @@ int main(int argc, char *argv[]) {
         LOG_ERROR("[moq] WTServer create failed");
         return 1;
     }
+    g_srv->SetPtoMaxMs(static_cast<uint64_t>(cfg.QuicPtoMaxMs()));
 
     for (const auto &sp : cfg.SubPaths()) {
         if (g_srv->AddPath(sp.path,
@@ -171,6 +172,7 @@ int main(int argc, char *argv[]) {
          * 分派点在 http3_server 的握手完成回调里，这里只负责把接住的那半边
          * 接上。 */
         g_moq_lite = std::make_unique<cpp_streamer::MoqLiteServer>();
+        g_moq_lite->SetPtoMaxMs(static_cast<uint64_t>(cfg.QuicPtoMaxMs()));
         /* catalog.json 更新有两个消费者：
          *   ① 已连接的 moq-lite 订阅方补发新组；
          *   ② ClusterManager 据此建立/更新上推连接。

@@ -165,6 +165,10 @@ const uint8_t *moqt_stream_config(const moqt_stream_t *s, size_t *len);
 /* Close the WebTransport session.  on_closed() will fire. */
 void moqt_client_close(moqt_client_t *c);
 
+/* 0 = 不额外限制；>0 = 最大 PTO（不会低于 pto_base）。
+ * 建议在 moqt_client_connect() 之前调用。 */
+void moqt_client_set_pto_max(moqt_client_t *c, uint64_t max_ms);
+
 /* Free the client after close/loop shutdown.  Does not free the loop. */
 void moqt_client_free(moqt_client_t *c);
 

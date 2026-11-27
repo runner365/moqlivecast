@@ -136,6 +136,7 @@ WTServerSession *WTServer::EnsureSession(wt_session_t *sess,
     if (it != sessions_.end()) return it->second.get();
     auto wrapper = std::make_unique<WTServerSession>(sess, path);
     WTServerSession *p = wrapper.get();
+    if (pto_max_ms_ > 0) wt_session_set_pto_max(sess, pto_max_ms_);
     sessions_[sess] = std::move(wrapper);
     return p;
 }

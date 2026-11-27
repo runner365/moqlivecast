@@ -285,6 +285,17 @@ bool Config::Load(const std::string &filename) {
         cert_file_ = YamlStringOrEmpty(srv["certfile"]);
         key_file_ = YamlStringOrEmpty(srv["keyfile"]);
 
+        YAML::Node quic = root["quic"];
+        if (quic && quic.IsMap() && quic["pto_max_ms"]) {
+            const int v = quic["pto_max_ms"].as<int>();
+            if (v < 0 || v > 600000) {
+                LOG_ERROR("[config] quic.pto_max_ms out of range: %d", v);
+                return false;
+            }
+            quic_pto_max_ms_ = v;
+        }
+        LOG_INFO("[config] quic.pto_max_ms=%d (0=unlimited)", quic_pto_max_ms_);
+
         YAML::Node httpflv = root["httpflv"];
         if (httpflv && httpflv.IsMap()) {
             if (httpflv["listenip"]) {

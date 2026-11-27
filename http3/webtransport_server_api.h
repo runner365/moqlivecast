@@ -105,6 +105,9 @@ void wt_session_close(wt_session_t *sess);
 /* 底层 QUIC 路径 / 拥塞快照。成功返回 0 */
 int wt_session_get_quic_stats(wt_session_t *sess, QuicConnectionStats *out);
 
+/* 0 = 不额外限制；>0 = 最大 PTO（仍保证不低于 pto_base）。 */
+void wt_session_set_pto_max(wt_session_t *sess, uint64_t max_ms);
+
 /* 主动打开 stream。回调在 stream 就绪时调用 */
 typedef void (*wt_session_on_stream_open_fn)(wt_server_t *srv,
                                               wt_session_t *sess,

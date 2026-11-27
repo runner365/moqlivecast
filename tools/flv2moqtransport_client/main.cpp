@@ -498,6 +498,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "moqt_client_new failed\n");
         return 1;
     }
+    /* Bound tail-loss recovery for this real-time publish client. */
+    moqt_client_set_pto_max(a.client, 300);
 
     if (!only_audio && !a.vcfg.empty()) {
         moqt_stream_config_t v = {

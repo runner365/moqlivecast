@@ -58,6 +58,9 @@ public:
                const char *const *alpn, int alpn_count);
     void Stop();
 
+    /* Apply to sessions created after this call (call before Start). */
+    void SetPtoMaxMs(uint64_t max_ms) { pto_max_ms_ = max_ms; }
+
     uv_loop_t *Loop() const { return loop_; }
     wt_server_t *Handle() const { return server_; }
     bool Listening() const { return listening_; }
@@ -91,6 +94,7 @@ private:
     bool listening_ = false;
     std::vector<std::unique_ptr<PathCbCtx>> path_ctxs_;
     OnOtherAlpn on_other_alpn_;
+    uint64_t pto_max_ms_ = 0;
     std::unordered_map<wt_session_t *, std::unique_ptr<WTServerSession>> sessions_;
 };
 

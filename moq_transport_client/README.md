@@ -71,6 +71,8 @@ moqt_client_connect(c, host, port, "/moq", app, stream,
   callbacks and `inflight_bytes` / `high_watermark` for pacing.
 - `on_write_done` reports `bytes == len` on success (all ACKed) and `0` on
   failure; QUIC stream writes are all-or-nothing.
+- `moqt_client_set_pto_max()` can cap PTO for real-time use; `0` keeps the
+  transport default, and a positive cap never goes below `pto_base`.
 - `high_watermark` is in **payload bytes**, not wire bytes.  When
   `inflight + len > watermark`, writes return `MOQT_ERR_AGAIN`; the caller
   decides whether to drop non-key video.

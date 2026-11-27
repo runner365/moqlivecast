@@ -82,6 +82,10 @@ void *wt_client_get_user_data(wt_client_t *cli);
 /* 底层 QUIC 路径 / 拥塞快照。成功返回 0；未建连返回 -1 */
 int wt_client_get_quic_stats(wt_client_t *cli, QuicConnectionStats *out);
 
+/* 0 = 不额外限制；>0 = 最大 PTO（仍保证不低于 pto_base）。
+ * 在 connect 前调用会保存到 client，建 QUIC 连接时生效。 */
+void wt_client_set_pto_max(wt_client_t *cli, uint64_t max_ms);
+
 /* ── Stream ────────────────────────────────── */
 
 /* 打开一个双向 stream（任意线程调用）。

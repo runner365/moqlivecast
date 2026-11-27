@@ -210,6 +210,11 @@ int wt_session_get_quic_stats(wt_session_t *sess, QuicConnectionStats *out) {
     return QuicConnectionGetStats((QuicConnection*)sess->ws->conn, out);
 }
 
+void wt_session_set_pto_max(wt_session_t *sess, uint64_t max_ms) {
+    if (!sess || !sess->ws || !sess->ws->conn) return;
+    QuicConnectionSetPtoMaxMs((QuicConnection*)sess->ws->conn, max_ms);
+}
+
 void wt_session_open_stream(wt_session_t *sess,
                              wt_session_on_stream_open_fn cb, void *user) {
     if (!sess || !sess->ws) return;

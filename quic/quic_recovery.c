@@ -801,9 +801,28 @@ static void arm_pto_timer(QuicRecoveryCtx *ctx) {
 
     uint64_t timeout = ctx->pto_base_;
     for (uint64_t n = 0; n < ctx->pto_count_; n++) timeout *= 2;
-    /* 不再 clamp 到 20ms — 让指数退避生效（200/400/800/1600ms），
-     * 上限由 idle timeout 兜底。 */
+    /* 可选的绝对上限。不能低于 pto_base_：低于基准会在 ACK 尚不可能
+     * 返回时重传，制造伪重传和额外拥塞。 */
+    if (ctx->pto_max_ms_ > 0 && timeout > ctx->pto_max_ms_) {
+        const uint64_t raw = timeout;
+        timeout = ctx->pto_max_ms_;
+        if (timeout < ctx->pto_base_) timeout = ctx->pto_base_;
+        const uint64_t now = uv_now(ctx->loop_);
+        if (ctx->last_pto_cap_log_ms_ == 0 ||
+            now - ctx->last_pto_cap_log_ms_ >= 1000) {
+            ctx->last_pto_cap_log_ms_ = now;
+            LOG_WARN("[quic-recovery] PTO capped: raw=%llums -> %llums "
+                     "(base=%llums pto_count=%llu max=%llums)",
+                     (unsigned long long)raw, (unsigned long long)timeout,
+                     (unsigned long long)ctx->pto_base_,
+                     (unsigned long long)ctx->pto_count_,
+                     (unsigned long long)ctx->pto_max_ms_);
+        }
+    }
 
+    if (timeout >= 200) {
+        LOG_WARN("[quic-recovery] PTO timeout >= 200ms: %llu", (unsigned long long)timeout);
+    }
     quic_timer_stop(&ctx->pto_timer_);
     quic_timer_start(&ctx->pto_timer_, on_pto_timer, ctx, timeout, 0);
 }
@@ -1047,4 +1066,10 @@ int quic_recovery_can_send(const QuicRecoveryCtx *ctx) {
 void quic_recovery_reset_pto(QuicRecoveryCtx *ctx) {
     quic_timer_stop(&ctx->pto_timer_);
     ctx->pto_count_ = 0;
+}
+
+void quic_recovery_set_pto_max_ms(QuicRecoveryCtx *ctx, uint64_t max_ms) {
+    if (!ctx) return;
+    ctx->pto_max_ms_ = max_ms;
+    ctx->last_pto_cap_log_ms_ = 0;
 }

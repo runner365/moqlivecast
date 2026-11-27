@@ -397,6 +397,9 @@ static void pusher_thread(void *arg) {
     /* 会话必须在 loop 线程上建 —— loop 归调用方，回调也在这条线程。 */
     g.sess = moq_lite_session_new(&g.loop);
     if (g.sess) {
+        /* 实时推流：限制尾部丢包的 PTO 退避，避免 800ms 级恢复。 */
+        moq_lite_session_set_pto_max(g.sess, 300);
+
         /* ⚠️ 推流方向必须设，且必须在 connect 之前：这个参数说的是**对端是谁**，
          * 发 1 对端才把自己当订阅方来订阅我们。不设的话服务端只当我们是订阅方，
          * 我们推的东西没人订阅，而且它一声不响。 */

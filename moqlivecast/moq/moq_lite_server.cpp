@@ -153,6 +153,8 @@ void MoqLiteServer::OnConnection(QuicConnection *conn, const std::string &alpn,
         return;
     }
 
+    if (pto_max_ms_ > 0) QuicConnectionSetPtoMaxMs(conn, pto_max_ms_);
+
     auto sess = std::make_shared<MoqLiteSession>(
         conn, alpn, remote_ip, remote_port,
         [this](MoqLiteSession &s) { return RouteTo(s); },

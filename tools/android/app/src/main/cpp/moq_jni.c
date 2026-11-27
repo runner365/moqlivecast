@@ -136,6 +136,7 @@ Java_com_example_moqlitepush_MoqNative_selfTest(JNIEnv *env, jobject thiz)
 
     moq_lite_session_t s = moq_lite_session_new(loop);
     if (!s) return -2;
+    moq_lite_session_set_pto_max(s, 300);
     if (moq_lite_session_set_role(s, MOQ_LITE_ROLE_PUBLISHER) != MOQ_LITE_OK) {
         moq_lite_session_close(s);
         return -3;

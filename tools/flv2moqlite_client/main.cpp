@@ -381,6 +381,7 @@ int main(int argc, char *argv[]) {
     cb.on_close     = OnClose;
     g.sess = moq_lite_session_new(g.loop);
     if (!g.sess) { LOG_ERROR("session_new failed"); return 1; }
+    moq_lite_session_set_pto_max(g.sess, 300);
 
     /* 推流方向：Role=PUBLISHER，对端才会来订阅我们。 */
     int src = moq_lite_session_set_role(g.sess, MOQ_LITE_ROLE_PUBLISHER);

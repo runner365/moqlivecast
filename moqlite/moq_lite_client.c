@@ -290,6 +290,7 @@ typedef struct MoqSession {
     moq_lite_session_cb_t cb;
 
     quic_client_t  *cli;
+    uint64_t        pto_max_ms;
     uv_loop_t      *loop;
 
     quic_stream_t  *setup_stream;
@@ -2332,6 +2333,16 @@ int moq_lite_session_set_alpn(const char *const *protos, int count) {
     return MOQ_LITE_OK;
 }
 
+void moq_lite_session_set_pto_max(moq_lite_session_t h, uint64_t max_ms) {
+    MoqSession *s = session_get(h);
+    if (!s) return;
+    s->pto_max_ms = max_ms;
+    if (s->cli) {
+        QuicConnection *qc = quic_client_conn(s->cli);
+        if (qc) QuicConnectionSetPtoMaxMs(qc, max_ms);
+    }
+}
+
 int moq_lite_session_connect(moq_lite_session_t h, const char *url,
                              const moq_lite_session_cb_t *cb) {
     MoqSession *s = session_get(h);
@@ -2359,6 +2370,10 @@ int moq_lite_session_connect(moq_lite_session_t h, const char *url,
     if (!cli) {
         free(host); free(path);
         return err_set(MOQ_LITE_ERR_NOMEM, "cannot create quic client");
+    }
+    if (s->pto_max_ms > 0) {
+        QuicConnection *qc = quic_client_conn(cli);
+        if (qc) QuicConnectionSetPtoMaxMs(qc, s->pto_max_ms);
     }
 
     /* ALPN：默认只 offer MOQ_LITE_VERSION。**刻意不 offer h3** —— 本库不会

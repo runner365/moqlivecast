@@ -85,6 +85,7 @@ struct wt_client {
     int              closing;
     /* QUIC */
     QuicConnection  *qc;
+    uint64_t         pto_max_ms;
     uint64_t         ctrl_sid;       /* H3 控制流 */
     int              connect_sent;   /* CONNECT 已发送 */
     /* CONNECT 请求的 :path / :authority（默认 "/" 与 "127.0.0.1:4433"）。
@@ -218,6 +219,12 @@ int wt_client_get_quic_stats(wt_client_t *cli, QuicConnectionStats *out) {
     return QuicConnectionGetStats(cli->qc, out);
 }
 
+void wt_client_set_pto_max(wt_client_t *cli, uint64_t max_ms) {
+    if (!cli) return;
+    cli->pto_max_ms = max_ms;
+    if (cli->qc) QuicConnectionSetPtoMaxMs(cli->qc, max_ms);
+}
+
 void wt_client_open_stream(wt_client_t *cli) {
     if (!cli) return;
     wt_task_t *t = (wt_task_t*)calloc(1, sizeof(*t));
@@ -282,6 +289,8 @@ static void async_cb(uv_async_t *h) {
                 snprintf(cli->authority, sizeof(cli->authority), "%s:%d",
                          t->host, t->port);
                 cli->qc = QuicConnectionCreate(cli->loop);
+                if (cli->pto_max_ms > 0)
+                    QuicConnectionSetPtoMaxMs(cli->qc, cli->pto_max_ms);
                 QuicConnectionSetIdleTimeout(cli->qc, 300000); /* 300s covers full test */
                 QuicConnectionSetAppData(cli->qc, cli);
                 QuicConnectionSetOnConnected(cli->qc, on_quic_connected);

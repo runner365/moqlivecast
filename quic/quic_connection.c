@@ -3720,6 +3720,11 @@ void QuicConnectionSetIdleTimeout(QuicConnection *conn, uint64_t timeout_ms) {
     conn->idle_timeout_ms_ = timeout_ms;
 }
 
+void QuicConnectionSetPtoMaxMs(QuicConnection *conn, uint64_t max_ms) {
+    if (!conn) return;
+    quic_recovery_set_pto_max_ms(&conn->recovery_ctx_, max_ms);
+}
+
 void QuicConnectionSetKeepalive(QuicConnection *conn, int enabled) {
     conn->keepalive_enabled_ = enabled;
     if (enabled) {
